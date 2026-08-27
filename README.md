@@ -23,7 +23,7 @@ The current repository is a contract scaffold. It does not claim to create accou
 
 ## Local dependencies
 
-The manifest uses local path dependencies for `mach-std`, `mach-http`, and `mach-tls`. Build outputs are written to `../.mach-out/acme/`, outside the repository.
+The manifest uses pinned Git tags for `mach-std`, `mach-http`, and `mach-tls`. Build output uses Mach's default `out/` directory.
 
 ## Status
 
