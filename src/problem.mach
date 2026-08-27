@@ -1,0 +1,46 @@
+# protocol and local failure classification
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+pub def Kind: u8;
+
+pub val PROTOCOL: Kind = 1;
+pub val TRANSPORT: Kind = 2;
+pub val SIGNING: Kind = 3;
+pub val STORAGE: Kind = 4;
+pub val CHALLENGE: Kind = 5;
+pub val POLICY: Kind = 6;
+
+pub rec Problem {
+    typ:      view.View;
+    title:    view.View;
+    detail:   view.View;
+    status:   u16;
+    instance: view.View;
+}
+
+pub rec Error {
+    kind:                Kind;
+    problem:             Problem;
+    detail:              str;
+    retry_after_seconds: u64;
+    retryable:           bool;
+}
+
+pub fun local(kind: Kind, detail: str) Error {
+    var e: Error;
+    e.kind = kind;
+    e.detail = detail;
+    e.retryable = false;
+    ret e;
+}
+
+test "acme.problem: local failures retain their class" {
+    val e: Error = local(STORAGE, "write failed");
+    if (e.kind != STORAGE || e.retryable) { ret 1; }
+    ret 0;
+}

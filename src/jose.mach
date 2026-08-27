@@ -1,0 +1,21 @@
+# caller-owned jose signing buffers
+
+use R: std.types.result;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+pub def EncodeJwkFun: fun(ptr, *u8, usize) R.Result[usize, str];
+pub def ThumbprintFun: fun(ptr, *u8, usize) R.Result[usize, str];
+pub def SignFun: fun(ptr, *u8, usize, *u8, usize, *u8, usize) R.Result[usize, str];
+
+pub rec Signer {
+    ctx:             ptr;
+    algorithm:       view.View;
+    encode_jwk:      EncodeJwkFun;
+    thumbprint:      ThumbprintFun;
+    sign:            SignFun;
+    max_jwk_bytes:   usize;
+    max_thumb_bytes: usize;
+    max_signature_bytes: usize;
+}

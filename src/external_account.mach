@@ -1,0 +1,18 @@
+# external account binding contract
+
+use R: std.types.result;
+use std.types.size.usize;
+use std.types.view;
+use crypto.contracts;
+
+pub rec Binding {
+    key_id:  view.View;
+    mac_key: contracts.SecretBytes;
+}
+
+pub def EncodeFun: fun(ptr, Binding, view.View, *u8, usize) R.Result[usize, view.View];
+
+pub rec Encoder {
+    ctx:    ptr;
+    encode: EncodeFun;
+}

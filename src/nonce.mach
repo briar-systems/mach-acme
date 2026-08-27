@@ -1,0 +1,23 @@
+# durable replay nonce pool boundary
+
+use R: std.types.result;
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+pub rec Taken {
+    found: bool;
+    value: view.View;
+}
+
+pub def TakeFun: fun(ptr, *u8, usize) R.Result[Taken, str];
+pub def PutFun: fun(ptr, view.View) R.Result[bool, str];
+pub def ClearFun: fun(ptr) R.Result[bool, str];
+
+pub rec Pool {
+    ctx:   ptr;
+    take:  TakeFun;
+    put:   PutFun;
+    clear: ClearFun;
+}

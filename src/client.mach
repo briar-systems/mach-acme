@@ -1,0 +1,61 @@
+# composed acme protocol driver contract
+
+use A: std.allocator;
+use R: std.types.result;
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.view;
+use http_client: http.client.client;
+use tls.config;
+use acme.account;
+use acme.challenge;
+use acme.certificate;
+use acme.nonce;
+use acme.order;
+use acme.problem;
+use acme.storage;
+
+pub rec Directory {
+    new_nonce_url:   view.View;
+    new_account_url: view.View;
+    new_order_url:   view.View;
+    revoke_cert_url: view.View;
+    key_change_url:  view.View;
+    terms_url:       view.View;
+    external_account_required: bool;
+}
+
+pub rec Limits {
+    max_response_bytes: usize;
+    max_problem_bytes:  usize;
+    max_nonce_bytes:    usize;
+    max_poll_attempts:  usize;
+    request_timeout_ns: u64;
+}
+
+pub def DiscoverFun: fun(ptr, view.View, *A.Allocator) R.Result[Directory, problem.Error];
+pub def CreateAccountFun: fun(ptr, Directory, account.Request, *A.Allocator) R.Result[account.Account, problem.Error];
+pub def CreateOrderFun: fun(ptr, Directory, account.Credentials, order.Request, *A.Allocator) R.Result[order.Order, problem.Error];
+pub def CompleteChallengesFun: fun(ptr, account.Credentials, *order.Order, challenge.Providers, *A.Allocator) R.Result[order.Order, problem.Error];
+pub def FinalizeFun: fun(ptr, account.Credentials, order.Order, certificate.CsrProvider, *A.Allocator, *certificate.Issued) R.Result[bool, problem.Error];
+pub def RevokeFun: fun(ptr, account.Credentials, certificate.Issued, u8) R.Result[bool, problem.Error];
+
+pub rec Operations {
+    ctx:                 ptr;
+    discover:            DiscoverFun;
+    create_account:      CreateAccountFun;
+    create_order:        CreateOrderFun;
+    complete_challenges: CompleteChallengesFun;
+    finalize:            FinalizeFun;
+    revoke:              RevokeFun;
+}
+
+pub rec Client {
+    http:          *http_client.Client;
+    tls:           *config.ClientConfig;
+    directory_url: view.View;
+    nonces:        *nonce.Pool;
+    storage:       *storage.Store;
+    operations:    Operations;
+    limits:        Limits;
+}

@@ -1,0 +1,38 @@
+# order and authorization state
+
+use std.types.size.usize;
+use std.types.view;
+use acme.identifier;
+
+pub val PENDING:    u8 = 1;
+pub val READY:      u8 = 2;
+pub val PROCESSING: u8 = 3;
+pub val VALID:      u8 = 4;
+pub val INVALID:    u8 = 5;
+
+pub rec Request {
+    identifiers: *identifier.Identifier;
+    len:         usize;
+    not_before:  view.View;
+    not_after:   view.View;
+}
+
+pub rec Authorization {
+    url:        view.View;
+    identifier: identifier.Identifier;
+    status:     u8;
+    wildcard:   u8;
+    expires:    view.View;
+}
+
+pub rec Order {
+    url:             view.View;
+    status:          u8;
+    expires:         view.View;
+    identifiers:     *identifier.Identifier;
+    identifier_len:  usize;
+    authorizations:  *Authorization;
+    authorization_len: usize;
+    finalize_url:    view.View;
+    certificate_url: view.View;
+}

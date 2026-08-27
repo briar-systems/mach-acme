@@ -1,0 +1,46 @@
+# challenge presentation and cleanup boundary
+
+use R: std.types.result;
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.view;
+use acme.identifier;
+use acme.problem;
+
+pub val HTTP_01:     u8 = 1;
+pub val DNS_01:      u8 = 2;
+pub val TLS_ALPN_01: u8 = 3;
+
+pub val PENDING:    u8 = 1;
+pub val PROCESSING: u8 = 2;
+pub val VALID:      u8 = 3;
+pub val INVALID:    u8 = 4;
+
+pub rec Challenge {
+    typ:       u8;
+    url:       view.View;
+    token:     view.View;
+    status:    u8;
+    validated: view.View;
+    failure:   problem.Problem;
+}
+
+pub rec Presentation {
+    ctx: ptr;
+}
+
+pub def SupportsFun: fun(ptr, identifier.Identifier, u8) bool;
+pub def PresentFun: fun(ptr, identifier.Identifier, Challenge, view.View) R.Result[Presentation, problem.Error];
+pub def CleanupFun: fun(ptr, Presentation) R.Result[bool, problem.Error];
+
+pub rec Provider {
+    ctx:      ptr;
+    supports: SupportsFun;
+    present:  PresentFun;
+    cleanup:  CleanupFun;
+}
+
+pub rec Providers {
+    items: *Provider;
+    len:   usize;
+}

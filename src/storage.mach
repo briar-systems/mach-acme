@@ -1,0 +1,44 @@
+# transactional durable state boundary
+
+use A: std.allocator;
+use R: std.types.result;
+use std.types.bool.bool;
+use std.types.string.str;
+use std.types.view;
+use acme.account;
+use acme.certificate;
+
+pub rec Transaction {
+    ctx: ptr;
+}
+
+pub rec AccountLoad {
+    found: bool;
+    value: account.Credentials;
+}
+
+pub rec CertificateLoad {
+    found: bool;
+    value: certificate.Issued;
+}
+
+pub def BeginFun: fun(ptr) R.Result[Transaction, str];
+pub def PutAccountFun: fun(ptr, Transaction, view.View, account.Credentials) R.Result[bool, str];
+pub def PutCertificateFun: fun(ptr, Transaction, certificate.Issued) R.Result[bool, str];
+pub def DeleteCertificateFun: fun(ptr, Transaction, view.View) R.Result[bool, str];
+pub def CommitFun: fun(ptr, Transaction) R.Result[bool, str];
+pub def AbortFun: fun(ptr, Transaction) R.Result[bool, str];
+pub def LoadAccountFun: fun(ptr, view.View, *A.Allocator) R.Result[AccountLoad, str];
+pub def LoadCertificateFun: fun(ptr, view.View, *A.Allocator, *CertificateLoad) R.Result[bool, str];
+
+pub rec Store {
+    ctx:                ptr;
+    begin:              BeginFun;
+    put_account:        PutAccountFun;
+    put_certificate:    PutCertificateFun;
+    delete_certificate: DeleteCertificateFun;
+    commit:             CommitFun;
+    abort:              AbortFun;
+    load_account:       LoadAccountFun;
+    load_certificate:   LoadCertificateFun;
+}

@@ -1,0 +1,31 @@
+# account lifecycle model
+
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.view;
+use acme.jose;
+
+pub val VALID:       u8 = 1;
+pub val DEACTIVATED: u8 = 2;
+pub val REVOKED:     u8 = 3;
+
+pub rec Request {
+    contacts:              *view.View;
+    contact_len:           usize;
+    terms_of_service_agreed: bool;
+    only_return_existing:  bool;
+}
+
+pub rec Account {
+    url:                    view.View;
+    status:                 u8;
+    contacts:               *view.View;
+    contact_len:            usize;
+    orders_url:             view.View;
+    terms_of_service_agreed: bool;
+}
+
+pub rec Credentials {
+    account: Account;
+    signer:  jose.Signer;
+}

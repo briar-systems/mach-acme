@@ -1,0 +1,49 @@
+# renewal policy and scheduler integration
+
+use R: std.types.result;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.string.str;
+use std.types.view;
+use acme.certificate;
+use acme.problem;
+
+pub rec Policy {
+    renew_before_seconds: u64;
+    min_retry_seconds:    u64;
+    max_retry_seconds:    u64;
+    jitter_seconds:       u64;
+}
+
+pub rec Event {
+    storage_key: view.View;
+    attempt:     u32;
+    next_run_unix: u64;
+    error:       problem.Error;
+}
+
+pub def ClockFun: fun(ptr) u64;
+pub def RenewFun: fun(ptr, certificate.Issued, *certificate.Issued) R.Result[bool, problem.Error];
+pub def EventFun: fun(ptr, Event);
+
+pub rec Scheduler {
+    ctx:      ptr;
+    policy:   Policy;
+    clock:    ClockFun;
+    renew:    RenewFun;
+    on_retry: EventFun;
+    on_success: EventFun;
+}
+
+pub fun due(now_unix: u64, not_after_unix: u64, renew_before_seconds: u64) bool {
+    if (not_after_unix <= now_unix) { ret true; }
+    ret not_after_unix - now_unix <= renew_before_seconds;
+}
+
+test "acme.renewal: due avoids unsigned expiry underflow" {
+    if (!due(200, 100, 30)) { ret 1; }
+    if (!due(80, 100, 20)) { ret 1; }
+    if (due(79, 100, 20)) { ret 1; }
+    ret 0;
+}

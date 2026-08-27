@@ -1,0 +1,18 @@
+# acme renewal information contract
+
+use R: std.types.result;
+use std.types.view;
+
+pub rec Window {
+    start_ns: i64;
+    end_ns:   i64;
+    retry_ns: i64;
+}
+
+pub def FetchFun: fun(ptr, view.View) R.Result[Window, view.View];
+
+pub rec Provider {
+    ctx:   ptr;
+    fetch: FetchFun;
+}
+

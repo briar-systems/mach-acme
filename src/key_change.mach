@@ -1,0 +1,14 @@
+# account key rollover contract
+
+use R: std.types.result;
+use std.types.view;
+use acme.account;
+use acme.jose;
+
+pub def RolloverFun: fun(ptr, account.Credentials, jose.Signer) R.Result[account.Credentials, view.View];
+
+pub rec Operation {
+    ctx:      ptr;
+    rollover: RolloverFun;
+}
+

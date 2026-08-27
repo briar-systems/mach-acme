@@ -1,0 +1,11 @@
+# certificate identifier model
+
+use std.types.view;
+
+pub val DNS: u8 = 1;
+pub val IP:  u8 = 2;
+
+pub rec Identifier {
+    kind:  u8;
+    value: view.View;
+}
