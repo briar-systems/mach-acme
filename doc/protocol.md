@@ -6,9 +6,14 @@ or account private-key storage.
 
 ## Directory discovery
 
-`client.discovery_request` produces a replay-safe GET description. The caller
-executes it through a transport and passes a bounded `client.Response` to
-`client.parse_directory`.
+`client.discovery_request` validates the bootstrap URL and produces a
+replay-safe GET description. The caller executes it through a transport and
+passes a bounded `client.Response` to `client.parse_directory`.
+
+Every successful `WireRequest` carries the configured timeout and maximum
+response body size. A constructor failure is retained in `WireRequest.error` and
+must not be sent. URLs are bounded HTTPS absolute URIs without fragments,
+userinfo, controls, malformed percent escapes, or non-ASCII wire bytes.
 
 Parsing requires HTTP 200, a strict UTF-8 JSON object, unique decoded member names,
 and HTTPS URLs for `newNonce`, `newAccount`, and `newOrder`. Optional `newAuthz`,
@@ -40,16 +45,28 @@ JWK members use RFC 7638 lexicographic order. Protected headers use the fixed or
 `alg`, then `jwk` or `kid`, then `nonce`, then `url`. Base64url values are unpadded.
 The flattened JWS object uses the fixed order `protected`, `payload`, `signature`.
 
-RSA-PSS asks the supplied entropy provider for exactly 32 secret bytes. An absent or
-failing provider returns `ENTROPY_UNAVAILABLE`. Salt storage is zeroed before and
-after the provider and after signing. Signing work and final output must not overlap.
-Capacity, key, entropy, or encoding failure leaves the final output unchanged.
+RSA-PSS asks the supplied entropy provider for exactly 32 secret bytes. Callers
+construct this boundary with `jose.entropy_provider` or `jose.no_entropy`. An
+absent or failing provider returns `ENTROPY_UNAVAILABLE`. Salt storage is zeroed
+before and after the provider and after signing. Signing work and final output
+must not overlap. Capacity, key, entropy, or encoding failure leaves the final
+output unchanged.
+
+Outer ACME requests explicitly include a nonce. The same encoder can omit it for
+the nested JWS required by account key rollover. A protected header cannot both
+select a JWK and retain a `kid`.
 
 ## Replay nonce ownership
 
 A `nonce.Pool` owns copies of available nonces. The supplied memory implementation
 uses fixed caller storage and rejects empty, oversized, non-base64url, duplicate,
 and over-capacity values.
+
+The memory implementation serializes put, take, and clear operations with its
+embedded mutex. Initialization and release require exclusive ownership. Release
+wipes the complete declared backing store and makes existing pool handles fail
+readiness validation before the storage can be initialized again. Sequence
+exhaustion fails closed until the pool is cleared.
 
 Taking a nonce copies it to caller storage and then wipes and retires its slot. The
 newest available nonce is selected. A small destination does not consume or modify
@@ -59,12 +76,17 @@ the stored nonce. Clearing the pool wipes every slot.
 attempt, that nonce is never returned to the pool, including when local signing
 fails. This conservative ownership rule prevents accidental replay across callers.
 
-Every successful ACME response may contribute one `Replay-Nonce`. Duplicate header
-fields are rejected. A `badNonce` response first discards all stale nonces, then
-stores its fresh response nonce when present. If absent, the state machine requests
-a HEAD acquisition. Retry count is bounded by `Limits.max_bad_nonce_retries`.
+Every successful ACME response may contribute one `Replay-Nonce`. A `badNonce`
+response first discards all stale nonces, then stores its fresh response nonce when
+present. If absent, the state machine requests a HEAD acquisition. Retry count is
+bounded by `Limits.max_bad_nonce_retries`.
 Exhaustion retains the last structured ACME and HTTP cause while returning
 `RETRY_LIMIT`.
+
+Invalid or repeated response nonce fields are ignored as RFC 8555 requires.
+Optional fresh nonces are also ignored when the bounded pool is already full.
+The completed POST result is never converted into a failure merely because an
+additional nonce could not be retained.
 
 ## Signed-request state
 
@@ -77,8 +99,15 @@ Exhaustion retains the last structured ACME and HTTP cause while returning
 - a recoverable `badNonce` enters `REQUEST_RETRY` or `REQUEST_NEEDS_NONCE`
 - any terminal protocol or transport-response failure enters `REQUEST_FAILED`
 
+Each request is bound to the exact initialized `Client` generation that began it.
+Foreign clients, double initialization, and requests retained across client release
+and reinitialization fail before consuming a nonce, exposing a wire body, or
+accepting a response.
+
 The caller must not replay a POST body after an ambiguous transport failure. The
-wire description marks signed POSTs as not replay safe. Higher account and order
+prepared request retains the exact output view accepted by signing. `signed_wire`
+does not accept a replacement body and clears that view when the response is
+accepted. The wire description marks signed POSTs as not replay safe. Higher account and order
 layers decide whether a new ACME request is valid after consulting their operation
 state.
 
@@ -86,8 +115,13 @@ state.
 
 `client.Limits` bounds request bodies, response bodies, problem bodies, URL and
 nonce lengths, JSON scratch, JSON depth, JSON values, JSON key lengths, CAA entries,
-retry count, and the transport timeout policy value. The caller's actual buffers may
-set tighter bounds.
+problem subproblems, response header fields, retry count, and the transport
+timeout policy value. The caller's actual buffers may set tighter bounds.
+
+`max_request_bytes` bounds the complete flattened JWS body, not only its raw
+payload. `prepare_signed` narrows the output capacity to that policy before the
+transactional encoder runs. The body view retained by `SignedRequest` remains
+valid only while the caller keeps the accepted output buffer alive and unchanged.
 
 Response bodies and fields need only remain alive for the accepting call, except
 that `Error.http.body` retains the supplied view. Directory and parsed problem views
@@ -95,13 +129,18 @@ point into their explicit storage records. A JWS output remains caller-owned. Wo
 storage contains public canonical and signature bytes and can be reused after the
 operation returns.
 
+Malformed or oversized body views are never retained in `Error.http.body`. Their
+status and retry delay remain available, but the rejected view is replaced with an
+empty view so callers cannot accidentally dereference out-of-policy memory.
+
 ## Error mapping
 
 Local errors retain a domain and stable code. Rejected non-ACME responses retain
 status, body, retry delay, and retryability. Valid ACME problem documents additionally
-retain type, title, detail, instance, and problem status. Malformed or oversized
-problem documents retain the original HTTP cause while reporting the precise parse
-or capacity code. The exact RFC badNonce URN maps to `BAD_NONCE`.
+retain type, title, detail, instance, problem status, and bounded structured
+subproblems with their identifiers. Malformed or oversized problem documents
+retain the original HTTP cause while reporting the precise parse or capacity
+code. The exact RFC badNonce URN maps to `BAD_NONCE`.
 
 ## Validation sources
 

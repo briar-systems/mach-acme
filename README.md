@@ -15,24 +15,27 @@ ownership contract.
 - strict bounded ACME directory discovery with all RFC 8555 endpoints and metadata
 - canonical EC, OKP, and RSA JWK encoding and RFC 7638 SHA-256 thumbprints
 - canonical flattened JWS with ES256, EdDSA, and PS256 account keys
+- nonce-bearing outer JWS and nonce-free nested JWS for key rollover
 - separate public signer metadata and caller-owned private keys
 - caller-provided entropy for RSA-PSS with explicit salt zeroization
 - bounded one-use replay nonce storage with deterministic newest-first selection
 - signed-request state and bounded `badNonce` recovery
+- exact prepared-body binding with timeout and response bounds on every wire request
 - structured local, HTTP, and ACME problem causes
+- bounded structured ACME subproblems for multi-identifier failures
 - caller-owned JSON scratch, output storage, signing work, and wire buffers
 
 ## Protocol boundary
 
 The transport-independent path is:
 
-1. Create `client.discovery_request` and execute the returned GET.
+1. Create `client.discovery_request` with the configured limits and execute the returned GET.
 2. Convert the transport result to `client.Response` and call
    `client.parse_directory`.
 3. Execute `client.nonce_request` when no replay nonce is available.
 4. Initialize a `client.SignedRequest` with `client.begin_signed`.
 5. Call `client.prepare_signed`, which consumes one stored nonce and writes a JWS.
-6. Execute the POST described by `client.signed_wire`.
+6. Execute the POST described by `client.signed_wire`. Its body is the exact output accepted by `prepare_signed`.
 7. Deliver the response to `client.accept_signed_response` and follow its action.
 
 `ACTION_RETRY_SIGNED` means the server supplied a fresh nonce. `ACTION_ACQUIRE_NONCE`
