@@ -17,11 +17,14 @@ ownership contract.
 - canonical flattened JWS with ES256, EdDSA, and PS256 account keys
 - nonce-bearing outer JWS and nonce-free nested JWS for key rollover
 - separate public signer metadata and caller-owned private keys
-- caller-provided entropy for RSA-PSS with explicit salt zeroization
+- caller-provided entropy for RSA-PSS with ownership predicates, post-callback
+  validation, transactional output, and explicit salt zeroization
 - bounded one-use replay nonce storage with deterministic newest-first selection
-- immutable nonce callback descriptors with fail-closed result and state validation
+- immutable nonce callback descriptors and owned ranges with fail-closed result,
+  alias, and state validation
 - signed-request state and bounded per-request `badNonce` recovery
-- exact prepared-body binding with timeout and response bounds on every wire request
+- exact URL, payload, `kid`, and prepared-body binding with timeout and response
+  bounds on every wire request
 - structured local, HTTP, and ACME problem causes
 - bounded structured ACME subproblems for multi-identifier failures
 - caller-owned JSON scratch, output storage, signing work, and wire buffers

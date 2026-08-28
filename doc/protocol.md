@@ -54,9 +54,16 @@ JWK members use RFC 7638 lexicographic order. Protected headers use the fixed or
 The flattened JWS object uses the fixed order `protected`, `payload`, `signature`.
 
 RSA-PSS asks the supplied entropy provider for exactly 32 secret bytes. Callers
-construct this boundary with `jose.entropy_provider` or `jose.no_entropy`. An
-absent or failing provider returns `ENTROPY_UNAVAILABLE`. Salt storage is zeroed
-before and after the provider and after signing. Signing work and final output
+construct this boundary with `jose.entropy_provider` or `jose.no_entropy`. A
+provider supplies public and secret ownership predicates plus a post-callback
+validation function. Those callbacks and their contexts remain valid and
+immutable for the operation. Any declared overlap with the message, output,
+public key, protocol state, or salt destination fails before entropy is requested.
+The message and bound ACME inputs are checked again after the callback. An absent
+or failing provider returns `ENTROPY_UNAVAILABLE`. A provider that changes an
+input or fails post-callback validation returns `INVALID_INPUT` before final
+output is published. Salt storage is zeroed before and after the provider and
+after signing. Signing work and final output
 must not overlap each other, the payload, protected header views, or public key
 storage. JWK, thumbprint, and signature outputs must not overlap their public
 inputs. Secret-qualified key storage cannot alias public mutable buffers in
@@ -88,8 +95,13 @@ the stored nonce. Clearing the pool wipes every slot.
 
 `Client` copies the `Pool` callback descriptor during initialization. The source
 descriptor therefore need not remain alive, but its `ctx` and the storage behind
-that context must remain valid until client release. Callback pointers, dimensions,
-and readiness are checked at initialization and every callback boundary. A take
+that context must remain valid until client release. The descriptor includes an
+immutable ownership predicate for every byte range owned by the provider. The
+predicate, callback pointers, dimensions, owned regions, and their backing state
+must not change until release. Client state, request state, signing inputs, work,
+output, callback inputs, and callback outputs are checked against that predicate
+before the corresponding callback boundary. Callback pointers, dimensions, and
+readiness are checked at initialization and every callback boundary. A take
 result is accepted only when it identifies the exact supplied output buffer, has a
 bounded nonzero base64url length, and is internally consistent with its error and
 `found` fields. Readiness, take, put, and clear callbacks must not mutate the bound
@@ -132,6 +144,13 @@ Each request is bound to the exact initialized `Client` generation that began it
 Foreign clients, double initialization, and requests retained across client release
 and reinitialization fail before consuming a nonce, exposing a wire body, or
 accepting a response.
+
+`begin_signed` records SHA-256 bindings for the exact URL, payload, and `kid`
+bytes. The caller retains their storage but grants the request immutable access
+through completion or failure. Preparation checks the bindings before and after
+nonce and entropy callbacks. `signed_wire` checks them again, so changing any
+borrowed input before preparation or after a body is prepared fails closed. The
+transport URL can never diverge from the URL protected by the JWS.
 
 The caller must not replay a POST body after an ambiguous transport failure. The
 prepared request retains the exact output view accepted by signing. `signed_wire`
