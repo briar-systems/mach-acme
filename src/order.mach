@@ -378,9 +378,10 @@ pub fun begin_fetch(protocol: *client.Client, state: *client.SignedRequest,
 }
 
 rec Cursor {
-    data: *u8;
-    cap:  usize;
-    pos:  usize;
+    data:  *u8;
+    cap:   usize;
+    pos:   usize;
+    short: bool;
 }
 
 fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
@@ -393,6 +394,8 @@ fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
     ret true;
 }
 
+# a value that decodes cleanly but does not fit is a capacity failure, not a
+# malformed document. the distinction is recorded so callers map it exactly.
 fun copy_string(cursor: *Cursor, value: *J.Value, maximum: usize,
     output: *view.View) bool {
     if (value == nil) {
@@ -400,7 +403,9 @@ fun copy_string(cursor: *Cursor, value: *J.Value, maximum: usize,
         ret true;
     }
     var len: usize = 0;
-    if (!decoded_len(value, maximum, ?len) || len > cursor.cap - cursor.pos) {
+    if (!decoded_len(value, maximum, ?len)) { ret false; }
+    if (len > cursor.cap - cursor.pos) {
+        cursor.short = true;
         ret false;
     }
     val start: usize = cursor.pos;
@@ -532,8 +537,11 @@ fun location(response: client.Response) *field.Field {
 }
 
 fun copy_view(cursor: *Cursor, value: view.View, output: *view.View) bool {
-    if (!memory_range.valid(value.data, value.len) ||
-        value.len > cursor.cap - cursor.pos) { ret false; }
+    if (!memory_range.valid(value.data, value.len)) { ret false; }
+    if (value.len > cursor.cap - cursor.pos) {
+        cursor.short = true;
+        ret false;
+    }
     val start: usize = cursor.pos;
     var i: usize = 0;
     for (i < value.len) {
@@ -581,6 +589,14 @@ fun storage_disjoint(data: *u8, capacity: usize, items: *u8,
 
 fun parse_error(code: problem.Code, detail: str) problem.Error {
     ret problem.local_code(problem.PROTOCOL, code, detail);
+}
+
+fun copy_failure(cursor: *Cursor, detail: str) problem.Error {
+    if (cursor.short) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "response text storage is too small");
+    }
+    ret parse_error(problem.MALFORMED_JSON, detail);
 }
 
 # order_url is empty for a creation response, which must carry a Location
@@ -683,11 +699,10 @@ pub fun parse(response: client.Response, order_url: view.View,
     result.authorization_len = authorization_len;
     result.certificate_url = view.view(nil, 0);
     var cursor: Cursor = Cursor{data: storage.data, cap: storage.capacity,
-        pos: 0};
+        pos: 0, short: false};
     if (order_location != nil) {
         if (!copy_view(?cursor, order_location.value, ?result.url)) {
-            ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
-                "order text storage is too small");
+            ret copy_failure(?cursor, "order location is invalid");
         }
     } or {
         result.url = order_url;
@@ -695,19 +710,18 @@ pub fun parse(response: client.Response, order_url: view.View,
     if (!copy_string(?cursor, finalize, configured.max_url_bytes,
             ?result.finalize_url) ||
         !client.url_valid(result.finalize_url, configured.max_url_bytes)) {
-        ret parse_error(problem.MALFORMED_JSON, "order finalize url is invalid");
+        ret copy_failure(?cursor, "order finalize url is invalid");
     }
     if (certificate != nil &&
         (!copy_string(?cursor, certificate, configured.max_url_bytes,
             ?result.certificate_url) ||
         !client.url_valid(result.certificate_url,
             configured.max_url_bytes))) {
-        ret parse_error(problem.MALFORMED_JSON,
-            "order certificate url is invalid");
+        ret copy_failure(?cursor, "order certificate url is invalid");
     }
     if (!copy_string(?cursor, expires, MAX_TIME_BYTES, ?result.expires) ||
         !timestamp_valid(result.expires)) {
-        ret parse_error(problem.MALFORMED_JSON, "order expiry is invalid");
+        ret copy_failure(?cursor, "order expiry is invalid");
     }
     var i: usize = 0;
     for (i < identifier_len) {
@@ -721,8 +735,7 @@ pub fun parse(response: client.Response, order_url: view.View,
             !copy_string(?cursor, json.find(item, "value"),
                 identifier.MAX_VALUE_BYTES,
                 ?storage.identifiers[i].value)) {
-            ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
-                "order text storage is too small");
+            ret copy_failure(?cursor, "order identifier is invalid");
         }
         storage.identifiers[i].kind = identifier.kind_from_name(kind_text);
         if (!identifier.valid(storage.identifiers[i], policy)) {
@@ -737,14 +750,13 @@ pub fun parse(response: client.Response, order_url: view.View,
                 configured.max_url_bytes, ?storage.authorizations[i]) ||
             !client.url_valid(storage.authorizations[i],
                 configured.max_url_bytes)) {
-            ret parse_error(problem.MALFORMED_JSON,
-                "order authorization url is invalid");
+            ret copy_failure(?cursor, "order authorization url is invalid");
         }
         i = i + 1;
     }
     if (!copy_problem(?cursor, json.find(?root, "error"), configured,
             ?result.failure)) {
-        ret parse_error(problem.MALFORMED_JSON, "order error object is invalid");
+        ret copy_failure(?cursor, "order error object is invalid");
     }
     @output = result;
     ret problem.none();
@@ -818,13 +830,12 @@ pub fun parse_authorization(response: client.Response,
     result.wildcard = false;
     if (wildcard != nil) { result.wildcard = J.value_bool(wildcard); }
     var cursor: Cursor = Cursor{data: storage.data, cap: storage.capacity,
-        pos: 0};
+        pos: 0, short: false};
     var kind_text: view.View;
     if (!copy_string(?cursor, json.find(subject, "type"), 16, ?kind_text) ||
         !copy_string(?cursor, json.find(subject, "value"),
             identifier.MAX_VALUE_BYTES, ?result.identifier.value)) {
-        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
-            "authorization text storage is too small");
+        ret copy_failure(?cursor, "authorization identifier is invalid");
     }
     result.identifier.kind = identifier.kind_from_name(kind_text);
     # the authority names the base domain and flags the wildcard separately,
@@ -839,8 +850,7 @@ pub fun parse_authorization(response: client.Response,
     }
     if (!copy_string(?cursor, expires, MAX_TIME_BYTES, ?result.expires) ||
         !timestamp_valid(result.expires)) {
-        ret parse_error(problem.MALFORMED_JSON,
-            "authorization expiry is invalid");
+        ret copy_failure(?cursor, "authorization expiry is invalid");
     }
     var i: usize = 0;
     for (i < challenge_len) {
@@ -858,8 +868,7 @@ pub fun parse_authorization(response: client.Response,
                 challenge.MAX_TOKEN_BYTES, ?entry.token) ||
             !copy_string(?cursor, json.find(item, "validated"),
                 MAX_TIME_BYTES, ?entry.validated)) {
-            ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
-                "authorization text storage is too small");
+            ret copy_failure(?cursor, "authorization challenge is invalid");
         }
         entry.typ = challenge.kind_from_name(type_text);
         entry.status = challenge.status_from(json.find(item, "status"));
@@ -876,7 +885,7 @@ pub fun parse_authorization(response: client.Response,
         }
         if (!copy_problem(?cursor, json.find(item, "error"), configured,
                 ?entry.failure)) {
-            ret parse_error(problem.MALFORMED_JSON,
+            ret copy_failure(?cursor,
                 "authorization challenge error object is invalid");
         }
         storage.challenges[i] = entry;

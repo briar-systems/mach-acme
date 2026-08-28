@@ -23,6 +23,9 @@ use std.types.string.str;
 use std.types.view;
 use acme.client;
 use acme.account;
+use acme.challenge;
+use acme.identifier;
+use acme.order;
 use acme.external_account;
 use acme.jose;
 use acme.json;
@@ -3347,5 +3350,236 @@ test "key change: interruption retains a recoverable nested rollover" {
     if (problem.failed(rsa_prepared.error) ||
         problem.failed(key_change.finish(?restarted_manager, rsa_prepared,
             key_change.REJECTED)) || provider.pending_ready) { ret 13; }
+    ret 0;
+}
+
+fun order_limits() order.Limits {
+    var configured: order.Limits = order.limits_default();
+    configured.max_response_bytes = 65536;
+    configured.max_json_scratch = 32768;
+    ret configured;
+}
+
+test "order: multi-identifier, partial failure, and expiry decode transactionally" {
+    var fields: field.Fields;
+    empty_fields(?fields);
+    val body: *u8 = "{\"status\":\"invalid\",\"expires\":\"2026-01-01T00:00:00Z\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"a.example\"},{\"type\":\"dns\",\"value\":\"b.example\"}],\"authorizations\":[\"https://example.com/authz/1\",\"https://example.com/authz/2\"],\"finalize\":\"https://example.com/finalize/1\",\"error\":{\"type\":\"urn:ietf:params:acme:error:unauthorized\",\"detail\":\"one identifier failed\",\"status\":403}}";
+    var scratch: [32768]u8;
+    var text: [4096]u8;
+    var names: [4]identifier.Identifier;
+    var authorizations: [4]view.View;
+    val storage: order.Storage = order.Storage{data: ?text[0], capacity: 4096,
+        identifiers: ?names[0], identifier_capacity: 4,
+        authorizations: ?authorizations[0], authorization_capacity: 4};
+    val known: view.View = view.view("https://example.com/order/1", 27);
+    var parsed: order.Order;
+    if (problem.failed(order.parse(response(status.OK, ?fields,
+            view.view(body, length(body))), known,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            storage, ?parsed))) { ret 1; }
+    # a failed order retains the authority's structured cause per identifier
+    if (parsed.status != order.INVALID || parsed.identifier_len != 2 ||
+        parsed.authorization_len != 2 || parsed.expires.len != 20 ||
+        parsed.certificate_url.len != 0 ||
+        parsed.failure.status != 403 || parsed.failure.typ.len == 0 ||
+        parsed.failure.detail.len == 0) { ret 2; }
+    if (!identifier.same(parsed.identifiers[0],
+            identifier.Identifier{kind: identifier.DNS,
+                value: view.view("a.example", 9)}) ||
+        !identifier.same(parsed.identifiers[1],
+            identifier.Identifier{kind: identifier.DNS,
+                value: view.view("b.example", 9)})) { ret 3; }
+
+    # a valid order must name its certificate, and a non-valid one must not
+    val mismatched: *u8 = "{\"status\":\"valid\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"a.example\"}],\"authorizations\":[\"https://example.com/authz/1\"],\"finalize\":\"https://example.com/finalize/1\"}";
+    if (order.parse(response(status.OK, ?fields,
+            view.view(mismatched, length(mismatched))), known,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            storage, ?parsed).code != problem.MALFORMED_JSON) { ret 4; }
+
+    # capacity failure leaves the caller's order record untouched
+    var guarded: order.Order;
+    fill((?guarded)::*u8, 0xa5, $size_of(order.Order));
+    val small: order.Storage = order.Storage{data: ?text[0], capacity: 8,
+        identifiers: ?names[0], identifier_capacity: 4,
+        authorizations: ?authorizations[0], authorization_capacity: 4};
+    if (order.parse(response(status.OK, ?fields,
+            view.view(body, length(body))), known,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            small, ?guarded).code != problem.OUTPUT_TOO_SMALL ||
+        !filled((?guarded)::*u8, 0xa5, $size_of(order.Order))) { ret 5; }
+    var narrow: order.Storage = storage;
+    narrow.identifier_capacity = 1;
+    if (order.parse(response(status.OK, ?fields,
+            view.view(body, length(body))), known,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            narrow, ?guarded).code != problem.OUTPUT_TOO_SMALL ||
+        !filled((?guarded)::*u8, 0xa5, $size_of(order.Order))) { ret 6; }
+
+    # a policy that forbids wildcards rejects an order the authority echoes
+    val wild: *u8 = "{\"status\":\"pending\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"*.a.example\"}],\"authorizations\":[\"https://example.com/authz/1\"],\"finalize\":\"https://example.com/finalize/1\"}";
+    var strict: identifier.Policy = identifier.policy_default();
+    strict.allow_wildcard = false;
+    if (order.parse(response(status.OK, ?fields,
+            view.view(wild, length(wild))), known, strict, order_limits(),
+            ?scratch[0], 32768, storage, ?guarded).code !=
+            problem.MALFORMED_JSON ||
+        !filled((?guarded)::*u8, 0xa5, $size_of(order.Order))) { ret 7; }
+    if (problem.failed(order.parse(response(status.OK, ?fields,
+            view.view(wild, length(wild))), known,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            storage, ?parsed))) { ret 8; }
+
+    # a poll response with no known order url cannot name a resource
+    if (order.parse(response(status.OK, ?fields,
+            view.view(body, length(body))), view.view(nil, 0),
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            storage, ?guarded).code != problem.INVALID_INPUT) { ret 9; }
+
+    # scratch that aliases output storage fails before anything is written
+    if (order.parse(response(status.OK, ?fields,
+            view.view(body, length(body))), known,
+            identifier.policy_default(), order_limits(), ?text[0], 4096,
+            storage, ?guarded).code != problem.INVALID_INPUT ||
+        !filled((?guarded)::*u8, 0xa5, $size_of(order.Order))) { ret 10; }
+    ret 0;
+}
+
+test "order: authorization expiry, wildcard, and challenge decoding are bounded" {
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var scratch: [32768]u8;
+    var text: [4096]u8;
+    var challenges: [8]challenge.Challenge;
+    val storage: order.AuthorizationStorage = order.AuthorizationStorage{
+        data: ?text[0], capacity: 4096, challenges: ?challenges[0],
+        challenge_capacity: 8};
+    val url: view.View = view.view("https://example.com/authz/1", 27);
+    val wildcard: *u8 = "{\"status\":\"pending\",\"wildcard\":true,\"expires\":\"2026-01-01T00:00:00Z\",\"identifier\":{\"type\":\"dns\",\"value\":\"a.example\"},\"challenges\":[{\"type\":\"dns-01\",\"url\":\"https://example.com/chall/1\",\"token\":\"tok-1\",\"status\":\"pending\"}]}";
+    var parsed: order.Authorization;
+    if (problem.failed(order.parse_authorization(response(status.OK, ?fields,
+            view.view(wildcard, length(wildcard))), url,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            storage, ?parsed))) { ret 1; }
+    if (!parsed.wildcard || parsed.status != order.AUTH_PENDING ||
+        parsed.challenge_len != 1 || parsed.expires.len != 20 ||
+        parsed.challenges[0].typ != challenge.DNS_01 ||
+        parsed.challenges[0].status != challenge.PENDING) { ret 2; }
+    # rfc 8555 admits only dns-01 for a wildcard authorization
+    if (!order.challenge_admissible(parsed, challenge.DNS_01) ||
+        order.challenge_admissible(parsed, challenge.HTTP_01) ||
+        order.select_challenge(parsed, challenge.HTTP_01) != nil) { ret 3; }
+
+    # an expired authorization decodes to its own terminal status
+    val expired: *u8 = "{\"status\":\"expired\",\"identifier\":{\"type\":\"dns\",\"value\":\"a.example\"},\"challenges\":[{\"type\":\"http-01\",\"url\":\"https://example.com/chall/1\",\"token\":\"tok-1\",\"status\":\"invalid\",\"error\":{\"type\":\"urn:ietf:params:acme:error:connection\",\"detail\":\"no answer\",\"status\":400}}]}";
+    if (problem.failed(order.parse_authorization(response(status.OK, ?fields,
+            view.view(expired, length(expired))), url,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            storage, ?parsed))) { ret 4; }
+    if (parsed.status != order.AUTH_EXPIRED || parsed.wildcard ||
+        parsed.challenges[0].status != challenge.INVALID ||
+        parsed.challenges[0].failure.status != 400 ||
+        parsed.challenges[0].failure.typ.len == 0) { ret 5; }
+
+    # a hostile token and an unknown status both fail closed
+    var guarded: order.Authorization;
+    fill((?guarded)::*u8, 0xa5, $size_of(order.Authorization));
+    val hostile: *u8 = "{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"a.example\"},\"challenges\":[{\"type\":\"http-01\",\"url\":\"https://example.com/chall/1\",\"token\":\"tok 1\",\"status\":\"pending\"}]}";
+    if (order.parse_authorization(response(status.OK, ?fields,
+            view.view(hostile, length(hostile))), url,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            storage, ?guarded).code != problem.MALFORMED_JSON ||
+        !filled((?guarded)::*u8, 0xa5, $size_of(order.Authorization))) {
+        ret 6;
+    }
+    val unknown: *u8 = "{\"status\":\"surprising\",\"identifier\":{\"type\":\"dns\",\"value\":\"a.example\"},\"challenges\":[{\"type\":\"http-01\",\"url\":\"https://example.com/chall/1\",\"token\":\"tok-1\",\"status\":\"pending\"}]}";
+    if (order.parse_authorization(response(status.OK, ?fields,
+            view.view(unknown, length(unknown))), url,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            storage, ?guarded).code != problem.MALFORMED_JSON ||
+        !filled((?guarded)::*u8, 0xa5, $size_of(order.Authorization))) {
+        ret 7;
+    }
+    # an unimplemented challenge type is retained without failing the whole
+    # authorization, and is simply not selectable
+    val mixed: *u8 = "{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"a.example\"},\"challenges\":[{\"type\":\"tls-sni-99\",\"url\":\"https://example.com/chall/9\",\"token\":\"tok-9\",\"status\":\"pending\"},{\"type\":\"http-01\",\"url\":\"https://example.com/chall/1\",\"token\":\"tok-1\",\"status\":\"pending\"}]}";
+    if (problem.failed(order.parse_authorization(response(status.OK, ?fields,
+            view.view(mixed, length(mixed))), url,
+            identifier.policy_default(), order_limits(), ?scratch[0], 32768,
+            storage, ?parsed))) { ret 8; }
+    if (parsed.challenge_len != 2 || parsed.challenges[0].typ != 0 ||
+        parsed.challenges[1].typ != challenge.HTTP_01 ||
+        order.select_challenge(parsed, 0) != nil ||
+        order.select_challenge(parsed, challenge.HTTP_01) == nil) { ret 9; }
+    ret 0;
+}
+
+test "order: newOrder payloads are exact and reject invalid identifiers" {
+    var names: [2]identifier.Identifier;
+    names[0] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("a.example", 9)};
+    names[1] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("*.b.example", 11)};
+    var output: [512]u8;
+    val encoded: order.Operation = order.encode(
+        order.Request{identifiers: ?names[0], len: 2,
+            not_before: view.view(nil, 0), not_after: view.view(nil, 0)},
+        identifier.policy_default(), order_limits(),
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    val expected: *u8 = "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"a.example\"},{\"type\":\"dns\",\"value\":\"*.b.example\"}]}";
+    if (problem.failed(encoded.error) ||
+        encoded.written != length(expected) ||
+        !equal(?output[0], expected, encoded.written)) { ret 1; }
+
+    var dated: order.Request = order.Request{identifiers: ?names[0], len: 1,
+        not_before: view.view("2026-01-01T00:00:00Z", 20),
+        not_after: view.view("2026-04-01T00:00:00Z", 20)};
+    val windowed: order.Operation = order.encode(dated,
+        identifier.policy_default(), order_limits(),
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    val expected_window: *u8 = "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"a.example\"}],\"notBefore\":\"2026-01-01T00:00:00Z\",\"notAfter\":\"2026-04-01T00:00:00Z\"}";
+    if (problem.failed(windowed.error) ||
+        windowed.written != length(expected_window) ||
+        !equal(?output[0], expected_window, windowed.written)) { ret 2; }
+
+    # a duplicate identifier makes the authorization list ambiguous
+    var duplicated: [2]identifier.Identifier;
+    duplicated[0] = names[0];
+    duplicated[1] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("A.EXAMPLE", 9)};
+    fill(?output[0], 0xa5, 512);
+    if (order.encode(order.Request{identifiers: ?duplicated[0], len: 2,
+            not_before: view.view(nil, 0), not_after: view.view(nil, 0)},
+            identifier.policy_default(), order_limits(),
+            contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
+            problem.INVALID_INPUT || !filled(?output[0], 0xa5, 512)) { ret 3; }
+
+    # an empty order, a malformed timestamp, and a denied wildcard all fail
+    var strict: identifier.Policy = identifier.policy_default();
+    strict.allow_wildcard = false;
+    var bad_time: order.Request = dated;
+    bad_time.not_after = view.view("soon", 4);
+    if (order.encode(order.Request{identifiers: ?names[0], len: 0,
+            not_before: view.view(nil, 0), not_after: view.view(nil, 0)},
+            identifier.policy_default(), order_limits(),
+            contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
+            problem.INVALID_INPUT ||
+        order.encode(bad_time, identifier.policy_default(), order_limits(),
+            contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
+            problem.INVALID_INPUT ||
+        order.encode(order.Request{identifiers: ?names[0], len: 2,
+            not_before: view.view(nil, 0), not_after: view.view(nil, 0)},
+            strict, order_limits(),
+            contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
+            problem.INVALID_INPUT || !filled(?output[0], 0xa5, 512)) { ret 4; }
+
+    # a short output is measured before any byte is published
+    if (order.encode(order.Request{identifiers: ?names[0], len: 2,
+            not_before: view.view(nil, 0), not_after: view.view(nil, 0)},
+            identifier.policy_default(), order_limits(),
+            contracts.Buffer{data: ?output[0], capacity: 16}).error.code !=
+            problem.OUTPUT_TOO_SMALL || !filled(?output[0], 0xa5, 512)) {
+        ret 5;
+    }
     ret 0;
 }
