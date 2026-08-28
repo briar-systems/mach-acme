@@ -54,7 +54,10 @@ fun valid_nonce(value: view.View, max_nonce_bytes: usize) bool {
     var i: usize = 0;
     for (i < value.len) {
         val byte: u8 = value.data[i];
-        if (byte <= ' ' || byte >= 127) { ret false; }
+        if (!((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_')) {
+            ret false;
+        }
         i = i + 1;
     }
     ret true;
