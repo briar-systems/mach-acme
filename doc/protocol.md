@@ -37,7 +37,9 @@ are rejected before output storage is changed.
 
 `jose.Signer` contains public key material and bounded output dimensions only.
 Private keys are passed separately as `jose.PrivateKey` for each signing operation.
-This keeps durable key ownership with the application or its secret provider.
+Each private key also carries a non-null opaque `secret_owner` identity. This keeps
+durable key ownership with the application or its secret provider without
+declassifying a secret-qualified address.
 
 Supported account algorithms are:
 
@@ -59,7 +61,8 @@ provider supplies public and secret ownership predicates plus a post-callback
 validation function. Those callbacks and their contexts remain valid and
 immutable for the operation. Any declared overlap with the message, output,
 public key, protocol state, or salt destination fails before entropy is requested.
-The message and bound ACME inputs are checked again after the callback. An absent
+The private RSA exponent is included in the secret ownership checks. The message
+and bound ACME inputs are checked again after the callback. An absent
 or failing provider returns `ENTROPY_UNAVAILABLE`. A provider that changes an
 input or fails post-callback validation returns `INVALID_INPUT` before final
 output is published. Salt storage is zeroed before and after the provider and
@@ -80,36 +83,51 @@ A `nonce.Pool` owns copies of available nonces. The supplied memory implementati
 uses fixed caller storage and rejects empty, oversized, non-base64url, duplicate,
 and over-capacity values. Its `Memory`, slot array, and complete declared byte
 store must be mathematically representable and pairwise disjoint. Put inputs and
-take outputs cannot alias any of those regions. Alias and range failures occur
+reservation outputs cannot alias any of those regions. Alias and range failures occur
 before a nonce is copied, consumed, or wiped.
 
-The memory implementation serializes put, take, and clear operations with its
+The memory implementation serializes put, reserve, commit, release, and clear
+operations with its
 embedded mutex. Initialization and release require exclusive ownership. Release
 wipes the complete declared backing store and makes existing pool handles fail
 readiness validation before the storage can be initialized again. Sequence
 exhaustion fails closed until the pool is cleared.
 
-Taking a nonce copies it to caller storage and then wipes and retires its slot. The
-newest available nonce is selected. A small destination does not consume or modify
-the stored nonce. Clearing the pool wipes every slot.
+Reserving a nonce copies the newest available value to caller storage and marks its
+slot unavailable to other reservations. Commit wipes and retires exactly that
+reservation. Release makes exactly that reservation available again with its
+original ordering. Invalid, repeated, or foreign transaction tokens fail without
+changing another slot. A small destination does not reserve or modify the stored
+nonce. Clearing the pool wipes available and reserved slots and invalidates their
+tokens. `nonce.take` is a convenience operation that reserves and immediately
+commits through the same contract.
 
 `Client` copies the `Pool` callback descriptor during initialization. The source
 descriptor therefore need not remain alive, but its `ctx` and the storage behind
 that context must remain valid until client release. The descriptor includes an
 immutable ownership predicate for every byte range owned by the provider. The
-predicate, callback pointers, dimensions, owned regions, and their backing state
+descriptor also includes `owns_secret(ctx, owner)`. It accepts the opaque owner
+identity carried by a private key, so providers can declare arbitrary secret
+ownership domains without receiving or declassifying secret addresses. The
+predicates, callback pointers, dimensions, owned regions, ownership domains, and
+their backing state
 must not change until release. Client state, request state, signing inputs, work,
 output, callback inputs, and callback outputs are checked against that predicate
 before the corresponding callback boundary. Callback pointers, dimensions, and
-readiness are checked at initialization and every callback boundary. A take
-result is accepted only when it identifies the exact supplied output buffer, has a
-bounded nonzero base64url length, and is internally consistent with its error and
-`found` fields. Readiness, take, put, and clear callbacks must not mutate the bound
-`Client` or `SignedRequest`. Such mutation fails closed and is never overwritten by
-the protocol layer.
+readiness are checked at initialization and every callback boundary. A reservation
+is accepted only when it has a nonzero token, identifies the exact supplied output
+buffer, has a bounded nonzero base64url length, and is internally consistent with
+its error and `found` fields. Readiness, ownership, reserve, commit, release, put,
+and clear callbacks must not mutate the bound `Client` or `SignedRequest`.
+`Client.callback_active` rejects reentrant client operations before they can change
+protocol state. Post-callback validation still rejects direct mutation. Such
+mutation fails closed and is never overwritten by the protocol layer.
 
-`client.prepare_signed` consumes a normal pool nonce before signing. Once handed
-to an attempt, that nonce is never returned to the pool. A nonce reserved for a
+`client.prepare_signed` reserves a normal pool nonce before signing. A local
+signing or capacity failure releases it, so an attempt that produced no wire body
+does not destroy a credential. Successful signing commits the reservation before
+the output view is published. A commit or release failure terminalizes the request,
+publishes no body, and wipes any encoded prefix after a failed commit. A nonce reserved for a
 specific `badNonce` recovery stays attached to that request across local signing
 failure because no wire request was emitted. It never becomes available to a
 different request.
@@ -152,6 +170,12 @@ nonce and entropy callbacks. `signed_wire` checks them again, so changing any
 borrowed input before preparation or after a body is prepared fails closed. The
 transport URL can never diverge from the URL protected by the JWS.
 
+Both signed-response and nonce-response acceptance check those bindings before
+parsing or invoking a provider. Once a final signed response is admitted, every
+terminal shape, alias, parse, provider, or policy failure clears the retained wire
+body and enters `REQUEST_FAILED`. A failed response callback can therefore never
+leave a replayable POST body behind.
+
 The caller must not replay a POST body after an ambiguous transport failure. The
 prepared request retains the exact output view accepted by signing. `signed_wire`
 does not accept a replacement body and clears that view when the response is
@@ -179,6 +203,8 @@ zeroes, truncated fractions or exponents, and integer parts outside the parser's
 signed 64-bit accumulation range are rejected. `max_json_key_comparisons` bounds
 decoded duplicate-member detection independently of byte and value limits, so a
 large object cannot turn a bounded response into unbounded quadratic work.
+Range-size output records and JSON object records are themselves checked as full
+representable ranges before write or dereference, including at the maximum address.
 
 Response bodies and fields need only remain alive for the accepting call, except
 that `Error.http.body` retains the supplied view. Directory and parsed problem views

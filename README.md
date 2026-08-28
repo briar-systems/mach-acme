@@ -20,8 +20,9 @@ ownership contract.
 - caller-provided entropy for RSA-PSS with ownership predicates, post-callback
   validation, transactional output, and explicit salt zeroization
 - bounded one-use replay nonce storage with deterministic newest-first selection
-- immutable nonce callback descriptors and owned ranges with fail-closed result,
-  alias, and state validation
+  and reserve, commit, and release transactions
+- immutable nonce callback descriptors, public ranges, and opaque secret-owner
+  domains with fail-closed result, alias, reentrancy, and state validation
 - signed-request state and bounded per-request `badNonce` recovery
 - exact URL, payload, `kid`, and prepared-body binding with timeout and response
   bounds on every wire request
@@ -39,7 +40,8 @@ The transport-independent path is:
    `client.parse_directory`.
 3. Execute `client.nonce_request` when no replay nonce is available.
 4. Initialize a `client.SignedRequest` with `client.begin_signed`.
-5. Call `client.prepare_signed`, which consumes one stored nonce and writes a JWS.
+5. Call `client.prepare_signed`, which reserves a stored nonce, writes a JWS, and
+   commits the nonce only when the exact wire body is ready.
 6. Execute the POST described by `client.signed_wire`. Its body is the exact output accepted by `prepare_signed`.
 7. Deliver the response to `client.accept_signed_response` and follow its action.
 
