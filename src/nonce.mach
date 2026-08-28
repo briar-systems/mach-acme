@@ -314,7 +314,7 @@ fun reserve_locked(memory: *Memory, output: *u8,
     if (memory.next_reservation == 18446744073709551615) {
         ret empty_reservation(problem.local_code(problem.STATE,
             problem.INVALID_STATE,
-            "nonce reservation sequence is exhausted; clear the pool"));
+            "nonce reservation sequence is exhausted; reinitialize the pool"));
     }
     val input: *u8 = slot_data(memory, selected);
     i = 0;
@@ -415,7 +415,6 @@ fun clear_locked(memory: *Memory) problem.Error {
         i = i + 1;
     }
     memory.next_sequence = 1;
-    memory.next_reservation = 1;
     ret problem.none();
 }
 
@@ -704,7 +703,16 @@ test "acme.nonce: reservation commit and release are exact transactions" {
     val active: Reservation = value.reserve(value.ctx, ?first_output[0], 16);
     if (problem.failed(active.error) || !active.found ||
         problem.failed(value.clear(value.ctx)) ||
+        !problem.failed(value.commit(value.ctx, active.token))) { ret 8; }
+    if (problem.failed(value.put(value.ctx, view.view("after_clear", 11)))) {
+        ret 9;
+    }
+    val after_clear: Reservation = value.reserve(value.ctx,
+        ?first_output[0], 16);
+    if (problem.failed(after_clear.error) || !after_clear.found ||
+        after_clear.token == active.token ||
         !problem.failed(value.commit(value.ctx, active.token)) ||
-        take(value, ?first_output[0], 16).found) { ret 8; }
+        problem.failed(value.commit(value.ctx, after_clear.token)) ||
+        take(value, ?first_output[0], 16).found) { ret 10; }
     ret 0;
 }

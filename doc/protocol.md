@@ -99,8 +99,8 @@ reservation. Release makes exactly that reservation available again with its
 original ordering. Invalid, repeated, or foreign transaction tokens fail without
 changing another slot. A small destination does not reserve or modify the stored
 nonce. Clearing the pool wipes available and reserved slots and invalidates their
-tokens. `nonce.take` is a convenience operation that reserves and immediately
-commits through the same contract.
+tokens without reusing their transaction identities. `nonce.take` is a convenience
+operation that reserves and immediately commits through the same contract.
 
 `Client` copies the `Pool` callback descriptor during initialization. The source
 descriptor therefore need not remain alive, but its `ctx` and the storage behind
