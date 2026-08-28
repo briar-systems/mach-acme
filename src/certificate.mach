@@ -1180,3 +1180,122 @@ pub fun parse_alternates(response: client.Response, max_url_bytes: usize,
     @output = Alternates{urls: urls, len: count};
     ret problem.none();
 }
+
+# the two fields draft-ietf-acme-ari builds a certificate identifier from: the
+# authority key identifier and the serial number, both as their exact der
+# content octets
+pub fun renewal_id_parts(der: view.View, key_id: *view.View,
+    serial: *view.View) problem.Error {
+    if (!memory_range.valid(der.data, der.len) || der.len == 0 ||
+        der.len > MAX_CERTIFICATE_BYTES || key_id == nil || serial == nil) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid renewal identifier inputs");
+    }
+    var outer: Reader = reader(der);
+    var body_bytes: view.View;
+    if (!read_expect(?outer, TAG_SEQUENCE, ?body_bytes) ||
+        !reader_done(?outer)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate is not a single der sequence");
+    }
+    var certificate: Reader = reader(body_bytes);
+    var tbs_bytes: view.View;
+    if (!read_expect(?certificate, TAG_SEQUENCE, ?tbs_bytes)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate has no tbsCertificate");
+    }
+    var tbs: Reader = reader(tbs_bytes);
+    var tag: u8 = 0;
+    var content: view.View;
+    if (!read_tlv(?tbs, ?tag, ?content)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "tbsCertificate is empty");
+    }
+    if (tag == 0xa0) {
+        if (!read_tlv(?tbs, ?tag, ?content)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "tbsCertificate has no serial number");
+        }
+    }
+    if (tag != TAG_INTEGER || content.len == 0 || content.len > 20) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate serial number is invalid");
+    }
+    @serial = content;
+    # signature algorithm, issuer, validity, subject, public key
+    if (!skip(?tbs, 5)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "tbsCertificate is malformed before its extensions");
+    }
+    var extensions_bytes: view.View;
+    var found: bool = false;
+    for (!reader_done(?tbs) && !found) {
+        if (!read_tlv(?tbs, ?tag, ?content)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "tbsCertificate is malformed after the public key");
+        }
+        if (tag == 0xa3) {
+            extensions_bytes = content;
+            found = true;
+        }
+    }
+    if (!found) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate has no extensions");
+    }
+    var wrapper: Reader = reader(extensions_bytes);
+    var list_bytes: view.View;
+    if (!read_expect(?wrapper, TAG_SEQUENCE, ?list_bytes) ||
+        !reader_done(?wrapper)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate extensions are malformed");
+    }
+    var extensions: Reader = reader(list_bytes);
+    for (!reader_done(?extensions)) {
+        var extension_bytes: view.View;
+        if (!read_expect(?extensions, TAG_SEQUENCE, ?extension_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "certificate extension is malformed");
+        }
+        var extension: Reader = reader(extension_bytes);
+        var oid_bytes: view.View;
+        if (!read_expect(?extension, TAG_OBJECT_ID, ?oid_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "certificate extension has no oid");
+        }
+        var value_bytes: view.View;
+        if (!read_tlv(?extension, ?tag, ?value_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "certificate extension has no value");
+        }
+        if (tag == 0x01 && !read_tlv(?extension, ?tag, ?value_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "critical certificate extension has no value");
+        }
+        # rfc 5280 authorityKeyIdentifier is 2.5.29.35
+        if (oid_bytes.len == 3 && oid_bytes.data[0] == 0x55 &&
+            oid_bytes.data[1] == 0x1d && oid_bytes.data[2] == 0x23 &&
+            tag == TAG_OCTET_STRING) {
+            var aki: Reader = reader(value_bytes);
+            var aki_bytes: view.View;
+            if (!read_expect(?aki, TAG_SEQUENCE, ?aki_bytes)) {
+                ret problem.local_code(problem.PROTOCOL,
+                    problem.INVALID_INPUT,
+                    "authority key identifier is malformed");
+            }
+            var fields: Reader = reader(aki_bytes);
+            var key_bytes: view.View;
+            # [0] keyIdentifier is the first field when present
+            if (!read_tlv(?fields, ?tag, ?key_bytes) || tag != 0x80 ||
+                key_bytes.len == 0) {
+                ret problem.local_code(problem.PROTOCOL,
+                    problem.INVALID_INPUT,
+                    "authority key identifier has no key identifier");
+            }
+            @key_id = key_bytes;
+            ret problem.none();
+        }
+    }
+    ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+        "certificate has no authority key identifier");
+}

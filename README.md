@@ -65,6 +65,9 @@ ownership contract.
 - file-backed durable state: versioned, checksummed documents replaced
   atomically with owner-only permissions, and a store that survives restart,
   reports corruption, and refuses a stale writer
+- ARI certificate identifiers, renewal-information windows, and a renewal
+  scheduler with randomized selection, bounded retry, clock-skew handling,
+  observable transitions, and cancellation
 
 ## Protocol boundary
 
@@ -291,3 +294,36 @@ maps that identity back to its key material.
 `file_store.copy_document` is backup and restore: the source is fully validated
 before anything is written, so a backup cannot capture a corrupt document and a
 restore cannot install one.
+
+## Renewal
+
+`renewal_info` implements draft-ietf-acme-ari. `certificate_id` builds the
+identifier from the certificate's own authority key identifier and serial
+number, `request_url` joins it to the directory's `renewalInfo` base, and
+`parse` validates the suggested window before retaining it. The window is
+advice, not an instruction: one that is inverted, unparseable, or absent leaves
+the caller on its own policy.
+
+`renewal` owns no clock, no timer, and no randomness. Every decision is a pure
+function of the caller's supplied reading, the certificate's own lifetime, the
+authority's advice, and an injected random source, so a deployment and a test
+see identical behaviour.
+
+The authority's window wins when it is usable, because it is the only party
+that knows about a mass revocation, and it is still clamped to the
+certificate's own lifetime so a wild suggestion cannot schedule a renewal after
+expiry. Without usable advice, renewal is planned a policy lead before expiry
+and spread with jitter so a fleet does not renew in lockstep.
+
+Urgency comes from the certificate's lifetime rather than only the planned
+instant, so a certificate inside its renewal lead is due even if the clock
+drifted. A schedule that is backing off is excluded from that shortcut, which
+is what keeps an expiring certificate that keeps failing from retrying without
+pause. Retries back off within a ceiling and count against a fixed budget, and
+a clock that moved backwards past the tolerated skew is replanned rather than
+fired. Every state change is reported to an observer, and cancellation is
+terminal.
+
+`select_next` picks the certificate closest to expiry among those actually
+ready, so expiring certificates get priority without a backing-off one being
+selected before its delay elapses.

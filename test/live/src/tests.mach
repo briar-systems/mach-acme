@@ -25,6 +25,8 @@ use crypto.contracts;
 use crypto.group.p256;
 use crypto.signature;
 use acme.certificate;
+use acme.renewal;
+use acme.renewal_info;
 use acme.account;
 use acme.challenge;
 use acme.client;
@@ -1451,18 +1453,55 @@ test "live: an order is finalized, downloaded, verified, and revoked" {
         ret 24;
     }
 
+    # draft-ietf-acme-ari: ask the authority when it would prefer this exact
+    # certificate to be renewed, and plan from its answer
+    if (session.directory.renewal_info_url.len == 0) { ret 31; }
+    var id_bytes: [128]u8;
+    val certificate_id: renewal_info.Operation =
+        renewal_info.certificate_id(chain.certificates[0].der,
+            contracts.Buffer{data: ?id_bytes[0], capacity: 128});
+    if (problem.failed(certificate_id.error)) { ret 32; }
+    var ari_url: [512]u8;
+    val ari: renewal_info.Operation = renewal_info.request_url(
+        session.directory.renewal_info_url, certificate_id.value, 4096,
+        contracts.Buffer{data: ?ari_url[0], capacity: 512});
+    if (problem.failed(ari.error)) { ret 33; }
+    if (!execute(renewal_info.request(ari.value, client.limits_default()),
+            ?exchange)) { ret 34; }
+    var window: renewal_info.Window;
+    if (problem.failed(renewal_info.parse(response(?exchange),
+            client.limits_default(), ?session.scratch[0], 32768, ?window))) {
+        ret 35;
+    }
+    # the authority's window must be usable and sit inside the certificate's
+    # own lifetime, which is what the scheduler then clamps against
+    if (!renewal_info.window_valid(window) ||
+        window.end_unix <= parsed.not_before_unix) { ret 36; }
+
+    var schedule: renewal.Schedule;
+    var renewal_policy: renewal.Policy = renewal.policy_default();
+    renewal_policy.renew_before_seconds = 2592000;
+    if (problem.failed(renewal.begin(?schedule, renewal_policy,
+            view.view(?name[0], name_len), parsed.not_before_unix,
+            parsed.not_after_unix))) { ret 37; }
+    if (problem.failed(renewal.plan(?schedule, window, renewal.no_random(),
+            parsed.not_before_unix, renewal.no_observer()))) { ret 38; }
+    # the planned instant is inside the certificate this authority issued
+    if (schedule.next_run_unix < parsed.not_before_unix ||
+        schedule.next_run_unix > parsed.not_after_unix) { ret 39; }
+
     # rfc 8555 section 7.6 revocation under the account key
     var revoke_payload: [32768]u8;
     val revoke: certificate.Operation = certificate.encode_revoke(
         chain.certificates[0].der, certificate.SUPERSEDED,
         contracts.Buffer{data: ?revoke_payload[0], capacity: 32768});
-    if (problem.failed(revoke.error)) { ret 25; }
+    if (problem.failed(revoke.error)) { ret 40; }
     var revocation: client.SignedRequest;
     if (problem.failed(certificate.begin_revoke(?session.protocol,
             ?revocation, session.directory.revoke_cert_url,
             session.account.url, revoke.value, revoke, false,
-            jose.signer(session.public_key)))) { ret 26; }
-    if (!run_signed(?session, ?revocation, ?exchange, ?decision)) { ret 27; }
+            jose.signer(session.public_key)))) { ret 41; }
+    if (!run_signed(?session, ?revocation, ?exchange, ?decision)) { ret 42; }
 
     # revoking the same certificate again is refused by the authority with a
     # structured acme problem rather than silently accepted
@@ -1470,9 +1509,9 @@ test "live: an order is finalized, downloaded, verified, and revoked" {
     if (problem.failed(certificate.begin_revoke(?session.protocol, ?again,
             session.directory.revoke_cert_url, session.account.url,
             revoke.value, revoke, false,
-            jose.signer(session.public_key)))) { ret 28; }
-    if (run_signed(?session, ?again, ?exchange, ?decision)) { ret 29; }
+            jose.signer(session.public_key)))) { ret 43; }
+    if (run_signed(?session, ?again, ?exchange, ?decision)) { ret 44; }
     if (decision.cause.code != problem.ACME_PROBLEM ||
-        decision.cause.problem.typ.len == 0) { ret 30; }
+        decision.cause.problem.typ.len == 0) { ret 45; }
     ret 0;
 }

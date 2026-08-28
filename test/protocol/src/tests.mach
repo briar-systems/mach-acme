@@ -29,6 +29,7 @@ use acme.challenge;
 use acme.identifier;
 use acme.order;
 use acme.poll;
+use acme.renewal_info;
 use acme.external_account;
 use acme.jose;
 use acme.json;
@@ -4910,5 +4911,71 @@ test "file store: concurrent writers are serialized to one committed record" {
 
     fs.remove_file(account_path);
     fs.remove_file(certificate_path);
+    ret 0;
+}
+
+test "renewal info: certificate identifiers, urls, and windows are exact" {
+    val pem: *u8 = leaf_pem();
+    var certificates: [4]certificate.Certificate;
+    var der: [8192]u8;
+    var chain: certificate.Chain;
+    if (problem.failed(certificate.parse_chain(
+            view.view(pem, length(pem)), ?certificates[0], 4, ?der[0], 8192,
+            ?chain))) { ret 1; }
+
+    # draft-ietf-acme-ari section 4.1, checked against a value computed from
+    # the certificate's own authority key identifier and serial number
+    var id_bytes: [128]u8;
+    val id: renewal_info.Operation = renewal_info.certificate_id(
+        chain.certificates[0].der,
+        contracts.Buffer{data: ?id_bytes[0], capacity: 128});
+    val expected_id: *u8 = "JN2JEPbmZ7Tb4bkwIh4k5MdM9bU.bnYIUfdvfMCkoKJt0Eea62OURk4";
+    if (problem.failed(id.error) || id.written != length(expected_id) ||
+        !equal(?id_bytes[0], expected_id, id.written)) { ret 2; }
+
+    # the request url joins the directory's base with that identifier, and a
+    # base that already ends in a slash does not gain a second one
+    var url_bytes: [512]u8;
+    val joined: renewal_info.Operation = renewal_info.request_url(
+        view.view("https://example.com/acme/renewal-info", 37), id.value,
+        4096, contracts.Buffer{data: ?url_bytes[0], capacity: 512});
+    val expected_url: *u8 = "https://example.com/acme/renewal-info/JN2JEPbmZ7Tb4bkwIh4k5MdM9bU.bnYIUfdvfMCkoKJt0Eea62OURk4";
+    if (problem.failed(joined.error) ||
+        joined.written != length(expected_url) ||
+        !equal(?url_bytes[0], expected_url, joined.written)) { ret 3; }
+    val slashed: renewal_info.Operation = renewal_info.request_url(
+        view.view("https://example.com/acme/renewal-info/", 38), id.value,
+        4096, contracts.Buffer{data: ?url_bytes[0], capacity: 512});
+    if (problem.failed(slashed.error) ||
+        slashed.written != length(expected_url) ||
+        !equal(?url_bytes[0], expected_url, slashed.written)) { ret 4; }
+
+    # a short output and a non-https base both fail closed
+    fill(?url_bytes[0], 0xa5, 512);
+    if (renewal_info.request_url(
+            view.view("https://example.com/acme/renewal-info", 37), id.value,
+            4096, contracts.Buffer{data: ?url_bytes[0], capacity: 16}
+            ).error.code != problem.OUTPUT_TOO_SMALL ||
+        renewal_info.request_url(
+            view.view("http://example.com/acme/renewal-info", 36), id.value,
+            4096, contracts.Buffer{data: ?url_bytes[0], capacity: 512}
+            ).error.code != problem.INVALID_INPUT ||
+        !filled(?url_bytes[0], 0xa5, 512)) { ret 5; }
+
+    # a suggested window decodes to unix seconds and carries the advice
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var scratch: [16384]u8;
+    var window: renewal_info.Window;
+    val body: *u8 = "{\"suggestedWindow\":{\"start\":\"2026-01-02T03:04:05Z\",\"end\":\"2026-01-09T03:04:05Z\"}}";
+    var advised: client.Response = response(status.OK, ?fields,
+        view.view(body, length(body)));
+    advised.retry_after_seconds = 21600;
+    if (problem.failed(renewal_info.parse(advised, client.limits_default(),
+            ?scratch[0], 16384, ?window))) { ret 6; }
+    if (!renewal_info.window_valid(window) ||
+        window.start_unix != 1767323045 ||
+        window.end_unix != 1767927845 ||
+        window.retry_after_seconds != 21600) { ret 7; }
     ret 0;
 }
