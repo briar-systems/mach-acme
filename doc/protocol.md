@@ -13,7 +13,10 @@ passes a bounded `client.Response` to `client.parse_directory`.
 Every successful `WireRequest` carries the configured timeout and maximum
 response body size. A constructor failure is retained in `WireRequest.error` and
 must not be sent. URLs are bounded HTTPS absolute URIs without fragments,
-userinfo, controls, malformed percent escapes, or non-ASCII wire bytes.
+userinfo, controls, malformed percent escapes, or non-ASCII wire bytes. The HTTPS
+scheme is matched case insensitively and accepted URL bytes are retained exactly.
+This narrow local check will be replaced by the shared client URL and authority
+policy from `mach-http` issue 11 when transport integration lands.
 
 Parsing requires HTTP 200, a strict UTF-8 JSON object, unique decoded member names,
 and HTTPS URLs for `newNonce`, `newAccount`, and `newOrder`. Optional `newAuthz`,
@@ -24,6 +27,11 @@ requires.
 The caller supplies JSON scratch, text storage, and a CAA view array. Successful
 views point into the caller's text storage. Any parse, type, limit, or capacity
 failure leaves the output record and text storage unchanged.
+
+All declared byte and item ranges must be mathematically representable. JSON
+input, response bodies and fields, scratch, text storage, item arrays, and output
+records must not overlap where parsing writes through either view. Alias failures
+are rejected before output storage is changed.
 
 ## Account keys and JWS
 
@@ -49,8 +57,11 @@ RSA-PSS asks the supplied entropy provider for exactly 32 secret bytes. Callers
 construct this boundary with `jose.entropy_provider` or `jose.no_entropy`. An
 absent or failing provider returns `ENTROPY_UNAVAILABLE`. Salt storage is zeroed
 before and after the provider and after signing. Signing work and final output
-must not overlap. Capacity, key, entropy, or encoding failure leaves the final
-output unchanged.
+must not overlap each other, the payload, protected header views, or public key
+storage. JWK, thumbprint, and signature outputs must not overlap their public
+inputs. Secret-qualified key storage cannot alias public mutable buffers in
+well-typed Mach code. Capacity, key, entropy, alias, or encoding failure leaves
+the final output unchanged.
 
 Outer ACME requests explicitly include a nonce. The same encoder can omit it for
 the nested JWS required by account key rollover. A protected header cannot both
@@ -72,14 +83,19 @@ Taking a nonce copies it to caller storage and then wipes and retires its slot. 
 newest available nonce is selected. A small destination does not consume or modify
 the stored nonce. Clearing the pool wipes every slot.
 
-`client.prepare_signed` consumes a nonce before signing. Once handed to a signing
-attempt, that nonce is never returned to the pool, including when local signing
-fails. This conservative ownership rule prevents accidental replay across callers.
+`client.prepare_signed` consumes a normal pool nonce before signing. Once handed
+to an attempt, that nonce is never returned to the pool. A nonce reserved for a
+specific `badNonce` recovery stays attached to that request across local signing
+failure because no wire request was emitted. It never becomes available to a
+different request.
 
 Every successful ACME response may contribute one `Replay-Nonce`. A `badNonce`
-response first discards all stale nonces, then stores its fresh response nonce when
-present. If absent, the state machine requests a HEAD acquisition. Retry count is
-bounded by `Limits.max_bad_nonce_retries`.
+response first discards all stale shared nonces, then copies its fresh response
+nonce into the exact `SignedRequest` that received the response. Clearing the
+shared pool does not disturb recovery nonces already reserved by other requests.
+If absent, the state machine requests a HEAD acquisition and binds that response's
+nonce to the waiting request. Retry count is bounded by
+`Limits.max_bad_nonce_retries`.
 Exhaustion retains the last structured ACME and HTTP cause while returning
 `RETRY_LIMIT`.
 
@@ -122,6 +138,9 @@ timeout policy value. The caller's actual buffers may set tighter bounds.
 payload. `prepare_signed` narrows the output capacity to that policy before the
 transactional encoder runs. The body view retained by `SignedRequest` remains
 valid only while the caller keeps the accepted output buffer alive and unchanged.
+Signing buffers and parser storage must also be disjoint from `Client`,
+`SignedRequest`, and nonce-pool state. Invalid aliases fail before a stored nonce
+is consumed or an awaiting request loses its exact prepared body.
 
 Response bodies and fields need only remain alive for the accepting call, except
 that `Error.http.body` retains the supplied view. Directory and parsed problem views

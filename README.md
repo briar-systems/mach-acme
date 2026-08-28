@@ -19,7 +19,7 @@ ownership contract.
 - separate public signer metadata and caller-owned private keys
 - caller-provided entropy for RSA-PSS with explicit salt zeroization
 - bounded one-use replay nonce storage with deterministic newest-first selection
-- signed-request state and bounded `badNonce` recovery
+- signed-request state and bounded per-request `badNonce` recovery
 - exact prepared-body binding with timeout and response bounds on every wire request
 - structured local, HTTP, and ACME problem causes
 - bounded structured ACME subproblems for multi-identifier failures
@@ -41,7 +41,9 @@ The transport-independent path is:
 `ACTION_RETRY_SIGNED` means the server supplied a fresh nonce. `ACTION_ACQUIRE_NONCE`
 means the caller must execute the directory's HEAD request, then pass the result to
 `client.accept_nonce_response`. Neither action hides I/O or retries inside a signing
-callback.
+callback. Recovery nonces are copied into the exact `SignedRequest` that received
+them, so concurrent requests cannot exchange retry credentials through the shared
+nonce pool.
 
 See [the protocol contract](doc/protocol.md) for lifetimes, failure rules, and
 buffer requirements.
