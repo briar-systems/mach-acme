@@ -1,14 +1,43 @@
-# order and authorization state
+# bounded order creation, authorization retrieval, and status polling
 
+use http.core.field;
+use http.core.status;
+use J: std.data.json;
+use R: std.types.result;
+use crypto.contracts;
+use crypto.hash;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
 use std.types.view;
+use acme.challenge;
+use acme.client;
 use acme.identifier;
+use acme.jose;
+use acme.json;
+use acme.memory_range;
+use acme.problem;
 
 pub val PENDING:    u8 = 1;
 pub val READY:      u8 = 2;
 pub val PROCESSING: u8 = 3;
 pub val VALID:      u8 = 4;
 pub val INVALID:    u8 = 5;
+
+# rfc 8555 gives authorizations their own status set, so they never share the
+# order codes and a caller cannot compare across the two by accident
+pub val AUTH_PENDING:     u8 = 1;
+pub val AUTH_VALID:       u8 = 2;
+pub val AUTH_INVALID:     u8 = 3;
+pub val AUTH_DEACTIVATED: u8 = 4;
+pub val AUTH_EXPIRED:     u8 = 5;
+pub val AUTH_REVOKED:     u8 = 6;
+
+pub val MAX_IDENTIFIERS: usize = 100;
+pub val MAX_CHALLENGES:  usize = 8;
+pub val MAX_TIME_BYTES:  usize = 64;
 
 pub rec Request {
     identifiers: *identifier.Identifier;
@@ -18,21 +47,1070 @@ pub rec Request {
 }
 
 pub rec Authorization {
-    url:        view.View;
-    identifier: identifier.Identifier;
-    status:     u8;
-    wildcard:   u8;
-    expires:    view.View;
+    url:           view.View;
+    identifier:    identifier.Identifier;
+    status:        u8;
+    wildcard:      bool;
+    expires:       view.View;
+    challenges:    *challenge.Challenge;
+    challenge_len: usize;
 }
 
 pub rec Order {
-    url:             view.View;
-    status:          u8;
-    expires:         view.View;
-    identifiers:     *identifier.Identifier;
-    identifier_len:  usize;
-    authorizations:  *Authorization;
-    authorization_len: usize;
-    finalize_url:    view.View;
-    certificate_url: view.View;
+    url:                view.View;
+    status:             u8;
+    expires:            view.View;
+    identifiers:        *identifier.Identifier;
+    identifier_len:     usize;
+    authorization_urls: *view.View;
+    authorization_len:  usize;
+    finalize_url:       view.View;
+    certificate_url:    view.View;
+    failure:            problem.Problem;
+}
+
+pub rec Limits {
+    max_response_bytes:       usize;
+    max_json_scratch:         usize;
+    max_json_depth:           usize;
+    max_json_values:          usize;
+    max_json_key_bytes:       usize;
+    max_json_key_comparisons: usize;
+    max_url_bytes:            usize;
+    max_identifiers:          usize;
+    max_challenges:           usize;
+    response_fields:          field.Limits;
+}
+
+pub rec Storage {
+    data:                   *u8;
+    capacity:               usize;
+    identifiers:            *identifier.Identifier;
+    identifier_capacity:    usize;
+    authorizations:         *view.View;
+    authorization_capacity: usize;
+}
+
+pub rec AuthorizationStorage {
+    data:               *u8;
+    capacity:           usize;
+    challenges:         *challenge.Challenge;
+    challenge_capacity: usize;
+}
+
+pub fun limits_default() Limits {
+    ret Limits{
+        max_response_bytes: 1048576,
+        max_json_scratch: 1048576,
+        max_json_depth: 16,
+        max_json_values: 4096,
+        max_json_key_bytes: 128,
+        max_json_key_comparisons: 65536,
+        max_url_bytes: 4096,
+        max_identifiers: MAX_IDENTIFIERS,
+        max_challenges: MAX_CHALLENGES,
+        response_fields: field.limits(128, 65536, 256, 8192),
+    };
+}
+
+fun limits_valid(configured: Limits) bool {
+    ret configured.max_response_bytes != 0 &&
+        configured.max_json_scratch != 0 && configured.max_json_depth != 0 &&
+        configured.max_json_values != 0 &&
+        configured.max_json_key_bytes != 0 &&
+        configured.max_json_key_bytes <= 128 &&
+        configured.max_json_key_comparisons != 0 &&
+        configured.max_url_bytes != 0 && configured.max_url_bytes <= 4096 &&
+        configured.max_identifiers != 0 &&
+        configured.max_identifiers <= MAX_IDENTIFIERS &&
+        configured.max_challenges != 0 &&
+        configured.max_challenges <= MAX_CHALLENGES &&
+        configured.response_fields.max_count != 0 &&
+        configured.response_fields.max_bytes != 0 &&
+        configured.response_fields.max_name_bytes != 0 &&
+        configured.response_fields.max_value_bytes != 0;
+}
+
+pub rec Operation {
+    error:          problem.Error;
+    written:        usize;
+    payload:        view.View;
+    payload_digest: [32]u8;
+}
+
+rec Writer {
+    data:       *u8;
+    cap:        usize;
+    pos:        usize;
+    count_only: bool;
+}
+
+fun failed(kind: problem.Kind, code: problem.Code, detail: *u8) Operation {
+    var result: Operation;
+    result.error = problem.local_code(kind, code, detail);
+    result.written = 0;
+    result.payload = view.view(nil, 0);
+    var i: usize = 0;
+    for (i < 32) {
+        result.payload_digest[i] = 0;
+        i = i + 1;
+    }
+    ret result;
+}
+
+fun byte(writer: *Writer, value: u8) bool {
+    if (writer.count_only) {
+        if (writer.pos == 0xffffffffffffffff) { ret false; }
+        writer.pos = writer.pos + 1;
+        ret true;
+    }
+    if (writer.pos >= writer.cap) { ret false; }
+    writer.data[writer.pos] = value;
+    writer.pos = writer.pos + 1;
+    ret true;
+}
+
+fun bytes(writer: *Writer, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret false; }
+    if (writer.count_only) {
+        if (len > 0xffffffffffffffff - writer.pos) { ret false; }
+        writer.pos = writer.pos + len;
+        ret true;
+    }
+    if (len > writer.cap - writer.pos) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        writer.data[writer.pos + i] = data[i];
+        i = i + 1;
+    }
+    writer.pos = writer.pos + len;
+    ret true;
+}
+
+# identifier and timestamp bytes are constrained ascii, so a json string never
+# needs an escape and any byte that would need one is rejected instead
+fun json_string(writer: *Writer, value: view.View) bool {
+    if (!memory_range.valid(value.data, value.len) || !byte(writer, '"')) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < value.len) {
+        val current: u8 = value.data[i];
+        if (current < ' ' || current > 126 || current == '"' ||
+            current == '\\') { ret false; }
+        if (!byte(writer, current)) { ret false; }
+        i = i + 1;
+    }
+    ret byte(writer, '"');
+}
+
+fun digest(value: view.View, output: *u8) bool {
+    if (!memory_range.valid(value.data, value.len) ||
+        !memory_range.valid(output, 32)) { ret false; }
+    var context: hash.Sha256 = hash.empty_sha256();
+    if (hash.init_sha256(?context) != contracts.OK ||
+        hash.update_sha256(?context, contracts.Bytes{data: value.data,
+            len: value.len}) != contracts.OK) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    val result: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: output, capacity: 32});
+    ret result.error == contracts.OK && result.written == 32;
+}
+
+fun digest_same(value: view.View, expected: *u8) bool {
+    var actual: [32]u8;
+    if (!digest(value, ?actual[0])) { ret false; }
+    var i: usize = 0;
+    for (i < 32) {
+        if (actual[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# rfc 3339 instants are the only timestamps rfc 8555 admits, and the wire form
+# is bounded ascii so a malformed value never reaches the authority
+fun timestamp_valid(value: view.View) bool {
+    if (value.len == 0) { ret true; }
+    if (!memory_range.valid(value.data, value.len) ||
+        value.len > MAX_TIME_BYTES || value.len < 20) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val current: u8 = value.data[i];
+        if (!((current >= '0' && current <= '9') || current == '-' ||
+            current == ':' || current == '.' || current == '+' ||
+            current == 'T' || current == 'Z' || current == 't' ||
+            current == 'z')) { ret false; }
+        i = i + 1;
+    }
+    ret value.data[4] == '-' && value.data[7] == '-' &&
+        (value.data[10] == 'T' || value.data[10] == 't') &&
+        value.data[13] == ':' && value.data[16] == ':';
+}
+
+fun request_valid(request: Request, policy: identifier.Policy,
+    configured: Limits, output: contracts.Buffer) bool {
+    if (!limits_valid(configured) || !identifier.policy_valid(policy) ||
+        output.data == nil ||
+        !memory_range.valid(output.data, output.capacity) ||
+        request.len == 0 || request.len > configured.max_identifiers) {
+        ret false;
+    }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(request.len, $size_of(identifier.Identifier),
+            ?item_bytes) ||
+        !memory_range.valid(request.identifiers::*u8, item_bytes) ||
+        memory_range.overlap(output.data, output.capacity,
+            request.identifiers::*u8, item_bytes) ||
+        !timestamp_valid(request.not_before) ||
+        !timestamp_valid(request.not_after) ||
+        memory_range.overlap(output.data, output.capacity,
+            request.not_before.data, request.not_before.len) ||
+        memory_range.overlap(output.data, output.capacity,
+            request.not_after.data, request.not_after.len)) { ret false; }
+    var i: usize = 0;
+    for (i < request.len) {
+        if (!identifier.valid(request.identifiers[i], policy) ||
+            memory_range.overlap(output.data, output.capacity,
+                request.identifiers[i].value.data,
+                request.identifiers[i].value.len)) { ret false; }
+        # a duplicate identifier makes the returned authorization list
+        # ambiguous, so it is rejected before the order is created
+        var j: usize = i + 1;
+        for (j < request.len) {
+            if (identifier.same(request.identifiers[i],
+                request.identifiers[j])) { ret false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun encode_payload(request: Request, writer: *Writer) bool {
+    if (!bytes(writer, "{\"identifiers\":[", 16)) { ret false; }
+    var i: usize = 0;
+    for (i < request.len) {
+        if ((i != 0 && !byte(writer, ',')) ||
+            !bytes(writer, "{\"type\":", 8) ||
+            !json_string(writer, identifier.type_name(
+                request.identifiers[i].kind)) ||
+            !bytes(writer, ",\"value\":", 9) ||
+            !json_string(writer, request.identifiers[i].value) ||
+            !byte(writer, '}')) { ret false; }
+        i = i + 1;
+    }
+    if (!byte(writer, ']')) { ret false; }
+    if (request.not_before.len != 0 &&
+        (!bytes(writer, ",\"notBefore\":", 13) ||
+        !json_string(writer, request.not_before))) { ret false; }
+    if (request.not_after.len != 0 &&
+        (!bytes(writer, ",\"notAfter\":", 12) ||
+        !json_string(writer, request.not_after))) { ret false; }
+    ret byte(writer, '}');
+}
+
+pub fun encode(request: Request, policy: identifier.Policy,
+    configured: Limits, output: contracts.Buffer) Operation {
+    if (!request_valid(request, policy, configured, output)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid order request");
+    }
+    var measured: Writer = Writer{data: nil, cap: 0, pos: 0, count_only: true};
+    if (!encode_payload(request, ?measured)) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "order request exceeds the public size bound");
+    }
+    if (output.capacity < measured.pos) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "order request output is too small");
+    }
+    var writer: Writer = Writer{data: output.data, cap: output.capacity,
+        pos: 0, count_only: false};
+    if (!encode_payload(request, ?writer) || writer.pos != measured.pos) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "measured order request changed during encoding");
+    }
+    var payload_digest: [32]u8;
+    if (!digest(view.view(output.data, writer.pos), ?payload_digest[0])) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "order request binding failed");
+    }
+    var result: Operation = Operation{error: problem.none(),
+        written: writer.pos, payload: view.view(output.data, writer.pos)};
+    var i: usize = 0;
+    for (i < 32) {
+        result.payload_digest[i] = payload_digest[i];
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub fun begin_new(protocol: *client.Client, state: *client.SignedRequest,
+    endpoint: view.View, account_url: view.View, payload: view.View,
+    encoded: Operation, signer: jose.Signer) problem.Error {
+    if (problem.failed(encoded.error) || encoded.written != payload.len ||
+        encoded.payload.data != payload.data ||
+        encoded.payload.len != payload.len ||
+        !digest_same(payload, ?encoded.payload_digest[0]) ||
+        account_url.len == 0) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "order request has invalid payload binding");
+    }
+    ret client.begin_signed_bound(protocol, state, client.SignedSpec{
+        url: endpoint, payload: payload, kid: account_url, use_jwk: false},
+        signer);
+}
+
+# rfc 8555 post-as-get: an empty payload authenticates a read of a resource
+pub fun begin_fetch(protocol: *client.Client, state: *client.SignedRequest,
+    resource_url: view.View, account_url: view.View,
+    signer: jose.Signer) problem.Error {
+    if (account_url.len == 0) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "post-as-get requires an account url");
+    }
+    ret client.begin_signed_bound(protocol, state, client.SignedSpec{
+        url: resource_url, payload: view.view(nil, 0), kid: account_url,
+        use_jwk: false}, signer);
+}
+
+rec Cursor {
+    data:  *u8;
+    cap:   usize;
+    pos:   usize;
+    short: bool;
+}
+
+fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
+    if (value == nil || value.kind != J.STRING || output == nil) { ret false; }
+    val result: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
+    if (R.is_err[usize, str](result)) { ret false; }
+    val len: usize = R.unwrap_ok[usize, str](result);
+    if (len > maximum) { ret false; }
+    @output = len;
+    ret true;
+}
+
+# a value that decodes cleanly but does not fit is a capacity failure, not a
+# malformed document. the distinction is recorded so callers map it exactly.
+fun copy_string(cursor: *Cursor, value: *J.Value, maximum: usize,
+    output: *view.View) bool {
+    if (value == nil) {
+        @output = view.view(nil, 0);
+        ret true;
+    }
+    var len: usize = 0;
+    if (!decoded_len(value, maximum, ?len)) { ret false; }
+    if (len > cursor.cap - cursor.pos) {
+        cursor.short = true;
+        ret false;
+    }
+    val start: usize = cursor.pos;
+    val result: R.Result[usize, str] = J.value_string_decode(value,
+        ?cursor.data[start], cursor.cap - start);
+    if (R.is_err[usize, str](result) ||
+        R.unwrap_ok[usize, str](result) != len) { ret false; }
+    cursor.pos = cursor.pos + len;
+    @output = view.view(?cursor.data[start], len);
+    ret true;
+}
+
+fun value_equals(value: *J.Value, expected: *u8) bool {
+    var decoded: [32]u8;
+    var len: usize = 0;
+    if (!decoded_len(value, 31, ?len)) { ret false; }
+    val result: R.Result[usize, str] = J.value_string_decode(value,
+        ?decoded[0], 32);
+    if (R.is_err[usize, str](result)) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (expected[i] == 0 || decoded[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret expected[len] == 0;
+}
+
+fun order_status(value: *J.Value) u8 {
+    if (value_equals(value, "pending")) { ret PENDING; }
+    if (value_equals(value, "ready")) { ret READY; }
+    if (value_equals(value, "processing")) { ret PROCESSING; }
+    if (value_equals(value, "valid")) { ret VALID; }
+    if (value_equals(value, "invalid")) { ret INVALID; }
+    ret 0;
+}
+
+fun authorization_status(value: *J.Value) u8 {
+    if (value_equals(value, "pending")) { ret AUTH_PENDING; }
+    if (value_equals(value, "valid")) { ret AUTH_VALID; }
+    if (value_equals(value, "invalid")) { ret AUTH_INVALID; }
+    if (value_equals(value, "deactivated")) { ret AUTH_DEACTIVATED; }
+    if (value_equals(value, "expired")) { ret AUTH_EXPIRED; }
+    if (value_equals(value, "revoked")) { ret AUTH_REVOKED; }
+    ret 0;
+}
+
+pub fun status_terminal(value: u8) bool {
+    ret value == VALID || value == INVALID;
+}
+
+# an embedded rfc 7807 object carries why one identifier failed. it is bounded
+# and copied into caller storage so a partial failure survives the response.
+fun copy_problem(cursor: *Cursor, value: *J.Value, configured: Limits,
+    output: *problem.Problem) bool {
+    @output = problem.Problem{typ: view.view(nil, 0),
+        title: view.view(nil, 0), detail: view.view(nil, 0), status: 0,
+        instance: view.view(nil, 0), subproblems: nil, subproblem_len: 0};
+    if (value == nil) { ret true; }
+    if (value.kind != J.OBJECT) { ret false; }
+    val code: *J.Value = json.find(value, "status");
+    if (code != nil) {
+        if (code.kind != J.NUMBER || J.value_is_float(code)) { ret false; }
+        val number: i64 = J.value_number(code);
+        if (number < 0 || number > 599) { ret false; }
+        output.status = number::u16;
+    }
+    ret copy_string(cursor, json.find(value, "type"),
+            configured.max_url_bytes, ?output.typ) &&
+        copy_string(cursor, json.find(value, "title"),
+            configured.max_url_bytes, ?output.title) &&
+        copy_string(cursor, json.find(value, "detail"),
+            configured.max_url_bytes, ?output.detail) &&
+        copy_string(cursor, json.find(value, "instance"),
+            configured.max_url_bytes, ?output.instance);
+}
+
+fun response_overlaps(response: client.Response, data: *u8, len: usize) bool {
+    if (memory_range.overlap(data, len, response.body.data,
+            response.body.len) ||
+        memory_range.overlap(data, len, response.fields::*u8,
+            $size_of(field.Fields))) { ret true; }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(response.fields.capacity, $size_of(field.Field),
+            ?item_bytes) || memory_range.overlap(data, len,
+            response.fields.items::*u8, item_bytes)) { ret true; }
+    var i: usize = 0;
+    for (i < response.fields.len) {
+        if (memory_range.overlap(data, len, response.fields.items[i].name.data,
+                response.fields.items[i].name.len) ||
+            memory_range.overlap(data, len,
+                response.fields.items[i].value.data,
+                response.fields.items[i].value.len)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun fields_valid(fields: *field.Fields) bool {
+    if (fields == nil ||
+        !memory_range.valid(fields::*u8, $size_of(field.Fields)) ||
+        fields.len > fields.capacity) { ret false; }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(fields.capacity, $size_of(field.Field),
+            ?item_bytes) ||
+        !memory_range.valid(fields.items::*u8, item_bytes)) { ret false; }
+    var i: usize = 0;
+    for (i < fields.len) {
+        if (!memory_range.valid(fields.items[i].name.data,
+                fields.items[i].name.len) ||
+            !memory_range.valid(fields.items[i].value.data,
+                fields.items[i].value.len)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun location(response: client.Response) *field.Field {
+    var found: *field.Field = nil;
+    var i: usize = 0;
+    for (i < response.fields.len) {
+        if (field.name_equal(response.fields.items[i].name,
+                view.view(field.LOCATION, 8))) {
+            if (found != nil) { ret nil; }
+            found = ?response.fields.items[i];
+        }
+        i = i + 1;
+    }
+    ret found;
+}
+
+fun copy_view(cursor: *Cursor, value: view.View, output: *view.View) bool {
+    if (!memory_range.valid(value.data, value.len)) { ret false; }
+    if (value.len > cursor.cap - cursor.pos) {
+        cursor.short = true;
+        ret false;
+    }
+    val start: usize = cursor.pos;
+    var i: usize = 0;
+    for (i < value.len) {
+        cursor.data[start + i] = value.data[i];
+        i = i + 1;
+    }
+    cursor.pos = cursor.pos + value.len;
+    @output = view.view(?cursor.data[start], value.len);
+    ret true;
+}
+
+fun response_shape(response: client.Response, configured: Limits,
+    scratch: *u8, scratch_capacity: usize) bool {
+    ret limits_valid(configured) && response.fields != nil &&
+        status.is_final(response.status) && response.body.data != nil &&
+        response.body.len != 0 &&
+        memory_range.valid(response.body.data, response.body.len) &&
+        response.body.len <= configured.max_response_bytes &&
+        scratch != nil && scratch_capacity != 0 &&
+        memory_range.valid(scratch, scratch_capacity) &&
+        fields_valid(response.fields) &&
+        field.validate(response.fields, configured.response_fields, false);
+}
+
+fun storage_disjoint(data: *u8, capacity: usize, items: *u8,
+    item_bytes: usize, extra: *u8, extra_bytes: usize, scratch: *u8,
+    usable: usize, output: *u8, output_bytes: usize,
+    response: client.Response) bool {
+    ret !memory_range.overlap(data, capacity, items, item_bytes) &&
+        !memory_range.overlap(data, capacity, extra, extra_bytes) &&
+        !memory_range.overlap(items, item_bytes, extra, extra_bytes) &&
+        !memory_range.overlap(scratch, usable, data, capacity) &&
+        !memory_range.overlap(scratch, usable, items, item_bytes) &&
+        !memory_range.overlap(scratch, usable, extra, extra_bytes) &&
+        !memory_range.overlap(scratch, usable, output, output_bytes) &&
+        !memory_range.overlap(data, capacity, output, output_bytes) &&
+        !memory_range.overlap(items, item_bytes, output, output_bytes) &&
+        !memory_range.overlap(extra, extra_bytes, output, output_bytes) &&
+        !response_overlaps(response, data, capacity) &&
+        !response_overlaps(response, items, item_bytes) &&
+        !response_overlaps(response, extra, extra_bytes) &&
+        !response_overlaps(response, scratch, usable) &&
+        !response_overlaps(response, output, output_bytes);
+}
+
+fun parse_error(code: problem.Code, detail: str) problem.Error {
+    ret problem.local_code(problem.PROTOCOL, code, detail);
+}
+
+fun copy_failure(cursor: *Cursor, detail: str) problem.Error {
+    if (cursor.short) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "response text storage is too small");
+    }
+    ret parse_error(problem.MALFORMED_JSON, detail);
+}
+
+# order_url is empty for a creation response, which must carry a Location
+pub fun parse(response: client.Response, order_url: view.View,
+    policy: identifier.Policy, configured: Limits, scratch: *u8,
+    scratch_capacity: usize, storage: Storage, output: *Order) problem.Error {
+    if (output == nil || !memory_range.valid(output::*u8, $size_of(Order)) ||
+        !response_shape(response, configured, scratch, scratch_capacity) ||
+        !identifier.policy_valid(policy) ||
+        (response.status != status.OK &&
+            response.status != status.CREATED) ||
+        storage.data == nil ||
+        !memory_range.valid(storage.data, storage.capacity) ||
+        (order_url.len != 0 &&
+            !client.url_valid(order_url, configured.max_url_bytes))) {
+        ret parse_error(problem.INVALID_INPUT, "invalid order response");
+    }
+    var usable: usize = scratch_capacity;
+    if (usable > configured.max_json_scratch) {
+        usable = configured.max_json_scratch;
+    }
+    var identifier_bytes: usize = 0;
+    var authorization_bytes: usize = 0;
+    if (!memory_range.size(storage.identifier_capacity,
+            $size_of(identifier.Identifier), ?identifier_bytes) ||
+        !memory_range.size(storage.authorization_capacity,
+            $size_of(view.View), ?authorization_bytes) ||
+        !memory_range.valid(storage.identifiers::*u8, identifier_bytes) ||
+        !memory_range.valid(storage.authorizations::*u8,
+            authorization_bytes) ||
+        !storage_disjoint(storage.data, storage.capacity,
+            storage.identifiers::*u8, identifier_bytes,
+            storage.authorizations::*u8, authorization_bytes, scratch, usable,
+            output::*u8, $size_of(Order), response) ||
+        memory_range.overlap(order_url.data, order_url.len, storage.data,
+            storage.capacity) ||
+        memory_range.overlap(order_url.data, order_url.len, output::*u8,
+            $size_of(Order))) {
+        ret parse_error(problem.INVALID_INPUT,
+            "order response storage overlaps an input");
+    }
+    # a creation response names the order, a poll response reuses the known url
+    var order_location: *field.Field = nil;
+    if (response.status == status.CREATED) {
+        order_location = location(response);
+        if (order_location == nil || !client.url_valid(order_location.value,
+                configured.max_url_bytes)) {
+            ret parse_error(problem.INVALID_INPUT,
+                "order creation location is invalid");
+        }
+    } or {
+        if (order_url.len == 0) {
+            ret parse_error(problem.INVALID_INPUT,
+                "order poll requires a known order url");
+        }
+    }
+    val document: json.Document = json.parse(response.body, scratch, usable,
+        json.Limits{max_bytes: configured.max_response_bytes,
+            max_depth: configured.max_json_depth,
+            max_values: configured.max_json_values,
+            max_key_bytes: configured.max_json_key_bytes,
+            max_key_comparisons: configured.max_json_key_comparisons});
+    if (!document.valid) { ret document.error; }
+    var root: J.Value = document.root;
+    if (root.kind != J.OBJECT) {
+        ret parse_error(problem.MALFORMED_JSON, "order response is not an object");
+    }
+    val state: u8 = order_status(json.find(?root, "status"));
+    val identifiers: *J.Value = json.find(?root, "identifiers");
+    val authorizations: *J.Value = json.find(?root, "authorizations");
+    val finalize: *J.Value = json.find(?root, "finalize");
+    val certificate: *J.Value = json.find(?root, "certificate");
+    val expires: *J.Value = json.find(?root, "expires");
+    if (state == 0 || identifiers == nil || identifiers.kind != J.ARRAY ||
+        authorizations == nil || authorizations.kind != J.ARRAY ||
+        finalize == nil) {
+        ret parse_error(problem.MALFORMED_JSON,
+            "order response has invalid fields");
+    }
+    val identifier_len: usize = J.value_count(identifiers);
+    val authorization_len: usize = J.value_count(authorizations);
+    if (identifier_len == 0 || identifier_len > configured.max_identifiers ||
+        identifier_len > storage.identifier_capacity ||
+        authorization_len > storage.authorization_capacity ||
+        authorization_len > configured.max_identifiers) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "order response storage is too small");
+    }
+    # a certificate url appears only once the order is valid
+    if ((state == VALID && certificate == nil) ||
+        (state != VALID && certificate != nil)) {
+        ret parse_error(problem.MALFORMED_JSON,
+            "order certificate url does not match the order status");
+    }
+    var result: Order;
+    result.status = state;
+    result.identifiers = storage.identifiers;
+    result.identifier_len = identifier_len;
+    result.authorization_urls = storage.authorizations;
+    result.authorization_len = authorization_len;
+    result.certificate_url = view.view(nil, 0);
+    var cursor: Cursor = Cursor{data: storage.data, cap: storage.capacity,
+        pos: 0, short: false};
+    if (order_location != nil) {
+        if (!copy_view(?cursor, order_location.value, ?result.url)) {
+            ret copy_failure(?cursor, "order location is invalid");
+        }
+    } or {
+        result.url = order_url;
+    }
+    if (!copy_string(?cursor, finalize, configured.max_url_bytes,
+            ?result.finalize_url) ||
+        !client.url_valid(result.finalize_url, configured.max_url_bytes)) {
+        ret copy_failure(?cursor, "order finalize url is invalid");
+    }
+    if (certificate != nil &&
+        (!copy_string(?cursor, certificate, configured.max_url_bytes,
+            ?result.certificate_url) ||
+        !client.url_valid(result.certificate_url,
+            configured.max_url_bytes))) {
+        ret copy_failure(?cursor, "order certificate url is invalid");
+    }
+    if (!copy_string(?cursor, expires, MAX_TIME_BYTES, ?result.expires) ||
+        !timestamp_valid(result.expires)) {
+        ret copy_failure(?cursor, "order expiry is invalid");
+    }
+    var i: usize = 0;
+    for (i < identifier_len) {
+        val item: *J.Value = J.value_get(identifiers, i);
+        if (item == nil || item.kind != J.OBJECT) {
+            ret parse_error(problem.MALFORMED_JSON,
+                "order identifier is not an object");
+        }
+        var kind_text: view.View;
+        if (!copy_string(?cursor, json.find(item, "type"), 16, ?kind_text) ||
+            !copy_string(?cursor, json.find(item, "value"),
+                identifier.MAX_VALUE_BYTES,
+                ?storage.identifiers[i].value)) {
+            ret copy_failure(?cursor, "order identifier is invalid");
+        }
+        storage.identifiers[i].kind = identifier.kind_from_name(kind_text);
+        if (!identifier.valid(storage.identifiers[i], policy)) {
+            ret parse_error(problem.MALFORMED_JSON,
+                "order identifier violates the configured policy");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < authorization_len) {
+        if (!copy_string(?cursor, J.value_get(authorizations, i),
+                configured.max_url_bytes, ?storage.authorizations[i]) ||
+            !client.url_valid(storage.authorizations[i],
+                configured.max_url_bytes)) {
+            ret copy_failure(?cursor, "order authorization url is invalid");
+        }
+        i = i + 1;
+    }
+    if (!copy_problem(?cursor, json.find(?root, "error"), configured,
+            ?result.failure)) {
+        ret copy_failure(?cursor, "order error object is invalid");
+    }
+    @output = result;
+    ret problem.none();
+}
+
+pub fun parse_authorization(response: client.Response,
+    authorization_url: view.View, policy: identifier.Policy,
+    configured: Limits, scratch: *u8, scratch_capacity: usize,
+    storage: AuthorizationStorage, output: *Authorization) problem.Error {
+    if (output == nil ||
+        !memory_range.valid(output::*u8, $size_of(Authorization)) ||
+        !response_shape(response, configured, scratch, scratch_capacity) ||
+        !identifier.policy_valid(policy) || response.status != status.OK ||
+        storage.data == nil ||
+        !memory_range.valid(storage.data, storage.capacity) ||
+        !client.url_valid(authorization_url, configured.max_url_bytes)) {
+        ret parse_error(problem.INVALID_INPUT, "invalid authorization response");
+    }
+    var usable: usize = scratch_capacity;
+    if (usable > configured.max_json_scratch) {
+        usable = configured.max_json_scratch;
+    }
+    var challenge_bytes: usize = 0;
+    if (!memory_range.size(storage.challenge_capacity,
+            $size_of(challenge.Challenge), ?challenge_bytes) ||
+        !memory_range.valid(storage.challenges::*u8, challenge_bytes) ||
+        !storage_disjoint(storage.data, storage.capacity,
+            storage.challenges::*u8, challenge_bytes, nil, 0, scratch, usable,
+            output::*u8, $size_of(Authorization), response) ||
+        memory_range.overlap(authorization_url.data, authorization_url.len,
+            storage.data, storage.capacity) ||
+        memory_range.overlap(authorization_url.data, authorization_url.len,
+            output::*u8, $size_of(Authorization))) {
+        ret parse_error(problem.INVALID_INPUT,
+            "authorization storage overlaps an input");
+    }
+    val document: json.Document = json.parse(response.body, scratch, usable,
+        json.Limits{max_bytes: configured.max_response_bytes,
+            max_depth: configured.max_json_depth,
+            max_values: configured.max_json_values,
+            max_key_bytes: configured.max_json_key_bytes,
+            max_key_comparisons: configured.max_json_key_comparisons});
+    if (!document.valid) { ret document.error; }
+    var root: J.Value = document.root;
+    if (root.kind != J.OBJECT) {
+        ret parse_error(problem.MALFORMED_JSON,
+            "authorization response is not an object");
+    }
+    val state: u8 = authorization_status(json.find(?root, "status"));
+    val subject: *J.Value = json.find(?root, "identifier");
+    val challenges: *J.Value = json.find(?root, "challenges");
+    val wildcard: *J.Value = json.find(?root, "wildcard");
+    val expires: *J.Value = json.find(?root, "expires");
+    if (state == 0 || subject == nil || subject.kind != J.OBJECT ||
+        challenges == nil || challenges.kind != J.ARRAY ||
+        (wildcard != nil && wildcard.kind != J.BOOL)) {
+        ret parse_error(problem.MALFORMED_JSON,
+            "authorization response has invalid fields");
+    }
+    val challenge_len: usize = J.value_count(challenges);
+    if (challenge_len == 0 || challenge_len > configured.max_challenges ||
+        challenge_len > storage.challenge_capacity) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "authorization challenge storage is too small");
+    }
+    var result: Authorization;
+    result.url = authorization_url;
+    result.status = state;
+    result.challenges = storage.challenges;
+    result.challenge_len = challenge_len;
+    result.wildcard = false;
+    if (wildcard != nil) { result.wildcard = J.value_bool(wildcard); }
+    var cursor: Cursor = Cursor{data: storage.data, cap: storage.capacity,
+        pos: 0, short: false};
+    var kind_text: view.View;
+    if (!copy_string(?cursor, json.find(subject, "type"), 16, ?kind_text) ||
+        !copy_string(?cursor, json.find(subject, "value"),
+            identifier.MAX_VALUE_BYTES, ?result.identifier.value)) {
+        ret copy_failure(?cursor, "authorization identifier is invalid");
+    }
+    result.identifier.kind = identifier.kind_from_name(kind_text);
+    # the authority names the base domain and flags the wildcard separately,
+    # so the identifier is validated without the wildcard label
+    if (!identifier.valid(result.identifier, policy)) {
+        ret parse_error(problem.MALFORMED_JSON,
+            "authorization identifier violates the configured policy");
+    }
+    if (result.wildcard && result.identifier.kind != identifier.DNS) {
+        ret parse_error(problem.MALFORMED_JSON,
+            "authorization marks a non-dns identifier as a wildcard");
+    }
+    if (!copy_string(?cursor, expires, MAX_TIME_BYTES, ?result.expires) ||
+        !timestamp_valid(result.expires)) {
+        ret copy_failure(?cursor, "authorization expiry is invalid");
+    }
+    var i: usize = 0;
+    for (i < challenge_len) {
+        val item: *J.Value = J.value_get(challenges, i);
+        if (item == nil || item.kind != J.OBJECT) {
+            ret parse_error(problem.MALFORMED_JSON,
+                "authorization challenge is not an object");
+        }
+        var entry: challenge.Challenge;
+        var type_text: view.View;
+        if (!copy_string(?cursor, json.find(item, "type"), 32, ?type_text) ||
+            !copy_string(?cursor, json.find(item, "url"),
+                configured.max_url_bytes, ?entry.url) ||
+            !copy_string(?cursor, json.find(item, "token"),
+                challenge.MAX_TOKEN_BYTES, ?entry.token) ||
+            !copy_string(?cursor, json.find(item, "validated"),
+                MAX_TIME_BYTES, ?entry.validated)) {
+            ret copy_failure(?cursor, "authorization challenge is invalid");
+        }
+        entry.typ = challenge.kind_from_name(type_text);
+        entry.status = challenge.status_from(json.find(item, "status"));
+        if (!client.url_valid(entry.url, configured.max_url_bytes) ||
+            entry.status == 0 || !timestamp_valid(entry.validated)) {
+            ret parse_error(problem.MALFORMED_JSON,
+                "authorization challenge has invalid fields");
+        }
+        # an unsupported challenge type is retained with a zero kind so
+        # selection can skip it without failing the whole authorization
+        if (entry.typ != 0 && !challenge.token_valid(entry.token)) {
+            ret parse_error(problem.MALFORMED_JSON,
+                "authorization challenge token is invalid");
+        }
+        if (!copy_problem(?cursor, json.find(item, "error"), configured,
+                ?entry.failure)) {
+            ret copy_failure(?cursor,
+                "authorization challenge error object is invalid");
+        }
+        storage.challenges[i] = entry;
+        i = i + 1;
+    }
+    @output = result;
+    ret problem.none();
+}
+
+# selection is a pure policy decision over an already parsed authorization, so
+# it never consults a provider or the network
+pub fun select_challenge(value: Authorization, kind: u8) *challenge.Challenge {
+    if (value.challenge_len == 0 || value.challenge_len > MAX_CHALLENGES) {
+        ret nil;
+    }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(value.challenge_len, $size_of(challenge.Challenge),
+            ?item_bytes) ||
+        !memory_range.valid(value.challenges::*u8, item_bytes)) { ret nil; }
+    var i: usize = 0;
+    for (i < value.challenge_len) {
+        if (value.challenges[i].typ == kind && kind != 0) {
+            ret ?value.challenges[i];
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# rfc 8555 section 7.1.3: a wildcard authorization is only satisfiable by
+# dns-01, so the policy is stated here rather than left to each caller
+pub fun challenge_admissible(value: Authorization, kind: u8) bool {
+    if (value.wildcard) { ret kind == challenge.DNS_01; }
+    if (value.identifier.kind == identifier.IP) {
+        ret kind == challenge.HTTP_01 || kind == challenge.TLS_ALPN_01;
+    }
+    ret kind == challenge.HTTP_01 || kind == challenge.DNS_01 ||
+        kind == challenge.TLS_ALPN_01;
+}
+
+pub def PollAction: u8;
+
+pub val POLL_WAIT:      PollAction = 1;
+pub val POLL_READY:     PollAction = 2;
+pub val POLL_TERMINAL:  PollAction = 3;
+pub val POLL_DEADLINE:  PollAction = 4;
+pub val POLL_CANCELLED: PollAction = 5;
+pub val POLL_LIMIT:     PollAction = 6;
+
+pub rec PollPolicy {
+    min_delay_ns: u64;
+    max_delay_ns: u64;
+    max_attempts: usize;
+}
+
+pub rec Poll {
+    policy:      PollPolicy;
+    deadline_ns: i64;
+    attempts:    usize;
+    cancelled:   bool;
+    started:     bool;
+}
+
+pub rec PollDecision {
+    action:   PollAction;
+    delay_ns: u64;
+    cause:    problem.Error;
+}
+
+pub fun poll_policy_default() PollPolicy {
+    ret PollPolicy{min_delay_ns: 1000000000, max_delay_ns: 30000000000,
+        max_attempts: 32};
+}
+
+pub fun poll_policy_valid(value: PollPolicy) bool {
+    ret value.min_delay_ns != 0 && value.max_delay_ns >= value.min_delay_ns &&
+        value.max_delay_ns <= 3600000000000 && value.max_attempts != 0 &&
+        value.max_attempts <= 4096;
+}
+
+pub fun poll_begin(state: *Poll, policy: PollPolicy,
+    deadline_ns: i64) problem.Error {
+    if (state == nil || !memory_range.valid(state::*u8, $size_of(Poll)) ||
+        !poll_policy_valid(policy)) {
+        ret problem.local_code(problem.POLICY, problem.INVALID_INPUT,
+            "invalid poll policy");
+    }
+    state.policy = policy;
+    state.deadline_ns = deadline_ns;
+    state.attempts = 0;
+    state.cancelled = false;
+    state.started = true;
+    ret problem.none();
+}
+
+pub fun poll_cancel(state: *Poll) bool {
+    if (state == nil || !memory_range.valid(state::*u8, $size_of(Poll)) ||
+        !state.started) { ret false; }
+    state.cancelled = true;
+    ret true;
+}
+
+fun poll_decision(action: PollAction, delay_ns: u64,
+    cause: problem.Error) PollDecision {
+    ret PollDecision{action: action, delay_ns: delay_ns, cause: cause};
+}
+
+# bounded exponential backoff. doubling stops at max_delay_ns, so a long poll
+# can never produce an unbounded or overflowing wait.
+fun backoff(policy: PollPolicy, attempts: usize) u64 {
+    var delay: u64 = policy.min_delay_ns;
+    var i: usize = 0;
+    for (i < attempts) {
+        if (delay >= policy.max_delay_ns || delay > 0x7fffffffffffffff) {
+            ret policy.max_delay_ns;
+        }
+        delay = delay * 2;
+        i = i + 1;
+    }
+    if (delay > policy.max_delay_ns) { ret policy.max_delay_ns; }
+    ret delay;
+}
+
+fun retry_after_ns(seconds: u64) u64 {
+    if (seconds > 0xffffffffffffffff / 1000000000) {
+        ret 0xffffffffffffffff;
+    }
+    ret seconds * 1000000000;
+}
+
+# the caller owns the clock. every wait is decided from the supplied monotonic
+# reading, the authority's Retry-After, and the absolute deadline.
+pub fun poll_next(state: *Poll, current: u8, target: u8,
+    retry_after_seconds: u64, now_ns: i64) PollDecision {
+    if (state == nil || !memory_range.valid(state::*u8, $size_of(Poll)) ||
+        !state.started || !poll_policy_valid(state.policy) || current == 0 ||
+        target == 0) {
+        ret poll_decision(POLL_TERMINAL, 0,
+            problem.local_code(problem.STATE, problem.INVALID_STATE,
+                "poll state is not initialized"));
+    }
+    if (state.cancelled) {
+        ret poll_decision(POLL_CANCELLED, 0,
+            problem.local_code(problem.POLICY, problem.INVALID_STATE,
+                "poll was cancelled"));
+    }
+    if (current == target) { ret poll_decision(POLL_READY, 0, problem.none()); }
+    if (status_terminal(current)) {
+        ret poll_decision(POLL_TERMINAL, 0,
+            problem.local_code(problem.PROTOCOL, problem.INVALID_STATE,
+                "order reached a terminal status other than the target"));
+    }
+    if (state.attempts >= state.policy.max_attempts) {
+        ret poll_decision(POLL_LIMIT, 0,
+            problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
+                "poll attempt limit reached"));
+    }
+    var delay: u64 = backoff(state.policy, state.attempts);
+    val advised: u64 = retry_after_ns(retry_after_seconds);
+    if (advised > delay) { delay = advised; }
+    if (delay > state.policy.max_delay_ns) { delay = state.policy.max_delay_ns; }
+    if (now_ns >= state.deadline_ns) {
+        ret poll_decision(POLL_DEADLINE, 0,
+            problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
+                "poll deadline reached"));
+    }
+    val remaining: u64 = (state.deadline_ns - now_ns)::u64;
+    if (delay > remaining) {
+        ret poll_decision(POLL_DEADLINE, 0,
+            problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
+                "poll delay would pass the deadline"));
+    }
+    state.attempts = state.attempts + 1;
+    ret poll_decision(POLL_WAIT, delay, problem.none());
+}
+
+test "acme.order: polling honours retry-after, deadlines, and backoff bounds" {
+    var state: Poll;
+    var policy: PollPolicy = poll_policy_default();
+    policy.min_delay_ns = 1000000000;
+    policy.max_delay_ns = 8000000000;
+    policy.max_attempts = 4;
+    if (problem.failed(poll_begin(?state, policy, 1000000000000))) { ret 1; }
+    # bounded exponential backoff doubles and then saturates
+    val first: PollDecision = poll_next(?state, PENDING, READY, 0, 0);
+    val second: PollDecision = poll_next(?state, PENDING, READY, 0, 0);
+    val third: PollDecision = poll_next(?state, PENDING, READY, 0, 0);
+    val fourth: PollDecision = poll_next(?state, PENDING, READY, 0, 0);
+    if (first.action != POLL_WAIT || first.delay_ns != 1000000000 ||
+        second.delay_ns != 2000000000 || third.delay_ns != 4000000000 ||
+        fourth.delay_ns != 8000000000) { ret 2; }
+    if (poll_next(?state, PENDING, READY, 0, 0).action != POLL_LIMIT) { ret 3; }
+    # a larger retry-after wins, but stays clamped to the policy ceiling
+    if (problem.failed(poll_begin(?state, policy, 1000000000000))) { ret 4; }
+    val advised: PollDecision = poll_next(?state, PENDING, READY, 5, 0);
+    if (advised.action != POLL_WAIT || advised.delay_ns != 5000000000) { ret 5; }
+    if (problem.failed(poll_begin(?state, policy, 1000000000000))) { ret 6; }
+    if (poll_next(?state, PENDING, READY, 3600, 0).delay_ns !=
+        policy.max_delay_ns) { ret 7; }
+    # a wait that would pass the absolute deadline is refused, not truncated
+    if (problem.failed(poll_begin(?state, policy, 500000000))) { ret 8; }
+    if (poll_next(?state, PENDING, READY, 0, 0).action != POLL_DEADLINE ||
+        state.attempts != 0) { ret 9; }
+    if (problem.failed(poll_begin(?state, policy, 100))) { ret 10; }
+    if (poll_next(?state, PENDING, READY, 0, 100).action != POLL_DEADLINE) {
+        ret 11;
+    }
+    # terminal states and cancellation stop the loop without waiting
+    if (problem.failed(poll_begin(?state, policy, 1000000000000))) { ret 12; }
+    if (poll_next(?state, READY, READY, 0, 0).action != POLL_READY ||
+        poll_next(?state, INVALID, READY, 0, 0).action != POLL_TERMINAL ||
+        poll_next(?state, VALID, READY, 0, 0).action != POLL_TERMINAL ||
+        poll_next(?state, PROCESSING, VALID, 0, 0).action != POLL_WAIT) {
+        ret 13;
+    }
+    if (!poll_cancel(?state) ||
+        poll_next(?state, PENDING, READY, 0, 0).action != POLL_CANCELLED) {
+        ret 14;
+    }
+    var fresh: Poll;
+    if (poll_next(?fresh, PENDING, READY, 0, 0).action != POLL_TERMINAL) {
+        ret 15;
+    }
+    var bad: PollPolicy = policy;
+    bad.min_delay_ns = 0;
+    if (!problem.failed(poll_begin(?state, bad, 1000))) { ret 16; }
+    ret 0;
 }

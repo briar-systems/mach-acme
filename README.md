@@ -40,6 +40,13 @@ ownership contract.
   failure, and unknown outcomes
 - serialized storage-provider callbacks with alias, reentrancy, descriptor,
   readiness, input-binding, and result validation
+- explicit wildcard and IP identifier policy with strict RFC 1123 name syntax,
+  IP literal parsing, and case-insensitive identifier comparison
+- bounded `newOrder` encoding, POST-as-GET retrieval, and strict order and
+  authorization decoding with embedded RFC 7807 failures
+- challenge selection and the RFC 8555 wildcard challenge rule
+- Retry-After-aware order polling with an absolute deadline, bounded
+  exponential backoff, an attempt ceiling, cancellation, and terminal statuses
 
 ## Protocol boundary
 
@@ -83,6 +90,21 @@ mach test test/protocol --profile debug
 mach test test/protocol --profile release
 ```
 
+`test/live` is a conformance suite that drives a real ACME authority rather
+than a fixture. Start the local stack first, then run it:
+
+```text
+test/live/harness/start.sh
+mach test test/live --profile debug
+mach test test/live --profile release
+test/live/harness/start.sh.stop
+```
+
+The harness runs `pebble`, its challenge test server, and a plain-HTTP front
+end on loopback. `mach-acme` emits typed HTTPS wire requests and TLS
+termination belongs to `mach-tls`, so the front end terminates TLS while every
+ACME byte, URL, status, and header passes through unchanged.
+
 ## Account lifecycle
 
 `account.encode` creates each RFC 8555 account payload. `account.begin` selects
@@ -121,3 +143,38 @@ installation, and renewal scheduling are tracked as later ACME layers. The
 current protocol boundary is shaped so those layers add request payloads and
 response decoders without changing signing, nonce, account, or transport
 ownership.
+
+## Orders and authorizations
+
+`order.encode` writes a bounded `newOrder` payload from a caller-owned
+identifier array. Admission is an explicit `identifier.Policy` rather than a
+library default, so a deployment that cannot answer DNS-01 never silently
+orders a wildcard, and RFC 8738 IP identifiers stay opt-in. DNS names use
+strict RFC 1123 syntax, wildcards are only a leftmost `*.` label, and duplicate
+identifiers are rejected before the order is created because they make the
+returned authorization list ambiguous.
+
+`order.begin_new` submits the order under the account `kid`. `order.begin_fetch`
+is the RFC 8555 POST-as-GET read used for order polling and authorization
+retrieval. `order.parse` accepts the 201 creation response with its `Location`
+and the 200 poll response against a known order URL, and requires the
+certificate URL to appear exactly when the order is `valid`.
+`order.parse_authorization` decodes the identifier, wildcard flag, expiry, and
+bounded challenge list. A challenge type this build does not implement is
+retained with a zero kind so selection can skip it without failing the whole
+authorization. An embedded `error` object is copied into caller storage, so a
+partial failure survives the response that carried it.
+
+`order.select_challenge` and `order.challenge_admissible` are pure decisions
+over an already parsed authorization. RFC 8555 section 7.1.3 admits only DNS-01
+for a wildcard authorization, and that rule is stated here rather than left to
+each caller.
+
+Polling is a decision function, not a loop. The caller owns the clock and
+supplies a monotonic reading, the authority's Retry-After, and the current
+status. `order.poll_next` honours Retry-After when it exceeds the local
+backoff floor, clamps every wait to the policy ceiling, refuses a wait that
+would pass the absolute deadline rather than truncating it, stops at an
+attempt ceiling, and reports cancellation and terminal statuses distinctly.
+Backoff doubles from the floor and saturates, so a long poll can never produce
+an unbounded or overflowing wait.

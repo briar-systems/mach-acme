@@ -191,6 +191,64 @@ verifies restart recovery, persisted monotonic transaction tokens, exact pending
 writes, and rejection of truncated durable records without publishing a partially
 modified recovery output.
 
+## Orders and authorizations
+
+`order.encode` measures the complete bounded `newOrder` payload before writing
+to caller output, so every admitted request is representable. Identifier
+admission is an explicit `identifier.Policy`. Wildcards are admitted because
+RFC 8555 defines them; IP identifiers are not, because RFC 8738 support is
+optional and many authorities reject them. A wildcard is only a leftmost `*.`
+label over a valid RFC 1123 name. Duplicate identifiers are rejected before the
+order is created, because the returned authorization list would be ambiguous.
+Timestamps are bounded RFC 3339 instants. Output cannot overlap the identifier
+array, identifier bytes, or the timestamp views.
+
+`order.begin_new` binds the exact payload digest and submits under the account
+`kid`. `order.begin_fetch` is the POST-as-GET read: an empty payload
+authenticates a read of an order or authorization and requires an account URL.
+
+`order.parse` accepts HTTP 201 with exactly one HTTPS `Location`, or HTTP 200
+against a caller-supplied known order URL. It requires a known order status, a
+nonempty identifier array, an authorization array, and an HTTPS finalize URL.
+The certificate URL must be present exactly when the order is `valid`. Parsed
+identifiers are re-validated against the caller's policy, so an authority that
+echoes a wildcard a deployment forbade is rejected rather than accepted.
+
+`order.parse_authorization` requires a known authorization status, an
+identifier object, and a bounded nonempty challenge array. The authority names
+the base domain and flags the wildcard separately, so the identifier is
+validated without the wildcard label. A challenge whose type this build does
+not implement is retained with a zero kind and is simply not selectable; it
+does not fail the authorization. Tokens are validated as bounded base64url for
+every implemented challenge type.
+
+An embedded RFC 7807 `error` object on an order or a challenge is bounded and
+copied into caller text storage, so a partial failure survives the response
+that carried it. A value that decodes cleanly but does not fit the caller's
+storage is a capacity failure, not a malformed document, and the two are
+reported with distinct codes. JSON scratch, text storage, item arrays, output
+records, the known resource URL, and the response body and fields are
+range-checked and pairwise disjoint. Any parse, type, limit, policy, or
+capacity failure leaves the caller's output record unchanged.
+
+## Order polling
+
+Polling is a decision, not a loop. The library owns no clock and no timer.
+`order.poll_next` receives the current status, the target status, the
+authority's Retry-After in seconds, and a caller-supplied monotonic reading,
+and returns exactly one of wait, ready, terminal, deadline, cancelled, or
+limit.
+
+Retry-After is honoured when it exceeds the local backoff floor, and every wait
+is clamped to the policy ceiling, so a hostile or mistaken advisory cannot
+produce an unbounded wait. Backoff doubles from the floor and saturates at the
+ceiling without overflowing. A wait that would pass the absolute deadline is
+refused rather than truncated, and the attempt counter is not advanced by a
+decision that produced no wait. Cancellation is checked before any status
+interpretation. A terminal status that is not the target is reported distinctly
+from reaching the target, so an order that went `invalid` is never mistaken for
+success.
+
 ## Replay nonce ownership
 
 A `nonce.Pool` owns copies of available nonces. The supplied memory implementation

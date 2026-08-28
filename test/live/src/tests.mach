@@ -1,0 +1,873 @@
+# live acme conformance suite
+#
+# these tests drive a real acme authority. `test/live/harness/start.sh` runs
+# pebble, its challenge test server, and a plain-http front end on loopback.
+# tls termination belongs to mach-tls, so the harness terminates it and this
+# suite speaks http/1.1 over a blocking socket. every acme byte, url, status,
+# and header still comes from and returns to the real server.
+
+use std.runtime;
+use http.core.field;
+use http.core.method;
+use http.core.status;
+use R: std.types.result;
+use std.net.ip;
+use std.net.tcp;
+use IO: std.io.error;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use crypto.contracts;
+use crypto.group.p256;
+use acme.account;
+use acme.challenge;
+use acme.client;
+use acme.external_account;
+use acme.identifier;
+use acme.jose;
+use acme.nonce;
+use acme.order;
+use acme.problem;
+
+val ACME_PORT:      u16 = 14001;
+val MAX_BODY_BYTES: usize = 65536;
+val MAX_FIELDS:     usize = 64;
+
+fun length(text: *u8) usize {
+    var i: usize = 0;
+    for (text[i] != 0) { i = i + 1; }
+    ret i;
+}
+
+fun copy(destination: *u8, source: *u8, len: usize) {
+    var i: usize = 0;
+    for (i < len) {
+        destination[i] = source[i];
+        i = i + 1;
+    }
+}
+
+# a bounded response buffer plus the parsed status line and fields
+pub rec Exchange {
+    status:  u16;
+    body:    view.View;
+    fields:  field.Fields;
+    items:   [64]field.Field;
+    storage: [65536]u8;
+    len:     usize;
+}
+
+rec Writer {
+    data: *u8;
+    cap:  usize;
+    pos:  usize;
+}
+
+fun put(writer: *Writer, data: *u8, len: usize) bool {
+    if (len > writer.cap - writer.pos) { ret false; }
+    copy(?writer.data[writer.pos], data, len);
+    writer.pos = writer.pos + len;
+    ret true;
+}
+
+fun put_text(writer: *Writer, text: *u8) bool {
+    ret put(writer, text, length(text));
+}
+
+fun put_number(writer: *Writer, value: usize) bool {
+    var digits: [24]u8;
+    var count: usize = 0;
+    var remaining: usize = value;
+    if (remaining == 0) {
+        digits[0] = '0';
+        count = 1;
+    }
+    for (remaining != 0) {
+        digits[count] = ('0'::usize + remaining % 10)::u8;
+        remaining = remaining / 10;
+        count = count + 1;
+    }
+    var i: usize = 0;
+    for (i < count) {
+        if (!put(writer, ?digits[count - 1 - i], 1)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the authority's urls are https and name the harness front end, so the
+# request line carries the exact path and the Host header the server echoes
+fun split_url(url: view.View, host: *view.View, path: *view.View) bool {
+    if (url.len < 9) { ret false; }
+    var i: usize = 8;
+    for (i < url.len && url.data[i] != '/') { i = i + 1; }
+    @host = view.view(?url.data[8], i - 8);
+    if (i == url.len) {
+        @path = view.view("/", 1);
+        ret true;
+    }
+    @path = view.view(?url.data[i], url.len - i);
+    ret host.len != 0;
+}
+
+fun method_name(value: method.Method) *u8 {
+    if (value.kind == method.GET) { ret "GET"; }
+    if (value.kind == method.HEAD) { ret "HEAD"; }
+    if (value.kind == method.POST) { ret "POST"; }
+    ret nil;
+}
+
+fun digit_value(value: u8) bool { ret value >= '0' && value <= '9'; }
+
+fun parse_status(data: *u8, len: usize, output: *u16) usize {
+    if (len < 12 || data[0] != 'H' || data[1] != 'T' || data[2] != 'T' ||
+        data[3] != 'P' || data[4] != '/') { ret 0; }
+    var i: usize = 5;
+    for (i < len && data[i] != ' ') { i = i + 1; }
+    if (i + 4 > len) { ret 0; }
+    i = i + 1;
+    if (!digit_value(data[i]) || !digit_value(data[i + 1]) ||
+        !digit_value(data[i + 2])) { ret 0; }
+    @output = ((data[i] - '0')::u16) * 100 + ((data[i + 1] - '0')::u16) * 10 +
+        (data[i + 2] - '0')::u16;
+    var j: usize = i;
+    for (j + 1 < len && !(data[j] == '\r' && data[j + 1] == '\n')) {
+        j = j + 1;
+    }
+    if (j + 1 >= len) { ret 0; }
+    ret j + 2;
+}
+
+fun trim(data: *u8, start: usize, finish: usize, output: *view.View) {
+    var first: usize = start;
+    var last: usize = finish;
+    for (first < last && (data[first] == ' ' || data[first] == '\t')) {
+        first = first + 1;
+    }
+    for (last > first && (data[last - 1] == ' ' || data[last - 1] == '\t')) {
+        last = last - 1;
+    }
+    @output = view.view(?data[first], last - first);
+}
+
+fun parse_number(value: view.View) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    for (i < value.len) {
+        if (!digit_value(value.data[i])) { ret 0; }
+        total = total * 10 + (value.data[i] - '0')::usize;
+        i = i + 1;
+    }
+    ret total;
+}
+
+fun name_is(value: view.View, expected: *u8) bool {
+    ret field.name_equal(value, view.view(expected, length(expected)));
+}
+
+# parses the header block into the exchange's own field storage and returns
+# the offset of the body plus its declared length
+fun parse_headers(exchange: *Exchange, start: usize, body_at: *usize,
+    body_len: *usize, chunked: *bool) bool {
+    var i: usize = start;
+    var declared: usize = 0;
+    var has_length: bool = false;
+    @chunked = false;
+    exchange.fields = field.init(?exchange.items[0], MAX_FIELDS,
+        field.limits(MAX_FIELDS, 65536, 256, 8192));
+    for (true) {
+        if (i + 1 >= exchange.len) { ret false; }
+        if (exchange.storage[i] == '\r' && exchange.storage[i + 1] == '\n') {
+            @body_at = i + 2;
+            if (@chunked) { ret true; }
+            if (!has_length) { @body_len = 0; ret true; }
+            @body_len = declared;
+            ret true;
+        }
+        var colon: usize = i;
+        for (colon < exchange.len && exchange.storage[colon] != ':' &&
+            exchange.storage[colon] != '\r') { colon = colon + 1; }
+        if (colon >= exchange.len || exchange.storage[colon] != ':') {
+            ret false;
+        }
+        var finish: usize = colon;
+        for (finish + 1 < exchange.len &&
+            !(exchange.storage[finish] == '\r' &&
+                exchange.storage[finish + 1] == '\n')) {
+            finish = finish + 1;
+        }
+        if (finish + 1 >= exchange.len) { ret false; }
+        if (exchange.fields.len >= MAX_FIELDS) { ret false; }
+        var name: view.View;
+        var value: view.View;
+        trim(?exchange.storage[0], i, colon, ?name);
+        trim(?exchange.storage[0], colon + 1, finish, ?value);
+        exchange.items[exchange.fields.len] = field.Field{name: name,
+            value: value, sensitive: false};
+        exchange.fields.len = exchange.fields.len + 1;
+        exchange.fields.bytes = exchange.fields.bytes + name.len + value.len;
+        if (name_is(name, "content-length")) {
+            declared = parse_number(value);
+            has_length = true;
+        }
+        if (name_is(name, "transfer-encoding")) { @chunked = true; }
+        i = finish + 2;
+    }
+    ret false;
+}
+
+fun hex_value(value: u8, output: *usize) bool {
+    if (value >= '0' && value <= '9') { @output = (value - '0')::usize; ret true; }
+    if (value >= 'a' && value <= 'f') {
+        @output = (value - 'a')::usize + 10;
+        ret true;
+    }
+    if (value >= 'A' && value <= 'F') {
+        @output = (value - 'A')::usize + 10;
+        ret true;
+    }
+    ret false;
+}
+
+# rewrites a chunked body in place so the exchange exposes one contiguous view
+fun dechunk(exchange: *Exchange, body_at: usize, output: *usize) bool {
+    var read: usize = body_at;
+    var write: usize = body_at;
+    for (true) {
+        var size: usize = 0;
+        var digits: usize = 0;
+        var terminated: bool = false;
+        for (read < exchange.len && !terminated) {
+            var value: usize = 0;
+            if (!hex_value(exchange.storage[read], ?value)) { ret false; }
+            size = size * 16 + value;
+            digits = digits + 1;
+            read = read + 1;
+            if (read + 1 < exchange.len && exchange.storage[read] == '\r' &&
+                exchange.storage[read + 1] == '\n') { terminated = true; }
+        }
+        if (!terminated || digits == 0) { ret false; }
+        read = read + 2;
+        if (size == 0) {
+            @output = write - body_at;
+            ret true;
+        }
+        if (read + size + 2 > exchange.len) { ret false; }
+        var i: usize = 0;
+        for (i < size) {
+            exchange.storage[write + i] = exchange.storage[read + i];
+            i = i + 1;
+        }
+        write = write + size;
+        read = read + size + 2;
+    }
+    ret false;
+}
+
+fun send_all(stream: *tcp.Stream, data: *u8, len: usize) bool {
+    var sent: usize = 0;
+    for (sent < len) {
+        val written: R.Result[usize, IO.Error] = tcp.stream_write(stream,
+            ?data[sent], len - sent);
+        if (R.is_err[usize, IO.Error](written)) { ret false; }
+        val count: usize = R.unwrap_ok[usize, IO.Error](written);
+        if (count == 0) { ret false; }
+        sent = sent + count;
+    }
+    ret true;
+}
+
+# executes one wire request against the harness and fills the exchange. the
+# connection is not reused, so each acme request is independent.
+pub fun execute(request: client.WireRequest, exchange: *Exchange) bool {
+    if (problem.failed(request.error)) { ret false; }
+    var host: view.View;
+    var path: view.View;
+    if (!split_url(request.url, ?host, ?path)) { ret false; }
+    val name: *u8 = method_name(request.method);
+    if (name == nil) { ret false; }
+    var head: [8192]u8;
+    var writer: Writer = Writer{data: ?head[0], cap: 8192, pos: 0};
+    if (!put_text(?writer, name) || !put_text(?writer, " ") ||
+        !put(?writer, path.data, path.len) ||
+        !put_text(?writer, " HTTP/1.1\r\nHost: ") ||
+        !put(?writer, host.data, host.len) ||
+        !put_text(?writer,
+            "\r\nUser-Agent: mach-acme-live/0.1\r\nConnection: close\r\n")) {
+        ret false;
+    }
+    if (request.content_type.len != 0 &&
+        (!put_text(?writer, "Content-Type: ") ||
+        !put(?writer, request.content_type.data, request.content_type.len) ||
+        !put_text(?writer, "\r\n"))) { ret false; }
+    if (request.method.kind == method.POST &&
+        (!put_text(?writer, "Content-Length: ") ||
+        !put_number(?writer, request.body.len) ||
+        !put_text(?writer, "\r\n"))) { ret false; }
+    if (!put_text(?writer, "\r\n")) { ret false; }
+
+    val connected: R.Result[tcp.Stream, IO.Error] = tcp.connect(
+        ip.endpoint(127, 0, 0, 1, ACME_PORT));
+    if (R.is_err[tcp.Stream, IO.Error](connected)) { ret false; }
+    var stream: tcp.Stream = R.unwrap_ok[tcp.Stream, IO.Error](connected);
+    tcp.stream_set_read_timeout(?stream, 30000);
+    var ok: bool = send_all(?stream, ?head[0], writer.pos);
+    if (ok && request.body.len != 0) {
+        ok = send_all(?stream, request.body.data, request.body.len);
+    }
+    exchange.len = 0;
+    for (ok) {
+        val received: R.Result[usize, IO.Error] = tcp.stream_read(?stream,
+            ?exchange.storage[exchange.len], MAX_BODY_BYTES - exchange.len);
+        if (R.is_err[usize, IO.Error](received)) { ok = false; }
+        or {
+            val count: usize = R.unwrap_ok[usize, IO.Error](received);
+            if (count == 0) { brk; }
+            exchange.len = exchange.len + count;
+            if (exchange.len == MAX_BODY_BYTES) { ok = false; }
+        }
+    }
+    tcp.stream_close(?stream);
+    if (!ok) { ret false; }
+    val header_at: usize = parse_status(?exchange.storage[0], exchange.len,
+        ?exchange.status);
+    if (header_at == 0) { ret false; }
+    var body_at: usize = 0;
+    var body_len: usize = 0;
+    var chunked: bool = false;
+    if (!parse_headers(exchange, header_at, ?body_at, ?body_len, ?chunked)) {
+        ret false;
+    }
+    if (chunked) {
+        if (!dechunk(exchange, body_at, ?body_len)) { ret false; }
+    } or {
+        if (body_at + body_len > exchange.len) { ret false; }
+    }
+    exchange.body = view.view(nil, 0);
+    if (body_len != 0) {
+        exchange.body = view.view(?exchange.storage[body_at], body_len);
+    }
+    exchange.fields.valid = true;
+    ret true;
+}
+
+fun all_digits(value: view.View) bool {
+    if (value.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        if (!digit_value(value.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun month_index(data: *u8) i64 {
+    val names: *u8 = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    var i: i64 = 0;
+    for (i < 12) {
+        val at: usize = (i * 3)::usize;
+        if (names[at] == data[0] && names[at + 1] == data[1] &&
+            names[at + 2] == data[2]) { ret i + 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun two_digits(data: *u8) i64 {
+    ret ((data[0] - '0')::i64) * 10 + (data[1] - '0')::i64;
+}
+
+# proleptic gregorian days since 1970-01-01, so two server timestamps can be
+# differenced without consulting a client clock
+fun days_from_civil(year: i64, month: i64, day: i64) i64 {
+    var y: i64 = year;
+    if (month <= 2) { y = y - 1; }
+    var era: i64 = y / 400;
+    if (y < 0) { era = (y - 399) / 400; }
+    val yoe: i64 = y - era * 400;
+    var shifted: i64 = month + 9;
+    if (month > 2) { shifted = month - 3; }
+    val doy: i64 = (153 * shifted + 2) / 5 + day - 1;
+    val doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    ret era * 146097 + doe - 719468;
+}
+
+# rfc 7231 imf-fixdate: "Fri, 28 Aug 2026 21:35:42 GMT"
+fun parse_http_date(value: view.View, output: *i64) bool {
+    if (value.len != 29 || value.data[3] != ',' || value.data[4] != ' ' ||
+        value.data[7] != ' ' || value.data[11] != ' ' ||
+        value.data[16] != ' ' || value.data[19] != ':' ||
+        value.data[22] != ':') { ret false; }
+    val month: i64 = month_index(?value.data[8]);
+    if (month == 0) { ret false; }
+    var i: usize = 12;
+    for (i < 16) {
+        if (!digit_value(value.data[i])) { ret false; }
+        i = i + 1;
+    }
+    val year: i64 = ((value.data[12] - '0')::i64) * 1000 +
+        ((value.data[13] - '0')::i64) * 100 +
+        ((value.data[14] - '0')::i64) * 10 + (value.data[15] - '0')::i64;
+    val day: i64 = two_digits(?value.data[5]);
+    val hour: i64 = two_digits(?value.data[17]);
+    val minute: i64 = two_digits(?value.data[20]);
+    val second: i64 = two_digits(?value.data[23]);
+    if (day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60) {
+        ret false;
+    }
+    @output = days_from_civil(year, month, day) * 86400 + hour * 3600 +
+        minute * 60 + second;
+    ret true;
+}
+
+fun header(exchange: *Exchange, name: *u8, output: *view.View) bool {
+    var i: usize = 0;
+    for (i < exchange.fields.len) {
+        if (name_is(exchange.items[i].name, name)) {
+            @output = exchange.items[i].value;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# rfc 7231 allows delta-seconds or an imf-fixdate. the date form is resolved
+# against the response's own Date header, so no client clock is involved.
+fun retry_after(exchange: *Exchange) u64 {
+    var advised: view.View;
+    if (!header(exchange, "retry-after", ?advised)) { ret 0; }
+    if (all_digits(advised)) { ret parse_number(advised)::u64; }
+    var origin: view.View;
+    var deadline: i64 = 0;
+    var now: i64 = 0;
+    if (!header(exchange, "date", ?origin) ||
+        !parse_http_date(advised, ?deadline) ||
+        !parse_http_date(origin, ?now) || deadline <= now) { ret 0; }
+    ret (deadline - now)::u64;
+}
+
+pub fun response(exchange: *Exchange) client.Response {
+    ret client.Response{status: exchange.status, fields: ?exchange.fields,
+        body: exchange.body, retry_after_seconds: retry_after(exchange)};
+}
+
+test "live: the harness reaches a real acme directory over http/1.1" {
+    var exchange: Exchange;
+    val configured: client.Limits = client.limits_default();
+    val discovery: client.WireRequest = client.discovery_request(
+        view.view("https://127.0.0.1:14001/dir", 27), configured);
+    if (problem.failed(discovery.error)) { ret 1; }
+    if (!execute(discovery, ?exchange)) { ret 2; }
+    if (exchange.status != status.OK || exchange.body.len == 0) { ret 3; }
+    var scratch: [65536]u8;
+    var text: [16384]u8;
+    var caa: [8]view.View;
+    var directory: client.Directory;
+    val parsed: problem.Error = client.parse_directory(response(?exchange),
+        configured, ?scratch[0], 65536,
+        client.DirectoryStorage{data: ?text[0], capacity: 16384,
+            caa_items: ?caa[0], caa_capacity: 8}, ?directory);
+    if (problem.failed(parsed)) { ret 4; }
+    if (directory.new_nonce_url.len == 0 ||
+        directory.new_account_url.len == 0 ||
+        directory.new_order_url.len == 0) { ret 5; }
+    ret 0;
+}
+
+# an authenticated session against the live authority: account key, replay
+# nonce pool, discovered directory, and the registered account url
+rec Session {
+    protocol:      client.Client;
+    pool:          nonce.Pool;
+    memory:        nonce.Memory;
+    slots:         [8]nonce.Slot;
+    nonce_bytes:   [1024]u8;
+    directory:     client.Directory;
+    directory_text: [8192]u8;
+    caa:           [8]view.View;
+    public_key:    jose.PublicKey;
+    private_key:   jose.PrivateKey;
+    private_bytes: [32]^u8;
+    public_bytes:  [65]u8;
+    account:       account.Account;
+    account_text:  [4096]u8;
+    contacts:      [8]view.View;
+    scratch:       [32768]u8;
+    work:          [8192]u8;
+    body:          [8192]u8;
+    problem_text:  [4096]u8;
+    subproblems:   [8]problem.Subproblem;
+}
+
+fun set_private(output: *^u8) {
+    val value: [32]u8 = [32]u8{
+        0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16,
+        0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6, 0x93,
+        0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12,
+        0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f, 0x67, 0x21
+    };
+    var i: usize = 0;
+    for (i < 32) {
+        output[i] = value[i];
+        i = i + 1;
+    }
+}
+
+fun session_keys(session: *Session) bool {
+    set_private(?session.private_bytes[0]);
+    val secret: contracts.SecretBytes = contracts.SecretBytes{
+        data: ?session.private_bytes[0], len: 32};
+    val derived: contracts.Operation = p256.derive_public(secret,
+        contracts.Buffer{data: ?session.public_bytes[0], capacity: 65});
+    if (derived.error != contracts.OK) { ret false; }
+    session.public_key = jose.PublicKey{algorithm: jose.ES256,
+        value: contracts.Bytes{data: ?session.public_bytes[0], len: 65}};
+    session.private_key = jose.PrivateKey{algorithm: jose.ES256,
+        secret_owner: (?session.public_bytes[0])::ptr, value: secret};
+    ret true;
+}
+
+fun problem_storage(session: *Session) client.ProblemStorage {
+    ret client.ProblemStorage{data: ?session.problem_text[0], capacity: 4096,
+        subproblems: ?session.subproblems[0], subproblem_capacity: 8};
+}
+
+fun session_begin(session: *Session, exchange: *Exchange) bool {
+    if (!session_keys(session)) { ret false; }
+    if (problem.failed(nonce.init_memory(?session.memory, ?session.slots[0], 8,
+            ?session.nonce_bytes[0], 1024, 128))) { ret false; }
+    session.pool = nonce.pool(?session.memory);
+    if (problem.failed(client.init(?session.protocol, ?session.pool,
+            client.limits_default()))) { ret false; }
+    val discovery: client.WireRequest = client.discovery_request(
+        view.view("https://127.0.0.1:14001/dir", 27),
+        client.limits_default());
+    if (!execute(discovery, exchange)) { ret false; }
+    ret !problem.failed(client.parse_directory(response(exchange),
+        client.limits_default(), ?session.scratch[0], 32768,
+        client.DirectoryStorage{data: ?session.directory_text[0],
+            capacity: 8192, caa_items: ?session.caa[0], caa_capacity: 8},
+        ?session.directory));
+}
+
+# drives one signed request to a final answer, acquiring a replay nonce and
+# following the protocol layer's badNonce recovery exactly as it directs
+fun run_signed(session: *Session, request: *client.SignedRequest,
+    exchange: *Exchange, decision: *client.Decision) bool {
+    var rounds: usize = 0;
+    for (rounds < 8) {
+        rounds = rounds + 1;
+        if (request.state == client.REQUEST_NEEDS_NONCE) {
+            val head: client.WireRequest = client.nonce_request(
+                ?session.protocol, session.directory);
+            if (!execute(head, exchange)) { ret false; }
+            if (problem.failed(client.accept_nonce_response(?session.protocol,
+                    request, response(exchange)))) { ret false; }
+        }
+        val signed: jose.Operation = client.prepare_signed(?session.protocol,
+            request, jose.signer(session.public_key), session.private_key,
+            jose.no_entropy(),
+            contracts.Buffer{data: ?session.work[0], capacity: 8192},
+            contracts.Buffer{data: ?session.body[0], capacity: 8192});
+        if (problem.failed(signed.error)) {
+            if (request.state == client.REQUEST_NEEDS_NONCE) { cnt; }
+            ret false;
+        }
+        val wire: client.WireRequest = client.signed_wire(?session.protocol,
+            request);
+        if (!execute(wire, exchange)) { ret false; }
+        @decision = client.accept_signed_response(?session.protocol, request,
+            response(exchange), ?session.scratch[0], 32768,
+            problem_storage(session));
+        if (decision.action == client.ACTION_COMPLETE) { ret true; }
+        if (decision.action == client.ACTION_RETRY_SIGNED ||
+            decision.action == client.ACTION_ACQUIRE_NONCE) { cnt; }
+        ret false;
+    }
+    ret false;
+}
+
+fun account_limits() account.Limits {
+    ret account.Limits{max_response_bytes: 65536, max_json_scratch: 32768,
+        max_json_depth: 16, max_json_values: 4096, max_json_key_bytes: 128,
+        max_json_key_comparisons: 65536, max_url_bytes: 4096,
+        max_contacts: 8, max_contact_bytes: 4096,
+        response_fields: field.limits(64, 65536, 256, 8192)};
+}
+
+# registers the session's account key and retains the returned account url
+fun session_account(session: *Session, exchange: *Exchange) bool {
+    var payload: [1024]u8;
+    var wanted: account.Request;
+    wanted.contacts = nil;
+    wanted.contact_len = 0;
+    wanted.terms_of_service_agreed = true;
+    wanted.only_return_existing = false;
+    wanted.external_account_binding = external_account.none();
+    val encoded: account.Operation = account.encode(account.CREATE, wanted,
+        contracts.Buffer{data: ?payload[0], capacity: 1024});
+    if (problem.failed(encoded.error)) { ret false; }
+    var request: client.SignedRequest;
+    if (problem.failed(account.begin(?session.protocol, ?request,
+            account.CREATE, session.directory.new_account_url,
+            view.view(nil, 0), encoded.payload, encoded,
+            jose.signer(session.public_key)))) { ret false; }
+    var decision: client.Decision;
+    if (!run_signed(session, ?request, exchange, ?decision)) { ret false; }
+    ret !problem.failed(account.parse(account.CREATE, response(exchange),
+        view.view(nil, 0), account_limits(), ?session.scratch[0], 32768,
+        account.Storage{data: ?session.account_text[0], capacity: 4096,
+            contacts: ?session.contacts[0], contact_capacity: 8},
+        ?session.account));
+}
+
+fun dns_name(value: str, len: usize) identifier.Identifier {
+    ret identifier.Identifier{kind: identifier.DNS,
+        value: view.view(value, len)};
+}
+
+fun order_storage(text: *u8, names: *identifier.Identifier,
+    authorizations: *view.View) order.Storage {
+    ret order.Storage{data: text, capacity: 8192, identifiers: names,
+        identifier_capacity: 8, authorizations: authorizations,
+        authorization_capacity: 8};
+}
+
+# creates an order over the supplied identifiers and decodes the response
+fun create_order(session: *Session, exchange: *Exchange,
+    names: *identifier.Identifier, len: usize, policy: identifier.Policy,
+    storage: order.Storage, created: *order.Order,
+    decision: *client.Decision) bool {
+    var payload: [2048]u8;
+    val encoded: order.Operation = order.encode(
+        order.Request{identifiers: names, len: len,
+            not_before: view.view(nil, 0), not_after: view.view(nil, 0)},
+        policy, order.limits_default(),
+        contracts.Buffer{data: ?payload[0], capacity: 2048});
+    if (problem.failed(encoded.error)) { ret false; }
+    var request: client.SignedRequest;
+    if (problem.failed(order.begin_new(?session.protocol, ?request,
+            session.directory.new_order_url, session.account.url,
+            encoded.payload, encoded, jose.signer(session.public_key)))) {
+        ret false;
+    }
+    if (!run_signed(session, ?request, exchange, decision)) { ret false; }
+    ret !problem.failed(order.parse(response(exchange), view.view(nil, 0),
+        policy, order.limits_default(), ?session.scratch[0], 32768, storage,
+        created));
+}
+
+fun fetch_authorization(session: *Session, exchange: *Exchange,
+    url: view.View, policy: identifier.Policy,
+    storage: order.AuthorizationStorage, output: *order.Authorization) bool {
+    var request: client.SignedRequest;
+    if (problem.failed(order.begin_fetch(?session.protocol, ?request, url,
+            session.account.url, jose.signer(session.public_key)))) {
+        ret false;
+    }
+    var decision: client.Decision;
+    if (!run_signed(session, ?request, exchange, ?decision)) { ret false; }
+    ret !problem.failed(order.parse_authorization(response(exchange), url,
+        policy, order.limits_default(), ?session.scratch[0], 32768, storage,
+        output));
+}
+
+test "live: a multi-identifier order returns one authorization per name" {
+    var session: Session;
+    var exchange: Exchange;
+    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_account(?session, ?exchange)) { ret 2; }
+    if (session.account.status != account.VALID ||
+        session.account.url.len == 0) { ret 3; }
+
+    var names: [2]identifier.Identifier;
+    names[0] = dns_name("live-a.example", 14);
+    names[1] = dns_name("live-b.example", 14);
+    var text: [8192]u8;
+    var parsed_names: [8]identifier.Identifier;
+    var authorizations: [8]view.View;
+    var created: order.Order;
+    var decision: client.Decision;
+    if (!create_order(?session, ?exchange, ?names[0], 2,
+            identifier.policy_default(),
+            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+            ?created, ?decision)) { ret 4; }
+    if (created.status != order.PENDING || created.identifier_len != 2 ||
+        created.authorization_len != 2 || created.url.len == 0 ||
+        created.finalize_url.len == 0 ||
+        created.certificate_url.len != 0) { ret 5; }
+
+    # every authorization the authority returned names one requested
+    # identifier and offers the three challenge types pebble implements
+    var i: usize = 0;
+    for (i < created.authorization_len) {
+        var authorization: order.Authorization;
+        var authorization_text: [8192]u8;
+        var challenges: [8]challenge.Challenge;
+        if (!fetch_authorization(?session, ?exchange, authorizations[i],
+                identifier.policy_default(),
+                order.AuthorizationStorage{data: ?authorization_text[0],
+                    capacity: 8192, challenges: ?challenges[0],
+                    challenge_capacity: 8}, ?authorization)) { ret 6; }
+        if (authorization.status != order.AUTH_PENDING ||
+            authorization.wildcard ||
+            authorization.identifier.kind != identifier.DNS) { ret 7; }
+        var matched: bool = false;
+        var j: usize = 0;
+        for (j < created.identifier_len) {
+            if (identifier.same(authorization.identifier,
+                parsed_names[j])) { matched = true; }
+            j = j + 1;
+        }
+        if (!matched) { ret 8; }
+        if (order.select_challenge(authorization, challenge.HTTP_01) == nil ||
+            order.select_challenge(authorization, challenge.DNS_01) == nil ||
+            order.select_challenge(authorization,
+                challenge.TLS_ALPN_01) == nil) { ret 9; }
+        if (!order.challenge_admissible(authorization, challenge.HTTP_01)) {
+            ret 10;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "live: a wildcard order yields a dns-01 only authorization" {
+    var session: Session;
+    var exchange: Exchange;
+    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_account(?session, ?exchange)) { ret 2; }
+    var names: [1]identifier.Identifier;
+    names[0] = dns_name("*.wild.example", 14);
+    var text: [8192]u8;
+    var parsed_names: [8]identifier.Identifier;
+    var authorizations: [8]view.View;
+    var created: order.Order;
+    var decision: client.Decision;
+    if (!create_order(?session, ?exchange, ?names[0], 1,
+            identifier.policy_default(),
+            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+            ?created, ?decision)) { ret 3; }
+    if (created.identifier_len != 1 || created.authorization_len != 1) {
+        ret 4;
+    }
+    var authorization: order.Authorization;
+    var authorization_text: [8192]u8;
+    var challenges: [8]challenge.Challenge;
+    if (!fetch_authorization(?session, ?exchange, authorizations[0],
+            identifier.policy_default(),
+            order.AuthorizationStorage{data: ?authorization_text[0],
+                capacity: 8192, challenges: ?challenges[0],
+                challenge_capacity: 8}, ?authorization)) { ret 5; }
+    # the authority names the base domain and flags the wildcard separately
+    if (!authorization.wildcard ||
+        !identifier.same(authorization.identifier,
+            dns_name("wild.example", 12))) { ret 6; }
+    if (!order.challenge_admissible(authorization, challenge.DNS_01) ||
+        order.challenge_admissible(authorization, challenge.HTTP_01) ||
+        order.challenge_admissible(authorization, challenge.TLS_ALPN_01)) {
+        ret 7;
+    }
+    if (order.select_challenge(authorization, challenge.DNS_01) == nil) {
+        ret 8;
+    }
+    ret 0;
+}
+
+test "live: a rejected identifier surfaces as a structured acme problem" {
+    var session: Session;
+    var exchange: Exchange;
+    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_account(?session, ?exchange)) { ret 2; }
+    var names: [1]identifier.Identifier;
+    names[0] = dns_name("blocked-domain.example", 22);
+    var text: [8192]u8;
+    var parsed_names: [8]identifier.Identifier;
+    var authorizations: [8]view.View;
+    var created: order.Order;
+    var decision: client.Decision;
+    # the authority blocks this name, so order creation must fail with the
+    # authority's own problem document rather than a transport error
+    if (create_order(?session, ?exchange, ?names[0], 1,
+            identifier.policy_default(),
+            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+            ?created, ?decision)) { ret 3; }
+    if (decision.action != client.ACTION_FAILED) { ret 4; }
+    if (decision.cause.kind != problem.PROTOCOL ||
+        decision.cause.code != problem.ACME_PROBLEM) { ret 5; }
+    if (decision.cause.problem.typ.len == 0 ||
+        decision.cause.http.status < 400) { ret 6; }
+    ret 0;
+}
+
+test "live: post-as-get order polling drives the bounded poll decision" {
+    var session: Session;
+    var exchange: Exchange;
+    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_account(?session, ?exchange)) { ret 2; }
+    var names: [1]identifier.Identifier;
+    names[0] = dns_name("live-poll.example", 17);
+    var text: [8192]u8;
+    var parsed_names: [8]identifier.Identifier;
+    var authorizations: [8]view.View;
+    var created: order.Order;
+    var decision: client.Decision;
+    if (!create_order(?session, ?exchange, ?names[0], 1,
+            identifier.policy_default(),
+            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+            ?created, ?decision)) { ret 3; }
+
+    # post-as-get the order the authority just created
+    var request: client.SignedRequest;
+    if (problem.failed(order.begin_fetch(?session.protocol, ?request,
+            created.url, session.account.url,
+            jose.signer(session.public_key)))) { ret 4; }
+    if (!run_signed(?session, ?request, ?exchange, ?decision)) { ret 5; }
+    var polled: order.Order;
+    var poll_text: [8192]u8;
+    var poll_names: [8]identifier.Identifier;
+    var poll_authorizations: [8]view.View;
+    if (problem.failed(order.parse(response(?exchange), created.url,
+            identifier.policy_default(), order.limits_default(),
+            ?session.scratch[0], 32768,
+            order_storage(?poll_text[0], ?poll_names[0],
+                ?poll_authorizations[0]), ?polled))) { ret 6; }
+    # a re-read of the same order names the same resource and identifiers
+    if (polled.status != order.PENDING || polled.identifier_len != 1 ||
+        polled.authorization_len != 1 ||
+        !identifier.same(polled.identifiers[0], names[0])) { ret 7; }
+
+    # the live status feeds the bounded poll decision. this authority does not
+    # advise Retry-After on a pending order; it does once a challenge is
+    # processing, which the challenge suite exercises.
+    var state: order.Poll;
+    var policy: order.PollPolicy = order.poll_policy_default();
+    policy.min_delay_ns = 1000000000;
+    policy.max_delay_ns = 60000000000;
+    if (problem.failed(order.poll_begin(?state, policy, 3600000000000))) {
+        ret 8;
+    }
+    val advised: u64 = retry_after(?exchange);
+    val waited: order.PollDecision = order.poll_next(?state, polled.status,
+        order.READY, advised, 0);
+    if (waited.action != order.POLL_WAIT) { ret 9; }
+    var expected: u64 = policy.min_delay_ns;
+    if (advised * 1000000000 > expected) { expected = advised * 1000000000; }
+    if (waited.delay_ns != expected) { ret 10; }
+
+    # an absolute deadline the next wait would pass stops the loop
+    if (problem.failed(order.poll_begin(?state, policy, 500000000))) { ret 11; }
+    if (order.poll_next(?state, polled.status, order.READY, advised, 0).action
+        != order.POLL_DEADLINE) { ret 12; }
+
+    # cancellation is observable from outside the poll loop
+    if (problem.failed(order.poll_begin(?state, policy, 3600000000000)) ||
+        !order.poll_cancel(?state) ||
+        order.poll_next(?state, polled.status, order.READY, advised,
+            0).action != order.POLL_CANCELLED) { ret 13; }
+    ret 0;
+}
