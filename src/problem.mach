@@ -40,6 +40,9 @@ pub val UNSUPPORTED_ALGORITHM: Code = 13;
 pub val INVALID_KEY:           Code = 14;
 pub val INVALID_STATE:         Code = 15;
 pub val ENTROPY_UNAVAILABLE:   Code = 16;
+pub val STORAGE_CONFLICT:      Code = 17;
+pub val STORAGE_FAILED:        Code = 18;
+pub val STORAGE_UNKNOWN:       Code = 19;
 
 pub rec Problem {
     typ:            view.View;

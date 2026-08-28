@@ -131,6 +131,8 @@ pub rec SignedRequest {
     url_digest:        [32]u8;
     payload_digest:    [32]u8;
     kid_digest:        [32]u8;
+    signer_thumbprint: [43]u8;
+    signer_bound:      bool;
 }
 
 pub def Action: u8;
@@ -283,6 +285,20 @@ fun spec_intact(request: *SignedRequest) bool {
         digest_same(request.spec.kid, ?request.kid_digest[0]);
 }
 
+fun signer_thumbprint(signer: jose.Signer, output: *u8) bool {
+    if (!jose.valid(signer) || !memory_range.valid(output, 43)) { ret false; }
+    val encoded: jose.Operation = jose.key_thumbprint(signer.public_key,
+        contracts.Buffer{data: output, capacity: 43});
+    ret !problem.failed(encoded.error) && encoded.written == 43;
+}
+
+fun signer_intact(request: *SignedRequest, signer: jose.Signer) bool {
+    if (!request.signer_bound) { ret true; }
+    var actual: [43]u8;
+    ret signer_thumbprint(signer, ?actual[0]) &&
+        bytes_same(?actual[0], ?request.signer_thumbprint[0], 43);
+}
+
 fun terminalize(request: *SignedRequest) {
     request.wire_body = view.view(nil, 0);
     request.state = REQUEST_FAILED;
@@ -369,7 +385,8 @@ fun request_same(first: SignedRequest, second: *SignedRequest) bool {
         first.state != second.state || first.attempts != second.attempts ||
         first.bad_nonce_retries != second.bad_nonce_retries ||
         first.retry_nonce_len != second.retry_nonce_len ||
-        first.retry_nonce_ready != second.retry_nonce_ready) { ret false; }
+        first.retry_nonce_ready != second.retry_nonce_ready ||
+        first.signer_bound != second.signer_bound) { ret false; }
     var i: usize = 0;
     for (i < 512) {
         if (first.retry_nonce[i] != second.retry_nonce[i]) { ret false; }
@@ -380,6 +397,13 @@ fun request_same(first: SignedRequest, second: *SignedRequest) bool {
         if (first.url_digest[i] != second.url_digest[i] ||
             first.payload_digest[i] != second.payload_digest[i] ||
             first.kid_digest[i] != second.kid_digest[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 43) {
+        if (first.signer_thumbprint[i] != second.signer_thumbprint[i]) {
+            ret false;
+        }
         i = i + 1;
     }
     ret true;
@@ -1498,6 +1522,7 @@ pub fun begin_signed(client: *Client, request: *SignedRequest,
     request.state = REQUEST_READY;
     request.attempts = 0;
     request.bad_nonce_retries = 0;
+    request.signer_bound = false;
     wipe_retry_nonce(request);
     var i: usize = 0;
     for (i < 32) {
@@ -1506,6 +1531,33 @@ pub fun begin_signed(client: *Client, request: *SignedRequest,
         request.kid_digest[i] = kid_digest[i];
         i = i + 1;
     }
+    i = 0;
+    for (i < 43) {
+        request.signer_thumbprint[i] = 0;
+        i = i + 1;
+    }
+    ret problem.none();
+}
+
+pub fun begin_signed_bound(client: *Client, request: *SignedRequest,
+    spec: SignedSpec, signer: jose.Signer) problem.Error {
+    var thumbprint: [43]u8;
+    if (request == nil || !memory_range.valid(request::*u8,
+            $size_of(SignedRequest)) ||
+        jose.public_key_overlaps(signer.public_key, request::*u8,
+            $size_of(SignedRequest)) ||
+        !signer_thumbprint(signer, ?thumbprint[0])) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid bound request signer");
+    }
+    val begun: problem.Error = begin_signed(client, request, spec);
+    if (problem.failed(begun)) { ret begun; }
+    var i: usize = 0;
+    for (i < 43) {
+        request.signer_thumbprint[i] = thumbprint[i];
+        i = i + 1;
+    }
+    request.signer_bound = true;
     ret problem.none();
 }
 
@@ -1519,6 +1571,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
         request.client_owner != client::ptr ||
         request.client_generation != client.generation ||
         !spec_intact(request) ||
+        !signer_intact(request, signer) ||
         (request.state != REQUEST_READY && request.state != REQUEST_RETRY) ||
         request.attempts == 18446744073709551615 ||
         (request.state == REQUEST_RETRY &&
@@ -1636,7 +1689,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
         nonce_len = reserved.value.len;
         reservation_token = reserved.token;
     }
-    if (!spec_intact(request)) {
+    if (!spec_intact(request) || !signer_intact(request, signer)) {
         var i: usize = 0;
         for (i < nonce_len) {
             nonce_bytes[i] = 0;
@@ -1702,7 +1755,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
             problem.INVALID_STATE, "entropy callback mutated protocol state"),
             written: 0};
     }
-    if (!spec_intact(request)) {
+    if (!spec_intact(request) || !signer_intact(request, signer)) {
         if (reservation_token != 0) {
             pool_finish(client, request, reservation_pool,
                 reservation_token, false);

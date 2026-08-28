@@ -1,6 +1,7 @@
 # bounded account lifecycle requests
 
 use crypto.contracts;
+use crypto.hash;
 use http.core.field;
 use http.core.status;
 use J: std.data.json;
@@ -38,7 +39,7 @@ pub rec Request {
     contact_len:           usize;
     terms_of_service_agreed: bool;
     only_return_existing:  bool;
-    external_account_binding: view.View;
+    external_account_binding: external_account.Operation;
 }
 
 pub rec Account {
@@ -158,6 +159,9 @@ pub rec Operation {
     error:   problem.Error;
     written: usize;
     action:  Action;
+    payload: view.View;
+    payload_digest: [32]u8;
+    external_binding: external_account.Operation;
 }
 
 rec Writer {
@@ -167,8 +171,18 @@ rec Writer {
 }
 
 fun failed(code: problem.Code, detail: *u8) Operation {
-    ret Operation{error: problem.local_code(problem.PROTOCOL, code, detail),
-        written: 0, action: 0};
+    var result: Operation;
+    result.error = problem.local_code(problem.PROTOCOL, code, detail);
+    result.written = 0;
+    result.action = 0;
+    result.payload = view.view(nil, 0);
+    result.external_binding = external_account.none();
+    var i: usize = 0;
+    for (i < 32) {
+        result.payload_digest[i] = 0;
+        i = i + 1;
+    }
+    ret result;
 }
 
 fun byte(writer: *Writer, value: u8) bool {
@@ -237,7 +251,58 @@ fun contact_valid(value: view.View) bool {
             current == '-' || current == '.')) { ret false; }
         i = i + 1;
     }
-    ret colon;
+    if (!colon) { ret false; }
+    val mailto: bool = value.len > 7 &&
+        (value.data[0] == 'm' || value.data[0] == 'M') &&
+        (value.data[1] == 'a' || value.data[1] == 'A') &&
+        (value.data[2] == 'i' || value.data[2] == 'I') &&
+        (value.data[3] == 'l' || value.data[3] == 'L') &&
+        (value.data[4] == 't' || value.data[4] == 'T') &&
+        (value.data[5] == 'o' || value.data[5] == 'O') && value.data[6] == ':';
+    if (!mailto) { ret true; }
+    var at: usize = 0;
+    i = 7;
+    for (i < value.len) {
+        if (value.data[i] == '?' || value.data[i] == ',' ||
+            value.data[i] == '#') { ret false; }
+        if (value.data[i] == '@') {
+            if (at != 0 || i == 7 || i + 1 == value.len) { ret false; }
+            at = i;
+        }
+        i = i + 1;
+    }
+    ret at != 0;
+}
+
+fun digest(value: view.View, output: *u8) bool {
+    if (!memory_range.valid(value.data, value.len) ||
+        !memory_range.valid(output, 32)) { ret false; }
+    var context: hash.Sha256 = hash.empty_sha256();
+    if (hash.init_sha256(?context) != contracts.OK ||
+        hash.update_sha256(?context, contracts.Bytes{data: value.data,
+            len: value.len}) != contracts.OK) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    val result: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: output, capacity: 32});
+    ret result.error == contracts.OK && result.written == 32;
+}
+
+fun digest_same(value: view.View, expected: *u8) bool {
+    var actual: [32]u8;
+    if (!digest(value, ?actual[0])) { ret false; }
+    var i: usize = 0;
+    for (i < 32) {
+        if (actual[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun external_absent(value: external_account.Operation) bool {
+    ret !problem.failed(value.error) && !value.bound && value.written == 0 &&
+        value.output.data == nil && value.output.len == 0;
 }
 
 fun inputs_valid(action: Action, request: Request, output: contracts.Buffer) bool {
@@ -249,23 +314,28 @@ fun inputs_valid(action: Action, request: Request, output: contracts.Buffer) boo
         !memory_range.size(request.contact_len, $size_of(view.View),
             ?contact_bytes) ||
         !memory_range.valid(request.contacts::*u8, contact_bytes) ||
-        !memory_range.valid(request.external_account_binding.data,
-            request.external_account_binding.len) ||
         memory_range.overlap(output.data, output.capacity,
             request.contacts::*u8, contact_bytes) ||
+        (request.external_account_binding.output.len != 0 &&
         memory_range.overlap(output.data, output.capacity,
-            request.external_account_binding.data,
-            request.external_account_binding.len)) { ret false; }
+            request.external_account_binding.output.data,
+            request.external_account_binding.output.len))) { ret false; }
+    val has_external: bool = request.external_account_binding.bound;
+    if ((has_external &&
+            !external_account.operation_valid(request.external_account_binding)) ||
+        (!has_external && !external_absent(request.external_account_binding))) {
+        ret false;
+    }
     if ((action == CREATE && request.only_return_existing) ||
         (action == LOOKUP && (!request.only_return_existing ||
             request.contact_len != 0 || request.terms_of_service_agreed ||
-            request.external_account_binding.len != 0)) ||
+            has_external)) ||
         (action == UPDATE_CONTACT && (request.only_return_existing ||
             request.terms_of_service_agreed ||
-            request.external_account_binding.len != 0)) ||
+            has_external)) ||
         ((action == AGREE_TERMS || action == DEACTIVATE) &&
             (request.contact_len != 0 || request.only_return_existing ||
-            request.external_account_binding.len != 0)) ||
+            has_external)) ||
         (action == AGREE_TERMS && !request.terms_of_service_agreed) ||
         (action == DEACTIVATE && request.terms_of_service_agreed) ||
         (action != CREATE && action != LOOKUP && action != UPDATE_CONTACT &&
@@ -276,10 +346,6 @@ fun inputs_valid(action: Action, request: Request, output: contracts.Buffer) boo
             memory_range.overlap(output.data, output.capacity,
                 request.contacts[i].data, request.contacts[i].len)) { ret false; }
         i = i + 1;
-    }
-    if (request.external_account_binding.len != 0 &&
-        !external_account.encoded_valid(request.external_account_binding)) {
-        ret false;
     }
     ret true;
 }
@@ -329,11 +395,11 @@ pub fun encode(action: Action, request: Request,
             }
             member = true;
         }
-        if (request.external_account_binding.len != 0) {
+        if (request.external_account_binding.bound) {
             if ((member && !byte(?writer, ',')) ||
                 !bytes(?writer, "\"externalAccountBinding\":", 25) ||
-                !bytes(?writer, request.external_account_binding.data,
-                    request.external_account_binding.len)) {
+                !bytes(?writer, request.external_account_binding.output.data,
+                    request.external_account_binding.output.len)) {
                 ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
             }
             member = true;
@@ -356,15 +422,31 @@ pub fun encode(action: Action, request: Request,
         output.data[i] = encoded[i];
         i = i + 1;
     }
-    ret Operation{error: problem.none(), written: writer.pos, action: action};
+    var payload_digest: [32]u8;
+    if (!digest(view.view(output.data, writer.pos), ?payload_digest[0])) {
+        ret failed(problem.INVALID_STATE, "account request binding failed");
+    }
+    var result: Operation = Operation{error: problem.none(),
+        written: writer.pos, action: action,
+        payload: view.view(output.data, writer.pos),
+        external_binding: request.external_account_binding};
+    i = 0;
+    for (i < 32) {
+        result.payload_digest[i] = payload_digest[i];
+        i = i + 1;
+    }
+    ret result;
 }
 
 pub fun begin(protocol: *client.Client, state: *client.SignedRequest,
     action: Action, endpoint: view.View, account_url: view.View,
-    payload: view.View, encoded: Operation) problem.Error {
+    payload: view.View, encoded: Operation, signer: jose.Signer) problem.Error {
     val initial: bool = action == CREATE || action == LOOKUP;
     if (problem.failed(encoded.error) || encoded.action != action ||
         encoded.written != payload.len ||
+        encoded.payload.data != payload.data ||
+        encoded.payload.len != payload.len ||
+        !digest_same(payload, ?encoded.payload_digest[0]) ||
         (action != CREATE && action != LOOKUP && action != UPDATE_CONTACT &&
             action != AGREE_TERMS && action != DEACTIVATE) ||
         (initial && account_url.len != 0) || (!initial &&
@@ -372,8 +454,20 @@ pub fun begin(protocol: *client.Client, state: *client.SignedRequest,
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "account request has invalid key identity");
     }
-    ret client.begin_signed(protocol, state, client.SignedSpec{url: endpoint,
-        payload: payload, kid: account_url, use_jwk: initial});
+    if (action == CREATE) {
+        if (encoded.external_binding.bound &&
+            !external_account.bound_to(encoded.external_binding,
+                signer.public_key, endpoint)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "external account binding has a different key identity");
+        }
+    } or (!external_absent(encoded.external_binding)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "external account binding is not valid for this action");
+    }
+    ret client.begin_signed_bound(protocol, state, client.SignedSpec{
+        url: endpoint, payload: payload, kid: account_url, use_jwk: initial},
+        signer);
 }
 
 fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
@@ -580,6 +674,9 @@ pub fun parse(action: Action, response: client.Response, account_url: view.View,
     or (value_equals(state, "deactivated")) { account_state = DEACTIVATED; }
     or (value_equals(state, "revoked")) { account_state = REVOKED; }
     if (account_state == 0 || orders == nil ||
+        ((action == CREATE || action == UPDATE_CONTACT ||
+            action == AGREE_TERMS) && account_state != VALID) ||
+        (action == DEACTIVATE && account_state != DEACTIVATED) ||
         (contact != nil && contact.kind != J.ARRAY) ||
         (agreed != nil && agreed.kind != J.BOOL)) {
         ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,

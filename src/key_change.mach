@@ -31,6 +31,7 @@ pub rec Prepared {
     key_change_digest: [32]u8;
     nested_digest: [32]u8;
     old_thumbprint: [43]u8;
+    new_thumbprint: [43]u8;
 }
 
 rec Writer {
@@ -94,6 +95,17 @@ fun failed(error: problem.Error) Prepared {
     ret result;
 }
 
+fun abort_failed(manager: *storage.Manager, transaction: storage.Write,
+    error: problem.Error) Prepared {
+    val aborted: problem.Error = storage.abort_write(manager, transaction);
+    if (problem.failed(aborted)) {
+        var result: Prepared = failed(aborted);
+        result.replacement = transaction;
+        ret result;
+    }
+    ret failed(error);
+}
+
 fun digest(value: view.View, output: *u8) bool {
     if (!memory_range.valid(value.data, value.len) ||
         !memory_range.valid(output, 32)) { ret false; }
@@ -146,6 +158,11 @@ pub fun prepare(manager: *storage.Manager, current: account.Credentials,
         ret failed(problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid key rollover input"));
     }
+    var disjoint: problem.Error = storage.range_disjoint(manager, work.data,
+        work.capacity);
+    if (problem.failed(disjoint)) { ret failed(disjoint); }
+    disjoint = storage.range_disjoint(manager, output.data, output.capacity);
+    if (problem.failed(disjoint)) { ret failed(disjoint); }
     var account_digest: [32]u8;
     var key_change_digest: [32]u8;
     var old_thumbprint: [43]u8;
@@ -160,21 +177,28 @@ pub fun prepare(manager: *storage.Manager, current: account.Credentials,
         !digest(key_change_url, ?key_change_digest[0]) ||
         problem.failed(thumbprint.error) || thumbprint.written != 43 ||
         problem.failed(replacement_thumbprint.error) ||
-        replacement_thumbprint.written != 43) {
+        replacement_thumbprint.written != 43 ||
+        same_bytes(?old_thumbprint[0], ?new_thumbprint[0], 43)) {
         ret failed(problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid key rollover identity"));
     }
     val transaction: storage.Write = storage.begin_replace(manager,
         current, replacement);
     if (problem.failed(transaction.error)) { ret failed(transaction.error); }
+    disjoint = storage.range_disjoint(manager, work.data, work.capacity);
+    if (!problem.failed(disjoint)) {
+        disjoint = storage.range_disjoint(manager, output.data,
+            output.capacity);
+    }
+    if (problem.failed(disjoint)) {
+        ret abort_failed(manager, transaction, disjoint);
+    }
     var old_jwk: [1536]u8;
     val encoded_key: jose.Operation = jose.key_encode_jwk(
         current.signer.public_key,
         contracts.Buffer{data: ?old_jwk[0], capacity: 1536});
     if (problem.failed(encoded_key.error)) {
-        val aborted: problem.Error = storage.abort_write(manager, transaction);
-        if (problem.failed(aborted)) { ret failed(aborted); }
-        ret failed(encoded_key.error);
+        ret abort_failed(manager, transaction, encoded_key.error);
     }
     var payload: [8192]u8;
     var writer: Writer = Writer{data: ?payload[0], cap: 8192, pos: 0};
@@ -183,10 +207,8 @@ pub fun prepare(manager: *storage.Manager, current: account.Credentials,
         !bytes(?writer, ",\"oldKey\":", 10) ||
         !bytes(?writer, ?old_jwk[0], encoded_key.written) ||
         !byte(?writer, '}')) {
-        val aborted: problem.Error = storage.abort_write(manager, transaction);
-        if (problem.failed(aborted)) { ret failed(aborted); }
-        ret failed(problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
-            "key rollover payload is too large"));
+        ret abort_failed(manager, transaction, problem.local_code(problem.LIMIT,
+            problem.OUTPUT_TOO_SMALL, "key rollover payload is too large"));
     }
     var nested: [16384]u8;
     val encoded: jose.Operation = jose.encode_jws(replacement.signer,
@@ -195,9 +217,15 @@ pub fun prepare(manager: *storage.Manager, current: account.Credentials,
             include_nonce: false}, view.view(?payload[0], writer.pos), work,
         contracts.Buffer{data: ?nested[0], capacity: 16384});
     if (problem.failed(encoded.error)) {
-        val aborted: problem.Error = storage.abort_write(manager, transaction);
-        if (problem.failed(aborted)) { ret failed(aborted); }
-        ret failed(encoded.error);
+        ret abort_failed(manager, transaction, encoded.error);
+    }
+    disjoint = storage.range_disjoint(manager, work.data, work.capacity);
+    if (!problem.failed(disjoint)) {
+        disjoint = storage.range_disjoint(manager, output.data,
+            output.capacity);
+    }
+    if (problem.failed(disjoint)) {
+        ret abort_failed(manager, transaction, disjoint);
     }
     if (!digest_same(current.account.url, ?account_digest[0]) ||
         !digest_same(key_change_url, ?key_change_digest[0]) ||
@@ -205,21 +233,20 @@ pub fun prepare(manager: *storage.Manager, current: account.Credentials,
         !thumbprint_same(replacement.signer.public_key,
             ?new_thumbprint[0]) ||
         output.capacity < encoded.written) {
-        val aborted: problem.Error = storage.abort_write(manager, transaction);
-        if (problem.failed(aborted)) { ret failed(aborted); }
         if (output.capacity < encoded.written) {
-            ret failed(problem.local_code(problem.LIMIT,
-                problem.OUTPUT_TOO_SMALL, "key rollover output is too small"));
+            ret abort_failed(manager, transaction,
+                problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+                    "key rollover output is too small"));
         }
-        ret failed(problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
-            "key rollover identity changed during signing"));
+        ret abort_failed(manager, transaction,
+            problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "key rollover identity changed during signing"));
     }
     var nested_digest: [32]u8;
     if (!digest(view.view(?nested[0], encoded.written), ?nested_digest[0])) {
-        val aborted: problem.Error = storage.abort_write(manager, transaction);
-        if (problem.failed(aborted)) { ret failed(aborted); }
-        ret failed(problem.local_code(problem.STATE, problem.INVALID_STATE,
-            "key rollover payload binding failed"));
+        ret abort_failed(manager, transaction,
+            problem.local_code(problem.STATE, problem.INVALID_STATE,
+                "key rollover payload binding failed"));
     }
     var i: usize = 0;
     for (i < encoded.written) {
@@ -241,6 +268,7 @@ pub fun prepare(manager: *storage.Manager, current: account.Credentials,
     i = 0;
     for (i < 43) {
         result.old_thumbprint[i] = old_thumbprint[i];
+        result.new_thumbprint[i] = new_thumbprint[i];
         i = i + 1;
     }
     ret result;
@@ -270,13 +298,15 @@ pub fun begin_outer(protocol: *client.Client, request: *client.SignedRequest,
         !same_bytes(key_change_url.data, prepared.key_change_url.data,
             key_change_url.len) ||
         !thumbprint_same(current.signer.public_key,
-            ?prepared.old_thumbprint[0])) {
+            ?prepared.old_thumbprint[0]) ||
+        !thumbprint_same(prepared.replacement.candidate.signer.public_key,
+            ?prepared.new_thumbprint[0])) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "key rollover is not prepared");
     }
-    ret client.begin_signed(protocol, request, client.SignedSpec{
+    ret client.begin_signed_bound(protocol, request, client.SignedSpec{
         url: key_change_url, payload: prepared.nested_jws,
-        kid: current.account.url, use_jwk: false});
+        kid: current.account.url, use_jwk: false}, current.signer);
 }
 
 fun thumbprint_same(key: jose.PublicKey, expected: *u8) bool {
@@ -310,15 +340,17 @@ pub fun finish(manager: *storage.Manager, prepared: Prepared,
         ret storage.abort_write(manager, prepared.replacement);
     }
     if (outcome == AMBIGUOUS) {
-        ret problem.local_code(problem.STORAGE, problem.INVALID_STATE,
+        ret problem.local_code(problem.STORAGE, problem.STORAGE_UNKNOWN,
             "key rollover requires account recovery");
     }
     ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
         "invalid key rollover outcome");
 }
 
-pub fun resolve(manager: *storage.Manager, pending: storage.Write,
+pub fun resolve(manager: *storage.Manager, recovered: storage.Snapshot,
     server_uses_replacement: bool) problem.Error {
+    val pending: storage.Write = storage.resume(recovered);
+    if (problem.failed(pending.error)) { ret pending.error; }
     if (server_uses_replacement) { ret storage.commit_write(manager, pending); }
     ret storage.abort_write(manager, pending);
 }
