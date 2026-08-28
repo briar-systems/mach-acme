@@ -316,6 +316,85 @@ attempt counter. Cancellation is checked before any status interpretation, and
 a terminal status that is not the target is reported distinctly from reaching
 the target.
 
+## Certificate requests
+
+`certificate.encode_csr` writes a complete RFC 2986 certification request. The
+subject is an empty `Name`, because an ACME certificate is identified entirely
+by its subjectAltName entries. DNS identifiers are written as `dNSName` and IP
+identifiers as `iPAddress` with the address packed to four or sixteen octets.
+Entries appear in the caller's identifier order.
+
+The DER writer fills its buffer from the end toward the front, so wrapping a
+finished child is a prepend and no length needs a second measuring pass.
+Lengths use the minimal form, and a length that cannot be represented fails
+rather than truncating.
+
+The library never holds the certificate key. The caller's `SignFun` receives
+the exact certification request info bytes and returns a signature. Its context
+is a plain pointer, so secret memory cannot reach it. After signing, the
+request info is re-encoded and compared, so a signer that disturbed its input
+publishes nothing. The returned signature is validated against the shape its
+algorithm names: the RFC 3279 DER sequence of two positive integers for ECDSA,
+sixty-four octets for Ed25519, and one modulus-sized block for RSA. Work and
+output storage must be disjoint from each other and from the public key.
+
+## Issued certificates
+
+`certificate.parse_certificate` uses a strict forward DER reader that rejects
+high-tag-number form, indefinite length, and non-minimal lengths. It decodes
+only the fields an ACME decision depends on: the subjectAltName entries and the
+validity window. Times are RFC 5280 `UTCTime` through 2049 and
+`GeneralizedTime` after, both zulu with seconds present. A certificate carrying
+more than one subjectAltName is rejected. General names other than `dNSName`
+and `iPAddress` are ignored, because no ACME identifier can produce them.
+
+`certificate.verify_issued` parses the leaf and requires it to cover exactly
+the requested identifiers. DNS names compare case insensitively; an IP
+identifier's text is packed and compared against the certificate's raw octets.
+A certificate that omits a requested name, or carries a name that was not
+ordered, is refused. Callers run this before anything is written to durable
+storage, so a mismatched certificate never becomes the stored one.
+
+`certificate.parse_chain` decodes an `application/pem-certificate-chain` body
+into caller storage. Content outside a PEM block, an unterminated block, an
+empty block, and a body that does not fit the caller's storage all fail without
+publishing a chain. Decoded certificates point into caller storage, never into
+the response.
+
+`certificate.parse_alternates` reads RFC 8288 `Link` headers and retains only
+`rel="alternate"` targets. Each is validated as an HTTPS URL and copied into
+caller storage, so an alternate outlives the response fields it came from.
+
+`encode_finalize` and `encode_revoke` write the RFC 8555 section 7.4 and 7.6
+payloads exactly, with base64url and no padding. Revocation admits only the CRL
+reasons ACME defines. `begin_revoke` selects the account `kid` or the
+certificate key's JWK, which is the only way to revoke when the account that
+ordered the certificate is gone.
+
+## Durable record kinds
+
+`storage.RecordKind` is the axis durable state grows along. Account credentials
+and certificates share the gate, the monotonic token sequence, the
+one-active-transaction rule, callback serialization, and same-thread reentrancy
+rejection. They differ only in the staged payload and its ownership rules, so
+adding a record kind does not rebuild the transaction layer.
+
+A `storage.Store` declares which record kinds it holds. Certificate callbacks
+are either both present or both absent; a half-declared record kind is a
+configuration error. A store that declares none refuses certificate
+transactions rather than half-supporting them.
+
+`begin_replace_certificate` checks the expected generation, so a concurrent
+renewal cannot overwrite a newer record. The staged record's digest binds the
+storage key, certificate URL, complete chain bytes, chain length, private-key
+owner identity, every identifier, the validity window, and the generation, so a
+record changed between staging and commit is detected as a conflict. A
+transaction the store opened but could not stage stays recoverable rather than
+being silently dropped. `recover_certificate` returns the durable record and
+any pending replacement and registers that exact transaction in a fresh
+manager; `resume_certificate` converts it to the exact write commit will
+accept.
+
 ## Replay nonce ownership
 
 A `nonce.Pool` owns copies of available nonces. The supplied memory implementation
