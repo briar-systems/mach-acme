@@ -17,8 +17,9 @@ pub fun overlap(first: *u8, first_len: usize, second: *u8,
     if (!valid(first, first_len) || !valid(second, second_len)) { ret true; }
     val first_start: usize = first::usize;
     val second_start: usize = second::usize;
-    ret first_start < second_start + second_len &&
-        second_start < first_start + first_len;
+    val first_end: usize = first_start + first_len - 1;
+    val second_end: usize = second_start + second_len - 1;
+    ret first_start <= second_end && second_start <= first_end;
 }
 
 pub fun size(count: usize, item_size: usize, output: *usize) bool {
@@ -26,4 +27,15 @@ pub fun size(count: usize, item_size: usize, output: *usize) bool {
         count > 0xffffffffffffffff / item_size)) { ret false; }
     @output = count * item_size;
     ret true;
+}
+
+test "acme.memory_range: overlap is safe at the address-space boundary" {
+    val low: *u8 = 1::*u8;
+    val high: *u8 = 0xffffffffffffffff::*u8;
+    if (!valid(low, 0xffffffffffffffff) || !valid(high, 1)) { ret 1; }
+    if (!overlap(low, 0xffffffffffffffff, high, 1) ||
+        !overlap(high, 1, low, 0xffffffffffffffff)) { ret 2; }
+    if (overlap(low, 1, high, 1)) { ret 3; }
+    if (!overlap(high, 2, low, 1)) { ret 4; }
+    ret 0;
 }
