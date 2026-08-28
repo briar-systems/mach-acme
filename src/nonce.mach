@@ -1,23 +1,231 @@
-# durable replay nonce pool boundary
+# bounded one-use replay nonce ownership
 
-use R: std.types.result;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
-use std.types.string.str;
 use std.types.view;
+use acme.problem;
+
+pub val EMPTY:     u8 = 0;
+pub val AVAILABLE: u8 = 1;
 
 pub rec Taken {
+    error: problem.Error;
     found: bool;
     value: view.View;
 }
 
-pub def TakeFun: fun(ptr, *u8, usize) R.Result[Taken, str];
-pub def PutFun: fun(ptr, view.View) R.Result[bool, str];
-pub def ClearFun: fun(ptr) R.Result[bool, str];
+pub def TakeFun: fun(ptr, *u8, usize) Taken;
+pub def PutFun: fun(ptr, view.View) problem.Error;
+pub def ClearFun: fun(ptr) problem.Error;
 
 pub rec Pool {
-    ctx:   ptr;
-    take:  TakeFun;
-    put:   PutFun;
-    clear: ClearFun;
+    ctx:             ptr;
+    take:            TakeFun;
+    put:             PutFun;
+    clear:           ClearFun;
+    max_nonce_bytes: usize;
+    capacity:        usize;
+}
+
+pub rec Slot {
+    state:    u8;
+    len:      usize;
+    sequence: u64;
+}
+
+pub rec Memory {
+    slots:            *Slot;
+    capacity:         usize;
+    storage:          *u8;
+    storage_capacity: usize;
+    max_nonce_bytes:  usize;
+    next_sequence:    u64;
+    initialized:      bool;
+}
+
+fun empty_taken(error: problem.Error) Taken {
+    ret Taken{error: error, found: false, value: view.view(nil, 0)};
+}
+
+fun valid_nonce(value: view.View, max_nonce_bytes: usize) bool {
+    if (value.data == nil || value.len == 0 || value.len > max_nonce_bytes) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val byte: u8 = value.data[i];
+        if (byte <= ' ' || byte >= 127) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun slot_data(memory: *Memory, index: usize) *u8 {
+    ret ?memory.storage[index * memory.max_nonce_bytes];
+}
+
+fun equal_slot(memory: *Memory, index: usize, value: view.View) bool {
+    if (memory.slots[index].state != AVAILABLE || memory.slots[index].len != value.len) {
+        ret false;
+    }
+    val data: *u8 = slot_data(memory, index);
+    var i: usize = 0;
+    for (i < value.len) {
+        if (data[i] != value.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun wipe_slot(memory: *Memory, index: usize) {
+    val data: *u8 = slot_data(memory, index);
+    var i: usize = 0;
+    for (i < memory.max_nonce_bytes) {
+        data[i] = 0;
+        i = i + 1;
+    }
+    memory.slots[index].state = EMPTY;
+    memory.slots[index].len = 0;
+    memory.slots[index].sequence = 0;
+}
+
+pub fun init_memory(memory: *Memory, slots: *Slot, capacity: usize,
+    storage: *u8, storage_capacity: usize, max_nonce_bytes: usize) problem.Error {
+    if (memory == nil || slots == nil || storage == nil || capacity == 0 ||
+        max_nonce_bytes == 0 || capacity > storage_capacity / max_nonce_bytes) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_INPUT,
+            "invalid nonce storage");
+    }
+    memory.slots = slots;
+    memory.capacity = capacity;
+    memory.storage = storage;
+    memory.storage_capacity = storage_capacity;
+    memory.max_nonce_bytes = max_nonce_bytes;
+    memory.next_sequence = 1;
+    memory.initialized = true;
+    var i: usize = 0;
+    for (i < capacity) {
+        wipe_slot(memory, i);
+        i = i + 1;
+    }
+    ret problem.none();
+}
+
+pub fun memory_put(ctx: ptr, value: view.View) problem.Error {
+    val memory: *Memory = ctx::*Memory;
+    if (memory == nil || !memory.initialized ||
+        !valid_nonce(value, memory.max_nonce_bytes)) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_INPUT,
+            "invalid replay nonce");
+    }
+    var empty_index: usize = memory.capacity;
+    var i: usize = 0;
+    for (i < memory.capacity) {
+        if (equal_slot(memory, i, value)) {
+            ret problem.local_code(problem.NONCE, problem.DUPLICATE_NONCE,
+                "duplicate replay nonce");
+        }
+        if (empty_index == memory.capacity && memory.slots[i].state == EMPTY) {
+            empty_index = i;
+        }
+        i = i + 1;
+    }
+    if (empty_index == memory.capacity) {
+        ret problem.local_code(problem.LIMIT, problem.NONCE_STORAGE_FULL,
+            "nonce storage is full");
+    }
+    val output: *u8 = slot_data(memory, empty_index);
+    i = 0;
+    for (i < value.len) {
+        output[i] = value.data[i];
+        i = i + 1;
+    }
+    memory.slots[empty_index].state = AVAILABLE;
+    memory.slots[empty_index].len = value.len;
+    memory.slots[empty_index].sequence = memory.next_sequence;
+    memory.next_sequence = memory.next_sequence + 1;
+    if (memory.next_sequence == 0) { memory.next_sequence = 1; }
+    ret problem.none();
+}
+
+pub fun memory_take(ctx: ptr, output: *u8, capacity: usize) Taken {
+    val memory: *Memory = ctx::*Memory;
+    if (memory == nil || !memory.initialized || output == nil) {
+        ret empty_taken(problem.local_code(problem.NONCE, problem.INVALID_INPUT,
+            "invalid nonce take"));
+    }
+    var selected: usize = memory.capacity;
+    var sequence: u64 = 0;
+    var i: usize = 0;
+    for (i < memory.capacity) {
+        if (memory.slots[i].state == AVAILABLE &&
+            (selected == memory.capacity || memory.slots[i].sequence > sequence)) {
+            selected = i;
+            sequence = memory.slots[i].sequence;
+        }
+        i = i + 1;
+    }
+    if (selected == memory.capacity) { ret empty_taken(problem.none()); }
+    val len: usize = memory.slots[selected].len;
+    if (capacity < len) {
+        ret empty_taken(problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "nonce output is too small"));
+    }
+    val input: *u8 = slot_data(memory, selected);
+    i = 0;
+    for (i < len) {
+        output[i] = input[i];
+        i = i + 1;
+    }
+    wipe_slot(memory, selected);
+    ret Taken{error: problem.none(), found: true, value: view.view(output, len)};
+}
+
+pub fun memory_clear(ctx: ptr) problem.Error {
+    val memory: *Memory = ctx::*Memory;
+    if (memory == nil || !memory.initialized) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "nonce storage is not initialized");
+    }
+    var i: usize = 0;
+    for (i < memory.capacity) {
+        wipe_slot(memory, i);
+        i = i + 1;
+    }
+    ret problem.none();
+}
+
+pub fun pool(memory: *Memory) Pool {
+    if (memory == nil || !memory.initialized) {
+        ret Pool{ctx: nil, take: memory_take, put: memory_put, clear: memory_clear,
+            max_nonce_bytes: 0, capacity: 0};
+    }
+    ret Pool{ctx: memory::ptr, take: memory_take, put: memory_put,
+        clear: memory_clear, max_nonce_bytes: memory.max_nonce_bytes,
+        capacity: memory.capacity};
+}
+
+pub fun valid(value: *Pool) bool {
+    ret value != nil && value.ctx != nil && value.take::usize != 0 &&
+        value.put::usize != 0 && value.clear::usize != 0 &&
+        value.max_nonce_bytes != 0 && value.capacity != 0;
+}
+
+test "acme.nonce: take consumes the newest nonce exactly once" {
+    var slots: [2]Slot;
+    var storage: [16]u8;
+    var memory: Memory;
+    if (problem.failed(init_memory(?memory, ?slots[0], 2, ?storage[0], 16, 8))) { ret 1; }
+    val value: Pool = pool(?memory);
+    if (problem.failed(value.put(value.ctx, view.view("first", 5))) ||
+        problem.failed(value.put(value.ctx, view.view("second", 6)))) { ret 2; }
+    var output: [8]u8;
+    val newest: Taken = value.take(value.ctx, ?output[0], 8);
+    if (problem.failed(newest.error) || !newest.found || newest.value.len != 6 ||
+        output[0] != 's') { ret 3; }
+    val older: Taken = value.take(value.ctx, ?output[0], 8);
+    if (problem.failed(older.error) || !older.found || older.value.len != 5 ||
+        output[0] != 'f') { ret 4; }
+    if (value.take(value.ctx, ?output[0], 8).found) { ret 5; }
+    ret 0;
 }
