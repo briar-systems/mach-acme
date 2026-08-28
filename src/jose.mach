@@ -86,6 +86,7 @@ pub rec PublicKey {
 
 pub rec PrivateKey {
     algorithm: Algorithm;
+    secret_owner: ptr;
     value:     contracts.SecretBytes;
     rsa:       signature.RsaPrivateKey;
 }
@@ -320,6 +321,7 @@ fun public_key_valid(key: PublicKey) bool {
 }
 
 fun private_key_valid(key: PrivateKey) bool {
+    if (key.secret_owner == nil) { ret false; }
     if (key.algorithm == ES256) {
         ret key.value.data != nil &&
             key.value.len == 32;
@@ -635,6 +637,8 @@ pub fun key_sign(key: PrivateKey, entropy: Entropy, message: contracts.Bytes,
         entropy_owns(entropy, key.rsa.modulus.data, key.rsa.modulus.len) ||
         entropy_owns(entropy, key.rsa.public_exponent.data,
             key.rsa.public_exponent.len) ||
+        entropy_owns_secret(entropy, key.rsa.private_exponent.data,
+            key.rsa.private_exponent.len) ||
         entropy_owns_secret(entropy, ?salt[0], 32) ||
         !sha256_unchanged(message.data, message.len, ?message_digest[0]) ||
         !sha256_unchanged(key.rsa.modulus.data, key.rsa.modulus.len,

@@ -89,6 +89,19 @@ fun entropy_invalid_after(ctx: ptr) bool {
     ret false;
 }
 
+rec SecretAliasProbe {
+    private_queried: bool;
+}
+
+fun entropy_aliases_private(ctx: ptr, data: *^u8, len: usize) bool {
+    val probe: *SecretAliasProbe = ctx::*SecretAliasProbe;
+    if (len == 256) {
+        probe.private_queried = true;
+        ret true;
+    }
+    ret false;
+}
+
 rec HostileEntropy {
     owned:     *u8;
     owned_len: usize;
@@ -140,7 +153,8 @@ fun es_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
     if (derived.error != contracts.OK) { ret false; }
     @public_key = jose.PublicKey{algorithm: jose.ES256,
         value: contracts.Bytes{data: public_bytes, len: 65}};
-    @private_key = jose.PrivateKey{algorithm: jose.ES256, value: secret};
+    @private_key = jose.PrivateKey{algorithm: jose.ES256,
+        secret_owner: public_bytes::ptr, value: secret};
     ret true;
 }
 
@@ -154,8 +168,12 @@ fun response(code: u16, fields: *field.Fields, body: view.View) client.Response 
 }
 
 fun awaiting(protocol: *client.Client, request: *client.SignedRequest) {
-    request.client_owner = protocol::ptr;
-    request.client_generation = protocol.generation;
+    request.state = client.REQUEST_EMPTY;
+    client.begin_signed(protocol, request, client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31),
+        use_jwk: false});
     request.wire_body = view.view("prepared", 8);
     request.state = client.REQUEST_AWAITING;
 }
@@ -167,6 +185,10 @@ val HOSTILE_TAKE_REQUEST:  u8 = 3;
 val HOSTILE_TAKE_CLIENT:   u8 = 4;
 val HOSTILE_PUT_REQUEST:   u8 = 5;
 val HOSTILE_CLEAR_REQUEST: u8 = 6;
+val HOSTILE_PUT_FAIL:      u8 = 7;
+val HOSTILE_COMMIT_FAIL:   u8 = 8;
+val HOSTILE_RELEASE_FAIL:  u8 = 9;
+val HOSTILE_REENTER:       u8 = 10;
 
 rec HostilePool {
     mode:     u8;
@@ -174,6 +196,10 @@ rec HostilePool {
     request:  *client.SignedRequest;
     owned:    *u8;
     owned_len: usize;
+    secret_owner: ptr;
+    commit_count: usize;
+    release_count: usize;
+    reentered: bool;
 }
 
 fun hostile_ready(ctx: ptr) bool {
@@ -185,36 +211,73 @@ fun hostile_aliases(ctx: ptr, data: *u8, len: usize) bool {
     ret memory_range.overlap(data, len, hostile.owned, hostile.owned_len);
 }
 
-fun hostile_take(ctx: ptr, output: *u8, capacity: usize) nonce.Taken {
+fun hostile_reserve(ctx: ptr, output: *u8,
+    capacity: usize) nonce.Reservation {
     val hostile: *HostilePool = ctx::*HostilePool;
+    if (hostile.mode == HOSTILE_REENTER && hostile.protocol != nil) {
+        hostile.reentered = client.release(hostile.protocol);
+    }
     if (hostile.mode == HOSTILE_TAKE_REQUEST && hostile.request != nil) {
         hostile.request.state = client.REQUEST_EMPTY;
     }
     if (hostile.mode == HOSTILE_TAKE_CLIENT && hostile.protocol != nil) {
-        hostile.protocol.nonces.take = nil;
+        hostile.protocol.nonces.reserve = nil;
     }
     if (hostile.mode == HOSTILE_OVERSIZED) {
-        ret nonce.Taken{error: problem.none(), found: true,
+        ret nonce.Reservation{error: problem.none(), found: true, token: 1,
             value: view.view(output, capacity + 1)};
     }
     if (hostile.mode == HOSTILE_FOREIGN) {
-        ret nonce.Taken{error: problem.none(), found: true,
+        ret nonce.Reservation{error: problem.none(), found: true, token: 1,
             value: view.view("foreign_nonce", 13)};
     }
     if (output == nil || capacity < 12) {
-        ret nonce.Taken{error: problem.local_code(problem.LIMIT,
+        ret nonce.Reservation{error: problem.local_code(problem.LIMIT,
             problem.OUTPUT_TOO_SMALL, "hostile test output is small"),
-            found: false, value: view.view(nil, 0)};
+            found: false, token: 0, value: view.view(nil, 0)};
     }
     copy(output, "custom_nonce", 12);
-    ret nonce.Taken{error: problem.none(), found: true,
+    ret nonce.Reservation{error: problem.none(), found: true, token: 1,
         value: view.view(output, 12)};
+}
+
+fun hostile_commit(ctx: ptr, token: u64) problem.Error {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    hostile.commit_count = hostile.commit_count + 1;
+    if (token != 1) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_INPUT,
+            "hostile test token is invalid");
+    }
+    if (hostile.mode == HOSTILE_COMMIT_FAIL) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "hostile commit failed");
+    }
+    ret problem.none();
+}
+
+fun hostile_release(ctx: ptr, token: u64) problem.Error {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    hostile.release_count = hostile.release_count + 1;
+    if (token != 1 || hostile.mode == HOSTILE_RELEASE_FAIL) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "hostile release failed");
+    }
+    ret problem.none();
+}
+
+fun hostile_owns_secret(ctx: ptr, owner: ptr) bool {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    ret owner != nil && owner == hostile.secret_owner;
 }
 
 fun hostile_put(ctx: ptr, value: view.View) problem.Error {
     val hostile: *HostilePool = ctx::*HostilePool;
     if (hostile.mode == HOSTILE_PUT_REQUEST && hostile.request != nil) {
         hostile.request.state = client.REQUEST_EMPTY;
+    }
+    if (hostile.mode == HOSTILE_PUT_FAIL) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "hostile put failed");
     }
     ret problem.none();
 }
@@ -228,8 +291,10 @@ fun hostile_clear(ctx: ptr) problem.Error {
 }
 
 fun hostile_pool(context: *HostilePool) nonce.Pool {
-    ret nonce.Pool{ctx: context::ptr, take: hostile_take, put: hostile_put,
+    ret nonce.Pool{ctx: context::ptr, reserve: hostile_reserve,
+        commit: hostile_commit, release: hostile_release, put: hostile_put,
         clear: hostile_clear, ready: hostile_ready, aliases: hostile_aliases,
+        owns_secret: hostile_owns_secret,
         max_nonce_bytes: 64, capacity: 4};
 }
 
@@ -508,6 +573,7 @@ test "jose: rfc 8032 ed25519 account signing vector is exact" {
     val public_key: jose.PublicKey = jose.PublicKey{algorithm: jose.EDDSA,
         value: contracts.Bytes{data: (?public_key_bytes[0]):~*u8, len: 32}};
     val private_key: jose.PrivateKey = jose.PrivateKey{algorithm: jose.EDDSA,
+        secret_owner: ((?public_key_bytes[0]):~*u8)::ptr,
         value: contracts.SecretBytes{data: ?seed[0], len: 32}};
     var jwk: [80]u8;
     val encoded: jose.Operation = jose.key_encode_jwk(public_key,
@@ -551,7 +617,8 @@ test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures"
         modulus: contracts.Bytes{data: ?modulus[0], len: 256},
         public_exponent: contracts.Bytes{data: ?exponent[0], len: 3},
         private_exponent: contracts.SecretBytes{data: ?private_bytes[0], len: 256}};
-    val key: jose.PrivateKey = jose.PrivateKey{algorithm: jose.PS256, rsa: rsa_private};
+    val key: jose.PrivateKey = jose.PrivateKey{algorithm: jose.PS256,
+        secret_owner: (?modulus[0])::ptr, rsa: rsa_private};
     var output: [256]u8;
     var message_bytes: [32]u8;
     copy(?message_bytes[0], "mach-acme openssl rsa-pss vector", 32);
@@ -566,6 +633,14 @@ test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures"
     if (signature.verify_rsa_pss_sha256(rsa_public,
             contracts.Bytes{data: message, len: 32},
             contracts.Bytes{data: ?output[0], len: 256}) != contracts.OK) { ret 22; }
+    var probe: SecretAliasProbe;
+    val owned_private: jose.Operation = jose.key_sign(key,
+        jose.entropy_provider((?probe)::ptr, deterministic_entropy,
+            entropy_aliases_nothing, entropy_aliases_private,
+            entropy_still_valid), contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (owned_private.error.code != problem.INVALID_INPUT ||
+        owned_private.written != 0 || !probe.private_queried) { ret 23; }
     fill(?output[0], 0xa5, 256);
     val unavailable: jose.Operation = jose.key_sign(key,
         jose.entropy_provider(nil, unavailable_entropy, entropy_aliases_nothing,
@@ -692,7 +767,7 @@ test "client: wire requests bind exact body and transport policy" {
     var small_nonce_storage: [64]u8;
     var small_memory: nonce.Memory;
     var small_configured: client.Limits = configured;
-    small_configured.max_request_bytes = 64;
+    small_configured.max_request_bytes = 512;
     if (problem.failed(nonce.init_memory(?small_memory, ?small_slots[0], 1,
         ?small_nonce_storage[0], 64, 64))) { ret 11; }
     var small_pool: nonce.Pool = nonce.pool(?small_memory);
@@ -707,12 +782,19 @@ test "client: wire requests bind exact body and transport policy" {
         ?small_request, jose.signer(public_key), private_key,
         jose.no_entropy(),
         contracts.Buffer{data: ?work[0], capacity: 2048},
-        contracts.Buffer{data: ?output[0], capacity: 512});
+        contracts.Buffer{data: ?output[0], capacity: 1});
     if (limited.error.code != problem.OUTPUT_TOO_SMALL || limited.written != 0 ||
         small_request.state != client.REQUEST_READY ||
         !filled(?output[0], 0xa5, 512) ||
         !problem.failed(client.signed_wire(?small_protocol,
             ?small_request).error)) { ret 13; }
+    val resumed: jose.Operation = client.prepare_signed(?small_protocol,
+        ?small_request, jose.signer(public_key), private_key,
+        jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(resumed.error) ||
+        small_request.state != client.REQUEST_AWAITING) { ret 14; }
     ret 0;
 }
 
@@ -865,7 +947,7 @@ test "client: mutable state and parser aliases fail transactionally" {
         contracts.Buffer{data: (?request)::*u8,
             capacity: $size_of(client.SignedRequest)});
     var nonce_output: [64]u8;
-    val retained: nonce.Taken = pool.take(pool.ctx, ?nonce_output[0], 64);
+    val retained: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
     if (rejected_prepare.error.code != problem.INVALID_INPUT ||
         request.state != client.REQUEST_READY || problem.failed(retained.error) ||
         !retained.found || retained.value.len != 15 ||
@@ -887,8 +969,8 @@ test "client: mutable state and parser aliases fail transactionally" {
         client.ProblemStorage{data: ?response_storage[0], capacity: 512,
             subproblems: nil, subproblem_capacity: 0});
     if (rejected_response.cause.code != problem.INVALID_INPUT ||
-        request.state != client.REQUEST_AWAITING ||
-        request.wire_body.data != wire_before) { ret 15; }
+        request.state != client.REQUEST_FAILED ||
+        request.wire_body.data != nil || wire_before == nil) { ret 15; }
 
     awaiting(?protocol, ?request);
     fill(?shared[0], 0xb7, 8192);
@@ -1119,7 +1201,7 @@ test "client: badNonce consumes stale state and retries with the fresh response 
     if (problem.failed(retry.error) || request.attempts != 2 ||
         request.state != client.REQUEST_AWAITING) { ret 8; }
     var nonce_output: [64]u8;
-    val remaining: nonce.Taken = pool.take(pool.ctx, ?nonce_output[0], 64);
+    val remaining: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
     if (problem.failed(remaining.error) || remaining.found) { ret 9; }
     ret 0;
 }
@@ -1200,7 +1282,7 @@ test "client: interleaved badNonce recovery remains bound to each request" {
         !equal(?first.retry_nonce[0], "fresh_a", 7)) { ret 9; }
 
     var nonce_output: [64]u8;
-    val shared_empty: nonce.Taken = pool.take(pool.ctx, ?nonce_output[0], 64);
+    val shared_empty: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
     if (problem.failed(shared_empty.error) || shared_empty.found) { ret 10; }
     val second_retry: jose.Operation = client.prepare_signed(?protocol, ?second,
         signer, private_key, jose.no_entropy(),
@@ -1261,7 +1343,7 @@ test "client: badNonce acquisition and retry exhaustion preserve protocol causes
         ret 3;
     }
     var nonce_output: [64]u8;
-    val stale: nonce.Taken = pool.take(pool.ctx, ?nonce_output[0], 64);
+    val stale: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
     if (problem.failed(stale.error) || stale.found) { ret 4; }
     var fresh_items: [1]field.Field;
     var fresh_fields: field.Fields = field.init(?fresh_items[0], 1,
@@ -1275,6 +1357,7 @@ test "client: badNonce acquisition and retry exhaustion preserve protocol causes
         !equal(?request.retry_nonce[0], "head_nonce", 10)) { ret 6; }
 
     awaiting(?protocol, ?request);
+    request.bad_nonce_retries = 1;
     var limit_items: [1]field.Field;
     var limit_fields: field.Fields = field.init(?limit_items[0], 1,
         field.limits(1, 128, 32, 64));
@@ -1287,7 +1370,7 @@ test "client: badNonce acquisition and retry exhaustion preserve protocol causes
     if (limited.action != client.ACTION_FAILED || limited.cause.code != problem.RETRY_LIMIT ||
         limited.cause.http.status != status.BAD_REQUEST || limited.cause.problem.typ.len == 0 ||
         limited.cause.retryable || request.state != client.REQUEST_FAILED) { ret 8; }
-    val remaining: nonce.Taken = pool.take(pool.ctx, ?nonce_output[0], 64);
+    val remaining: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
     if (problem.failed(remaining.error) || remaining.found ||
         request.retry_nonce_ready || request.retry_nonce_len != 0) { ret 9; }
     ret 0;
@@ -1388,7 +1471,7 @@ test "client: invalid and excess response nonces are ignored" {
     if (full.action != client.ACTION_COMPLETE ||
         request.state != client.REQUEST_COMPLETE) { ret 6; }
     var output: [64]u8;
-    val retained: nonce.Taken = pool.take(pool.ctx, ?output[0], 64);
+    val retained: nonce.Taken = nonce.take(pool, ?output[0], 64);
     if (problem.failed(retained.error) || !retained.found || retained.value.len != 14 ||
         !equal(retained.value.data, "existing_nonce", 14)) { ret 7; }
 
@@ -1405,7 +1488,7 @@ test "client: invalid and excess response nonces are ignored" {
             subproblems: nil, subproblem_capacity: 0});
     if (multiple.action != client.ACTION_COMPLETE ||
         request.state != client.REQUEST_COMPLETE ||
-        pool.take(pool.ctx, ?output[0], 64).found) { ret 9; }
+        nonce.take(pool, ?output[0], 64).found) { ret 9; }
     ret 0;
 }
 
@@ -1430,7 +1513,7 @@ test "client: nonce callbacks preserve immutable descriptors and exact state" {
     var request: client.SignedRequest;
     if (problem.failed(client.init(?protocol, ?supplied,
             client.limits_default()))) { ret 2; }
-    supplied.take = nil;
+    supplied.reserve = nil;
     supplied.ready = nil;
     if (problem.failed(client.begin_signed(?protocol, ?request, spec))) { ret 3; }
     val first: jose.Operation = client.prepare_signed(?protocol, ?request,
@@ -1438,7 +1521,8 @@ test "client: nonce callbacks preserve immutable descriptors and exact state" {
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     if (problem.failed(first.error) || request.state != client.REQUEST_AWAITING ||
-        protocol.nonces.take::usize == 0 || protocol.nonces.ready::usize == 0) {
+        protocol.nonces.reserve::usize == 0 ||
+        protocol.nonces.ready::usize == 0) {
         ret 4;
     }
 
@@ -1457,9 +1541,8 @@ test "client: nonce callbacks preserve immutable descriptors and exact state" {
             subproblems: nil, subproblem_capacity: 0});
     if (put_mutation.action != client.ACTION_FAILED ||
         put_mutation.cause.code != problem.INVALID_STATE ||
-        request.state != client.REQUEST_EMPTY ||
-        request.wire_body.data != wire_before.data ||
-        request.wire_body.len != wire_before.len) { ret 6; }
+        request.state != client.REQUEST_FAILED ||
+        request.wire_body.data != nil || wire_before.data == nil) { ret 6; }
 
     context.mode = HOSTILE_OVERSIZED;
     context.request = nil;
@@ -1470,27 +1553,29 @@ test "client: nonce callbacks preserve immutable descriptors and exact state" {
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     if (oversized.error.code != problem.INVALID_STATE ||
-        request.state != client.REQUEST_READY || !filled(?output[0], 0xa5, 512)) {
+        request.state != client.REQUEST_FAILED || !filled(?output[0], 0xa5, 512)) {
         ret 8;
     }
     context.mode = HOSTILE_FOREIGN;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec))) { ret 9; }
     val foreign: jose.Operation = client.prepare_signed(?protocol, ?request,
         jose.signer(public_key), private_key, jose.no_entropy(),
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     if (foreign.error.code != problem.INVALID_STATE ||
-        request.state != client.REQUEST_READY || !filled(?output[0], 0xa5, 512)) {
-        ret 9;
+        request.state != client.REQUEST_FAILED || !filled(?output[0], 0xa5, 512)) {
+        ret 10;
     }
     context.mode = HOSTILE_TAKE_REQUEST;
     context.request = ?request;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec))) { ret 11; }
     val request_mutation: jose.Operation = client.prepare_signed(?protocol, ?request,
         jose.signer(public_key), private_key, jose.no_entropy(),
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     if (request_mutation.error.code != problem.INVALID_STATE ||
-        request.state != client.REQUEST_EMPTY || !filled(?output[0], 0xa5, 512)) {
-        ret 10;
+        request.state != client.REQUEST_FAILED || !filled(?output[0], 0xa5, 512)) {
+        ret 12;
     }
 
     context.mode = HOSTILE_NORMAL;
@@ -1499,7 +1584,7 @@ test "client: nonce callbacks preserve immutable descriptors and exact state" {
         problem.failed(client.prepare_signed(?protocol, ?request,
             jose.signer(public_key), private_key, jose.no_entropy(),
             contracts.Buffer{data: ?work[0], capacity: 2048},
-            contracts.Buffer{data: ?output[0], capacity: 512}).error)) { ret 11; }
+            contracts.Buffer{data: ?output[0], capacity: 512}).error)) { ret 13; }
     context.mode = HOSTILE_CLEAR_REQUEST;
     context.request = ?request;
     val bad_nonce: *u8 =
@@ -1513,8 +1598,8 @@ test "client: nonce callbacks preserve immutable descriptors and exact state" {
             subproblems: nil, subproblem_capacity: 0});
     if (clear_mutation.action != client.ACTION_FAILED ||
         clear_mutation.cause.code != problem.INVALID_STATE ||
-        request.state != client.REQUEST_EMPTY || request.wire_body.data != ?output[0]) {
-        ret 12;
+        request.state != client.REQUEST_FAILED || request.wire_body.data != nil) {
+        ret 14;
     }
 
     var client_context: HostilePool;
@@ -1524,7 +1609,7 @@ test "client: nonce callbacks preserve immutable descriptors and exact state" {
     if (problem.failed(client.init(?mutated_client, ?client_pool,
             client.limits_default())) ||
         problem.failed(client.begin_signed(?mutated_client, ?client_request, spec))) {
-        ret 13;
+        ret 15;
     }
     client_context.mode = HOSTILE_TAKE_CLIENT;
     client_context.protocol = ?mutated_client;
@@ -1533,8 +1618,8 @@ test "client: nonce callbacks preserve immutable descriptors and exact state" {
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     if (client_mutation.error.code != problem.INVALID_STATE ||
-        mutated_client.nonces.take::usize != 0 ||
-        client_request.state != client.REQUEST_READY) { ret 14; }
+        mutated_client.nonces.reserve::usize != 0 ||
+        client_request.state != client.REQUEST_FAILED) { ret 16; }
     ret 0;
 }
 
@@ -1576,6 +1661,160 @@ test "client: nonce provider ownership is disjoint at every callback boundary" {
         request.state != client.REQUEST_READY || !filled(?output[0], 0xa5, 512)) {
         ret 5;
     }
+    ret 0;
+}
+
+test "client: provider transactions fail closed before wire publication" {
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 1; }
+    val spec: client.SignedSpec = client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31),
+        use_jwk: false};
+    var work: [2048]u8;
+    var output: [512]u8;
+
+    var reentrant_context: HostilePool;
+    reentrant_context.mode = HOSTILE_REENTER;
+    var reentrant_pool: nonce.Pool = hostile_pool(?reentrant_context);
+    var reentrant_client: client.Client;
+    var reentrant_request: client.SignedRequest;
+    if (problem.failed(client.init(?reentrant_client, ?reentrant_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?reentrant_client,
+            ?reentrant_request, spec))) { ret 2; }
+    reentrant_context.protocol = ?reentrant_client;
+    val reentrant: jose.Operation = client.prepare_signed(?reentrant_client,
+        ?reentrant_request, jose.signer(public_key), private_key,
+        jose.no_entropy(), contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(reentrant.error) || reentrant_context.reentered ||
+        !reentrant_client.initialized || reentrant_client.callback_active ||
+        reentrant_request.state != client.REQUEST_AWAITING ||
+        reentrant_context.commit_count != 1) { ret 3; }
+
+    var commit_context: HostilePool;
+    commit_context.mode = HOSTILE_COMMIT_FAIL;
+    var commit_pool: nonce.Pool = hostile_pool(?commit_context);
+    var commit_client: client.Client;
+    var commit_request: client.SignedRequest;
+    if (problem.failed(client.init(?commit_client, ?commit_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?commit_client, ?commit_request,
+            spec))) { ret 4; }
+    fill(?output[0], 0xa5, 512);
+    val commit_failed: jose.Operation = client.prepare_signed(?commit_client,
+        ?commit_request, jose.signer(public_key), private_key,
+        jose.no_entropy(), contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (commit_failed.error.code != problem.INVALID_STATE ||
+        commit_failed.written != 0 || commit_context.commit_count != 1 ||
+        commit_request.state != client.REQUEST_FAILED ||
+        commit_request.wire_body.data != nil || output[0] != 0) { ret 5; }
+
+    var release_context: HostilePool;
+    release_context.mode = HOSTILE_RELEASE_FAIL;
+    var release_pool: nonce.Pool = hostile_pool(?release_context);
+    var release_client: client.Client;
+    var release_request: client.SignedRequest;
+    if (problem.failed(client.init(?release_client, ?release_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?release_client, ?release_request,
+            spec))) { ret 6; }
+    fill(?output[0], 0xa5, 512);
+    val release_failed: jose.Operation = client.prepare_signed(?release_client,
+        ?release_request, jose.signer(public_key), private_key,
+        jose.no_entropy(), contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 1});
+    if (release_failed.error.code != problem.INVALID_STATE ||
+        release_failed.written != 0 || release_context.release_count != 1 ||
+        release_request.state != client.REQUEST_FAILED ||
+        release_request.wire_body.data != nil || output[0] != 0) {
+        ret 7;
+    }
+
+    var secret_context: HostilePool;
+    secret_context.secret_owner = private_key.secret_owner;
+    var secret_pool: nonce.Pool = hostile_pool(?secret_context);
+    var secret_client: client.Client;
+    var secret_request: client.SignedRequest;
+    if (problem.failed(client.init(?secret_client, ?secret_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?secret_client, ?secret_request,
+            spec))) { ret 8; }
+    fill(?output[0], 0xa5, 512);
+    val secret_owned: jose.Operation = client.prepare_signed(?secret_client,
+        ?secret_request, jose.signer(public_key), private_key,
+        jose.no_entropy(), contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (secret_owned.error.code != problem.INVALID_INPUT ||
+        secret_owned.written != 0 || secret_request.state != client.REQUEST_READY ||
+        secret_context.commit_count != 0 || secret_context.release_count != 0 ||
+        !filled(?output[0], 0xa5, 512)) { ret 9; }
+
+    var response_context: HostilePool;
+    var response_pool: nonce.Pool = hostile_pool(?response_context);
+    var response_client: client.Client;
+    var response_request: client.SignedRequest;
+    if (problem.failed(client.init(?response_client, ?response_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?response_client, ?response_request,
+            spec)) ||
+        problem.failed(client.prepare_signed(?response_client,
+            ?response_request, jose.signer(public_key), private_key,
+            jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error)) { ret 10; }
+    var item: [1]field.Field;
+    var fields: field.Fields = field.init(?item[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("response_nonce", 14), sensitive: false}) !=
+        field.ADD_OK) { ret 11; }
+    response_context.mode = HOSTILE_PUT_FAIL;
+    val response_failed: client.Decision = client.accept_signed_response(
+        ?response_client, ?response_request,
+        response(status.OK, ?fields, view.view(nil, 0)), nil, 0,
+        client.ProblemStorage{data: nil, capacity: 0,
+            subproblems: nil, subproblem_capacity: 0});
+    if (response_failed.action != client.ACTION_FAILED ||
+        response_failed.cause.code != problem.INVALID_STATE ||
+        response_request.state != client.REQUEST_FAILED ||
+        response_request.wire_body.data != nil) { ret 12; }
+
+    var payload: [2]u8 = [2]u8{'{', '}'};
+    var mutation_context: HostilePool;
+    var mutation_pool: nonce.Pool = hostile_pool(?mutation_context);
+    var mutation_client: client.Client;
+    var mutation_request: client.SignedRequest;
+    val mutation_spec: client.SignedSpec = client.SignedSpec{url: spec.url,
+        payload: view.view(?payload[0], 2), kid: spec.kid, use_jwk: false};
+    if (problem.failed(client.init(?mutation_client, ?mutation_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?mutation_client, ?mutation_request,
+            mutation_spec)) ||
+        problem.failed(client.prepare_signed(?mutation_client,
+            ?mutation_request, jose.signer(public_key), private_key,
+            jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error)) { ret 13; }
+    payload[0] = '[';
+    var empty: field.Fields;
+    empty_fields(?empty);
+    val changed: client.Decision = client.accept_signed_response(
+        ?mutation_client, ?mutation_request,
+        response(status.OK, ?empty, view.view(nil, 0)), nil, 0,
+        client.ProblemStorage{data: nil, capacity: 0,
+            subproblems: nil, subproblem_capacity: 0});
+    if (changed.action != client.ACTION_FAILED ||
+        changed.cause.code != problem.INVALID_STATE ||
+        mutation_request.state != client.REQUEST_FAILED ||
+        mutation_request.wire_body.data != nil) { ret 14; }
     ret 0;
 }
 
@@ -1679,12 +1918,12 @@ test "nonce: hostile values, duplicates, and small outputs are transactional" {
     }
     var output: [16]u8;
     fill(?output[0], 0xcc, 16);
-    val small: nonce.Taken = pool.take(pool.ctx, ?output[0], 4);
+    val small: nonce.Taken = nonce.take(pool, ?output[0], 4);
     if (small.error.code != problem.OUTPUT_TOO_SMALL || small.found ||
         !filled(?output[0], 0xcc, 16)) { ret 3; }
-    val taken: nonce.Taken = pool.take(pool.ctx, ?output[0], 16);
+    val taken: nonce.Taken = nonce.take(pool, ?output[0], 16);
     if (problem.failed(taken.error) || !taken.found || taken.value.len != 11) { ret 4; }
-    val exhausted: nonce.Taken = pool.take(pool.ctx, ?output[0], 16);
+    val exhausted: nonce.Taken = nonce.take(pool, ?output[0], 16);
     if (problem.failed(exhausted.error) || exhausted.found) { ret 5; }
     ret 0;
 }

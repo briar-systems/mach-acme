@@ -94,6 +94,7 @@ pub rec Client {
     nonces:      nonce.Pool;
     limits:      Limits;
     generation:  u64;
+    callback_active: bool;
     initialized: bool;
 }
 
@@ -242,6 +243,14 @@ fun bytes_same(first: *u8, second: *u8, len: usize) bool {
     ret true;
 }
 
+fun wipe_bytes(data: *u8, len: usize) {
+    var i: usize = 0;
+    for (i < len) {
+        data[i] = 0;
+        i = i + 1;
+    }
+}
+
 fun digest(data: *u8, len: usize, output: *u8) bool {
     if (output == nil || !memory_range.valid(data, len) ||
         !memory_range.valid(output, 32)) { ret false; }
@@ -272,6 +281,12 @@ fun spec_intact(request: *SignedRequest) bool {
         digest_same(request.spec.kid, ?request.kid_digest[0]);
 }
 
+fun terminalize(request: *SignedRequest) {
+    request.wire_body = view.view(nil, 0);
+    request.state = REQUEST_FAILED;
+    wipe_retry_nonce(request);
+}
+
 fun field_limits_same(first: field.Limits, second: field.Limits) bool {
     ret first.max_count == second.max_count && first.max_bytes == second.max_bytes &&
         first.max_name_bytes == second.max_name_bytes &&
@@ -300,7 +315,22 @@ fun client_same(first: Client, second: *Client) bool {
     ret second != nil && nonce.same(first.nonces, second.nonces) &&
         limits_same(first.limits, second.limits) &&
         first.generation == second.generation &&
+        first.callback_active == second.callback_active &&
         first.initialized == second.initialized;
+}
+
+fun callback_begin(client: *Client) bool {
+    if (client == nil || client.callback_active) { ret false; }
+    client.callback_active = true;
+    ret true;
+}
+
+fun callback_end(client: *Client, before: Client,
+    request: *SignedRequest, request_before: SignedRequest) bool {
+    val intact: bool = client_same(before, client) &&
+        request_same(request_before, request) && spec_intact(request);
+    client.callback_active = false;
+    ret intact;
 }
 
 fun request_same(first: SignedRequest, second: *SignedRequest) bool {
@@ -361,17 +391,40 @@ fun pool_range_disjoint(snapshot: nonce.Pool, client: *Client,
     if (!digest(data, len, ?range_before[0])) {
         ret callback_error("nonce ownership input could not be bound");
     }
+    if (!callback_begin(client)) {
+        ret callback_error("nonce ownership callback is reentrant");
+    }
     val client_before: Client = @client;
     val request_before: SignedRequest = @request;
     val owned: bool = snapshot.aliases(snapshot.ctx, data, len);
-    if (!client_same(client_before, client) ||
-        !request_same(request_before, request) ||
+    val callback_intact: bool = callback_end(client, client_before, request,
+        request_before);
+    if (!callback_intact ||
         !digest_same(view.view(data, len), ?range_before[0])) {
         ret callback_error("nonce ownership callback mutated protocol state");
     }
     if (owned) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "nonce provider storage aliases protocol-owned storage");
+    }
+    ret problem.none();
+}
+
+fun pool_secret_disjoint(snapshot: nonce.Pool, client: *Client,
+    request: *SignedRequest, owner: ptr) problem.Error {
+    if (owner == nil || !callback_begin(client)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid secret range at nonce provider boundary");
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val owned: bool = snapshot.owns_secret(snapshot.ctx, owner);
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret callback_error("nonce secret ownership callback mutated protocol state");
+    }
+    if (owned) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "nonce provider storage aliases signing secrets");
     }
     ret problem.none();
 }
@@ -389,11 +442,13 @@ fun pool_ready_snapshot(client: *Client, request: *SignedRequest,
     val request_disjoint: problem.Error = pool_range_disjoint(snapshot, client,
         request, request::*u8, $size_of(SignedRequest));
     if (problem.failed(request_disjoint)) { ret request_disjoint; }
+    if (!callback_begin(client)) {
+        ret callback_error("nonce readiness callback is reentrant");
+    }
     val client_before: Client = @client;
     val request_before: SignedRequest = @request;
     val ready: bool = snapshot.ready(snapshot.ctx);
-    if (!client_same(client_before, client) ||
-        !request_same(request_before, request)) {
+    if (!callback_end(client, client_before, request, request_before)) {
         ret callback_error("nonce readiness callback mutated protocol state");
     }
     if (!ready) { ret callback_error("nonce pool is not ready"); }
@@ -401,61 +456,87 @@ fun pool_ready_snapshot(client: *Client, request: *SignedRequest,
     ret problem.none();
 }
 
-fun pool_take(client: *Client, request: *SignedRequest, output: *u8,
-    capacity: usize) nonce.Taken {
+fun pool_reserve(client: *Client, request: *SignedRequest, output: *u8,
+    capacity: usize) nonce.Reservation {
     var snapshot: nonce.Pool;
     if (!nonce.descriptor_valid(client.nonces)) {
-        ret nonce.Taken{error: callback_error(
+        ret nonce.Reservation{error: callback_error(
             "nonce pool descriptor is invalid"), found: false,
-            value: view.view(nil, 0)};
+            token: 0, value: view.view(nil, 0)};
     }
     snapshot = client.nonces;
     val before_ready: problem.Error = pool_range_disjoint(snapshot, client,
         request, output, capacity);
     if (problem.failed(before_ready)) {
-        ret nonce.Taken{error: before_ready, found: false,
-            value: view.view(nil, 0)};
+        ret nonce.Reservation{error: before_ready, found: false,
+            token: 0, value: view.view(nil, 0)};
     }
     val ready: problem.Error = pool_ready_snapshot(client, request, ?snapshot);
     if (problem.failed(ready)) {
-        ret nonce.Taken{error: ready, found: false, value: view.view(nil, 0)};
+        ret nonce.Reservation{error: ready, found: false, token: 0,
+            value: view.view(nil, 0)};
     }
     val disjoint: problem.Error = pool_range_disjoint(snapshot, client, request,
         output, capacity);
     if (problem.failed(disjoint)) {
-        ret nonce.Taken{error: disjoint, found: false, value: view.view(nil, 0)};
+        ret nonce.Reservation{error: disjoint, found: false, token: 0,
+            value: view.view(nil, 0)};
+    }
+    if (!callback_begin(client)) {
+        ret nonce.Reservation{error: callback_error(
+            "nonce reservation callback is reentrant"), found: false,
+            token: 0, value: view.view(nil, 0)};
     }
     val client_before: Client = @client;
     val request_before: SignedRequest = @request;
-    val result: nonce.Taken = snapshot.take(snapshot.ctx, output, capacity);
-    if (!client_same(client_before, client) ||
-        !request_same(request_before, request)) {
-        ret nonce.Taken{error: callback_error(
-            "nonce take callback mutated protocol state"),
-            found: false, value: view.view(nil, 0)};
+    val result: nonce.Reservation = snapshot.reserve(snapshot.ctx, output,
+        capacity);
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret nonce.Reservation{error: callback_error(
+            "nonce reservation callback mutated protocol state"),
+            found: false, token: 0, value: view.view(nil, 0)};
     }
     if (problem.failed(result.error)) {
-        if (result.found || result.value.data != nil || result.value.len != 0) {
-            ret nonce.Taken{error: callback_error(
-                "nonce take callback returned inconsistent failure"),
-                found: false, value: view.view(nil, 0)};
+        if (result.found || result.token != 0 || result.value.data != nil ||
+            result.value.len != 0) {
+            ret nonce.Reservation{error: callback_error(
+                "nonce reservation callback returned inconsistent failure"),
+                found: false, token: 0, value: view.view(nil, 0)};
         }
         ret result;
     }
     if (!result.found) {
-        if (result.value.data != nil || result.value.len != 0) {
-            ret nonce.Taken{error: callback_error(
-                "nonce take callback returned inconsistent empty result"),
-                found: false, value: view.view(nil, 0)};
+        if (result.token != 0 || result.value.data != nil ||
+            result.value.len != 0) {
+            ret nonce.Reservation{error: callback_error(
+                "nonce reservation callback returned inconsistent empty result"),
+                found: false, token: 0, value: view.view(nil, 0)};
         }
         ret result;
     }
-    if (result.value.data != output || result.value.len == 0 ||
+    if (result.token == 0 || result.value.data != output || result.value.len == 0 ||
         result.value.len > capacity || result.value.len > snapshot.max_nonce_bytes ||
         !nonce.value_valid(result.value, snapshot.max_nonce_bytes)) {
-        ret nonce.Taken{error: callback_error(
-            "nonce take callback violated output ownership"),
-            found: false, value: view.view(nil, 0)};
+        ret nonce.Reservation{error: callback_error(
+            "nonce reservation callback violated output ownership"),
+            found: false, token: 0, value: view.view(nil, 0)};
+    }
+    ret result;
+}
+
+fun pool_finish(client: *Client, request: *SignedRequest, snapshot: nonce.Pool,
+    token: u64, consume: bool) problem.Error {
+    if (token == 0 || !nonce.descriptor_valid(snapshot) ||
+        !callback_begin(client)) {
+        ret callback_error("nonce reservation transaction is invalid");
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    var result: problem.Error;
+    if (consume) { result = snapshot.commit(snapshot.ctx, token); }
+    or { result = snapshot.release(snapshot.ctx, token); }
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret callback_error("nonce reservation finalizer mutated protocol state");
     }
     ret result;
 }
@@ -475,11 +556,13 @@ fun pool_put(client: *Client, request: *SignedRequest,
     val disjoint: problem.Error = pool_range_disjoint(snapshot, client, request,
         value.data, value.len);
     if (problem.failed(disjoint)) { ret disjoint; }
+    if (!callback_begin(client)) {
+        ret callback_error("nonce put callback is reentrant");
+    }
     val client_before: Client = @client;
     val request_before: SignedRequest = @request;
     val result: problem.Error = snapshot.put(snapshot.ctx, value);
-    if (!client_same(client_before, client) ||
-        !request_same(request_before, request)) {
+    if (!callback_end(client, client_before, request, request_before)) {
         ret callback_error("nonce put callback mutated protocol state");
     }
     ret result;
@@ -489,11 +572,13 @@ fun pool_clear(client: *Client, request: *SignedRequest) problem.Error {
     var snapshot: nonce.Pool;
     val ready: problem.Error = pool_ready_snapshot(client, request, ?snapshot);
     if (problem.failed(ready)) { ret ready; }
+    if (!callback_begin(client)) {
+        ret callback_error("nonce clear callback is reentrant");
+    }
     val client_before: Client = @client;
     val request_before: SignedRequest = @request;
     val result: problem.Error = snapshot.clear(snapshot.ctx);
-    if (!client_same(client_before, client) ||
-        !request_same(request_before, request)) {
+    if (!callback_end(client, client_before, request, request_before)) {
         ret callback_error("nonce clear callback mutated protocol state");
     }
     ret result;
@@ -521,6 +606,10 @@ fun pool_prepare_disjoint(client: *Client, request: *SignedRequest,
     if (signer.algorithm == jose.ES256 || signer.algorithm == jose.EDDSA) {
         result = pool_range_disjoint(snapshot, client, request,
             signer.public_key.value.data, signer.public_key.value.len);
+        if (!problem.failed(result)) {
+            result = pool_secret_disjoint(snapshot, client, request,
+                private_key.secret_owner);
+        }
     } or (signer.algorithm == jose.PS256) {
         result = pool_range_disjoint(snapshot, client, request,
             signer.public_key.rsa.modulus.data,
@@ -538,6 +627,10 @@ fun pool_prepare_disjoint(client: *Client, request: *SignedRequest,
             result = pool_range_disjoint(snapshot, client, request,
                 private_key.rsa.public_exponent.data,
                 private_key.rsa.public_exponent.len);
+        }
+        if (!problem.failed(result)) {
+            result = pool_secret_disjoint(snapshot, client, request,
+                private_key.secret_owner);
         }
     }
     if (!spec_intact(request)) {
@@ -593,7 +686,8 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
         !memory_range.valid(nonces::*u8, $size_of(nonce.Pool)) ||
         memory_range.overlap(client::*u8, $size_of(Client),
             nonces::*u8, $size_of(nonce.Pool)) ||
-        client.initialized || client.generation == 18446744073709551615 ||
+        client.initialized || client.callback_active ||
+        client.generation == 18446744073709551615 ||
         !limits_valid(configured)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid acme client configuration");
@@ -604,30 +698,39 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid acme nonce pool configuration");
     }
+    client.callback_active = true;
     val before: Client = @client;
     val owned: bool = snapshot.aliases(snapshot.ctx, client::*u8,
         $size_of(Client));
-    if (!client_same(before, client) || !nonce.same(snapshot, @nonces) || owned) {
+    val alias_intact: bool = client_same(before, client);
+    client.callback_active = false;
+    if (!alias_intact || !nonce.same(snapshot, @nonces) || owned) {
         ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
             "nonce ownership callback rejected or mutated client state");
     }
+    client.callback_active = true;
+    val ready_before: Client = @client;
     val ready: bool = snapshot.ready(snapshot.ctx);
-    if (!client_same(before, client) || !nonce.same(snapshot, @nonces) || !ready) {
+    val ready_intact: bool = client_same(ready_before, client);
+    client.callback_active = false;
+    if (!ready_intact || !nonce.same(snapshot, @nonces) || !ready) {
         ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
             "acme nonce pool is not ready or mutated client state");
     }
     client.nonces = snapshot;
     client.limits = configured;
     client.generation = client.generation + 1;
+    client.callback_active = false;
     client.initialized = true;
     ret problem.none();
 }
 
 pub fun release(client: *Client) bool {
     if (client == nil || !memory_range.valid(client::*u8, $size_of(Client)) ||
-        !client.initialized) { ret false; }
+        !client.initialized || client.callback_active) { ret false; }
     client.nonces = nonce.Pool{};
     client.limits = Limits{};
+    client.callback_active = false;
     client.initialized = false;
     ret true;
 }
@@ -1295,7 +1398,7 @@ pub fun discovery_request(directory_url: view.View,
 
 pub fun nonce_request(client: *Client, directory: Directory) WireRequest {
     if (client == nil || !memory_range.valid(client::*u8, $size_of(Client)) ||
-        !client.initialized ||
+        !client.initialized || client.callback_active ||
         !memory_range.valid(directory.new_nonce_url.data,
             directory.new_nonce_url.len) ||
         directory.new_nonce_url.len == 0 ||
@@ -1329,7 +1432,7 @@ pub fun begin_signed(client: *Client, request: *SignedRequest,
         !memory_range.valid(spec.url.data, spec.url.len) ||
         !memory_range.valid(spec.payload.data, spec.payload.len) ||
         !memory_range.valid(spec.kid.data, spec.kid.len) ||
-        !client.initialized ||
+        !client.initialized || client.callback_active ||
         (request.state != REQUEST_EMPTY && request.state != REQUEST_COMPLETE &&
             request.state != REQUEST_FAILED) ||
         spec.url.data == nil ||
@@ -1377,7 +1480,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
     if (client == nil || request == nil ||
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
-        !client.initialized ||
+        !client.initialized || client.callback_active ||
         request.client_owner != client::ptr ||
         request.client_generation != client.generation ||
         !spec_intact(request) ||
@@ -1421,6 +1524,9 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
     val pool_storage: problem.Error = pool_prepare_disjoint(client, request,
         signer, private_key, work, bounded_output);
     if (problem.failed(pool_storage)) {
+        if (pool_storage.code == problem.INVALID_STATE) {
+            terminalize(request);
+        }
         ret jose.Operation{error: pool_storage, written: 0};
     }
     var guarded_entropy: jose.Entropy = entropy;
@@ -1428,9 +1534,14 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
     var entropy_guarded: bool = false;
     if (signer.algorithm == jose.PS256 && jose.entropy_valid(entropy) &&
         entropy.available) {
+        if (!callback_begin(client)) {
+            ret jose.Operation{error: callback_error(
+                "entropy ownership callback is reentrant"), written: 0};
+        }
         val client_before: Client = @client;
         val request_before: SignedRequest = @request;
-        if (jose.entropy_owns(entropy, client::*u8, $size_of(Client)) ||
+        val owned: bool =
+            jose.entropy_owns(entropy, client::*u8, $size_of(Client)) ||
             jose.entropy_owns(entropy, request::*u8, $size_of(SignedRequest)) ||
             jose.entropy_owns(entropy, request.spec.url.data,
                 request.spec.url.len) ||
@@ -1440,9 +1551,16 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
                 request.spec.kid.len) ||
             jose.entropy_owns(entropy, work.data, work.capacity) ||
             jose.entropy_owns(entropy, bounded_output.data,
-                bounded_output.capacity) ||
-            !client_same(client_before, client) ||
-            !request_same(request_before, request) || !spec_intact(request)) {
+                bounded_output.capacity);
+        val callback_intact: bool = callback_end(client, client_before,
+            request, request_before);
+        if (!callback_intact) {
+            terminalize(request);
+            ret jose.Operation{error: problem.local_code(problem.SIGNING,
+                problem.INVALID_INPUT,
+                "entropy provider mutated protocol storage"), written: 0};
+        }
+        if (owned) {
             ret jose.Operation{error: problem.local_code(problem.SIGNING,
                 problem.INVALID_INPUT,
                 "entropy provider aliases or mutated protocol storage"),
@@ -1450,17 +1568,16 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
         }
         entropy_guard = EntropyGuard{source_validate: entropy.validate,
             source_ctx: entropy.validation_ctx, client: client,
-            request: request, client_before: @client, request_before: @request};
+            request: request};
         guarded_entropy.validation_ctx = (?entropy_guard)::ptr;
         guarded_entropy.validate = guarded_entropy_validate;
         entropy_guarded = true;
     }
     request.wire_body = view.view(nil, 0);
-    if (entropy_guarded) {
-        entropy_guard.request_before = @request;
-    }
     var nonce_bytes: [512]u8;
     var nonce_len: usize = 0;
+    var reservation_token: u64 = 0;
+    val reservation_pool: nonce.Pool = client.nonces;
     val retrying: bool = request.state == REQUEST_RETRY;
     if (retrying) {
         nonce_len = request.retry_nonce_len;
@@ -1470,17 +1587,19 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
             i = i + 1;
         }
     } or {
-        val taken: nonce.Taken = pool_take(client, request,
+        val reserved: nonce.Reservation = pool_reserve(client, request,
             ?nonce_bytes[0], client.limits.max_nonce_bytes);
-        if (problem.failed(taken.error)) {
-            ret jose.Operation{error: taken.error, written: 0};
+        if (problem.failed(reserved.error)) {
+            terminalize(request);
+            ret jose.Operation{error: reserved.error, written: 0};
         }
-        if (!taken.found) {
+        if (!reserved.found) {
             request.state = REQUEST_NEEDS_NONCE;
             ret jose.Operation{error: problem.local_code(problem.NONCE,
                 problem.MISSING_NONCE, "no replay nonce is available"), written: 0};
         }
-        nonce_len = taken.value.len;
+        nonce_len = reserved.value.len;
+        reservation_token = reserved.token;
     }
     if (!spec_intact(request)) {
         var i: usize = 0;
@@ -1488,9 +1607,37 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
             nonce_bytes[i] = 0;
             i = i + 1;
         }
-        request.state = REQUEST_FAILED;
+        if (reservation_token != 0) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+        }
+        terminalize(request);
         ret jose.Operation{error: problem.local_code(problem.STATE,
             problem.INVALID_STATE, "signed request inputs changed"), written: 0};
+    }
+    var output_before: [32]u8;
+    if (!digest(bounded_output.data, bounded_output.capacity,
+            ?output_before[0])) {
+        if (reservation_token != 0) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+        }
+        terminalize(request);
+        ret jose.Operation{error: problem.local_code(problem.STATE,
+            problem.INVALID_STATE, "signed output binding failed"), written: 0};
+    }
+    if (entropy_guarded) {
+        if (!callback_begin(client)) {
+            if (reservation_token != 0) {
+                pool_finish(client, request, reservation_pool,
+                    reservation_token, false);
+            }
+            terminalize(request);
+            ret jose.Operation{error: callback_error(
+                "entropy callback is reentrant"), written: 0};
+        }
+        entropy_guard.client_before = @client;
+        entropy_guard.request_before = @request;
     }
     val result: jose.Operation = jose.encode_jws(signer, private_key,
         guarded_entropy,
@@ -1499,27 +1646,83 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
             kid: request.spec.kid, use_jwk: request.spec.use_jwk,
             include_nonce: true},
         request.spec.payload, work, bounded_output);
+    var entropy_intact: bool = true;
+    if (entropy_guarded) {
+        entropy_intact = callback_end(client, entropy_guard.client_before,
+            request, entropy_guard.request_before);
+    }
     var i: usize = 0;
     for (i < nonce_len) {
         nonce_bytes[i] = 0;
         i = i + 1;
     }
-    if (entropy_guarded &&
-        (!client_same(entropy_guard.client_before, client) ||
-            !request_same(entropy_guard.request_before, request))) {
+    if (!entropy_intact) {
+        if (reservation_token != 0) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+        }
+        wipe_bytes(bounded_output.data, bounded_output.capacity);
+        terminalize(request);
         ret jose.Operation{error: problem.local_code(problem.STATE,
             problem.INVALID_STATE, "entropy callback mutated protocol state"),
             written: 0};
     }
     if (!spec_intact(request)) {
-        request.state = REQUEST_FAILED;
+        if (reservation_token != 0) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+        }
+        if (!problem.failed(result.error)) {
+            wipe_bytes(output.data, result.written);
+        }
+        terminalize(request);
         ret jose.Operation{error: problem.local_code(problem.STATE,
             problem.INVALID_STATE, "signed request inputs changed during signing"),
             written: 0};
     }
     if (problem.failed(result.error)) {
-        if (!retrying) { request.state = REQUEST_READY; }
+        if (!retrying) {
+            val released: problem.Error = pool_finish(client, request,
+                reservation_pool, reservation_token, false);
+            if (problem.failed(released)) {
+                wipe_bytes(bounded_output.data, bounded_output.capacity);
+                terminalize(request);
+                ret jose.Operation{error: released, written: 0};
+            }
+            request.state = REQUEST_READY;
+        }
+        if (!digest_same(view.view(bounded_output.data,
+                bounded_output.capacity), ?output_before[0])) {
+            wipe_bytes(bounded_output.data, bounded_output.capacity);
+            terminalize(request);
+            ret jose.Operation{error: callback_error(
+                "signing callback changed unpublished output"), written: 0};
+        }
         ret result;
+    }
+    if (!retrying) {
+        var body_digest: [32]u8;
+        if (!digest(output.data, result.written, ?body_digest[0])) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+            wipe_bytes(output.data, result.written);
+            terminalize(request);
+            ret jose.Operation{error: callback_error(
+                "signed body binding failed"), written: 0};
+        }
+        val committed: problem.Error = pool_finish(client, request,
+            reservation_pool, reservation_token, true);
+        if (problem.failed(committed) ||
+            !digest_same(view.view(output.data, result.written),
+                ?body_digest[0])) {
+            wipe_bytes(output.data, result.written);
+            terminalize(request);
+            if (problem.failed(committed)) {
+                ret jose.Operation{error: committed, written: 0};
+            }
+            ret jose.Operation{error: callback_error(
+                "nonce commit changed the signed body"), written: 0};
+        }
     }
     if (retrying) { wipe_retry_nonce(request); }
     request.attempts = request.attempts + 1;
@@ -1532,7 +1735,7 @@ pub fun signed_wire(client: *Client, request: *SignedRequest) WireRequest {
     if (client == nil || request == nil ||
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
-        !client.initialized ||
+        !client.initialized || client.callback_active ||
         request.client_owner != client::ptr ||
         request.client_generation != client.generation ||
         request.state != REQUEST_AWAITING || request.wire_body.data == nil ||
@@ -1587,7 +1790,7 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
     if (client == nil || request == nil ||
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
-        !client.initialized ||
+        !client.initialized || client.callback_active ||
         request.client_owner != client::ptr ||
         request.client_generation != client.generation ||
         request.state != REQUEST_AWAITING || request.wire_body.data == nil ||
@@ -1596,11 +1799,15 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
             problem.INVALID_STATE, "signed response is invalid for request state");
         ret Decision{action: ACTION_FAILED, cause: error};
     }
+    if (!spec_intact(request)) {
+        val error: problem.Error = problem.local_code(problem.STATE,
+            problem.INVALID_STATE, "signed request inputs changed before response");
+        terminalize(request);
+        ret Decision{action: ACTION_FAILED, cause: error};
+    }
     val shaped: problem.Error = response_shape(response, client.limits);
     if (problem.failed(shaped)) {
-        request.state = REQUEST_FAILED;
-        request.wire_body = view.view(nil, 0);
-        wipe_retry_nonce(request);
+        terminalize(request);
         ret Decision{action: ACTION_FAILED, cause: shaped};
     }
     if (!nonce.descriptor_valid(client.nonces) ||
@@ -1608,6 +1815,7 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
         response_overlaps(response, client::*u8, $size_of(Client))) {
         val error: problem.Error = problem.local_code(problem.PROTOCOL,
             problem.INVALID_INPUT, "response aliases signed request state");
+        terminalize(request);
         ret Decision{action: ACTION_FAILED, cause: error};
     }
     if (response.status >= 200 && response.status < 300) {
@@ -1615,6 +1823,7 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
         val nonce_status: problem.Error = store_response_nonce(client, response,
             request, ?stored);
         if (problem.failed(nonce_status)) {
+            terminalize(request);
             ret Decision{action: ACTION_FAILED, cause: nonce_status};
         }
         request.wire_body = view.view(nil, 0);
@@ -1639,6 +1848,7 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
             client::*u8, $size_of(Client))) {
         val error: problem.Error = problem.local_code(problem.PROTOCOL,
             problem.INVALID_INPUT, "problem buffers alias protocol state");
+        terminalize(request);
         ret Decision{action: ACTION_FAILED, cause: error};
     }
     val cause: problem.Error = parse_problem(response, client.limits, scratch,
@@ -1646,12 +1856,13 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
     if (cause.code == problem.BAD_NONCE) {
         val cleared: problem.Error = pool_clear(client, request);
         if (problem.failed(cleared)) {
+            terminalize(request);
             ret Decision{action: ACTION_FAILED, cause: cleared};
         }
         request.wire_body = view.view(nil, 0);
         wipe_retry_nonce(request);
         if (request.bad_nonce_retries >= client.limits.max_bad_nonce_retries) {
-            request.state = REQUEST_FAILED;
+            terminalize(request);
             var limited: problem.Error = cause;
             limited.kind = problem.POLICY;
             limited.code = problem.RETRY_LIMIT;
@@ -1663,8 +1874,7 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
         val nonce_status: problem.Error = bind_response_nonce(client, request,
             response, false, ?bound);
         if (problem.failed(nonce_status)) {
-            request.state = REQUEST_FAILED;
-            wipe_retry_nonce(request);
+            terminalize(request);
             ret Decision{action: ACTION_FAILED, cause: nonce_status};
         }
         request.bad_nonce_retries = request.bad_nonce_retries + 1;
@@ -1679,11 +1889,10 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
     val nonce_status: problem.Error = store_response_nonce(client, response,
         request, ?stored);
     if (problem.failed(nonce_status)) {
+        terminalize(request);
         ret Decision{action: ACTION_FAILED, cause: nonce_status};
     }
-    request.wire_body = view.view(nil, 0);
-    request.state = REQUEST_FAILED;
-    wipe_retry_nonce(request);
+    terminalize(request);
     ret Decision{action: ACTION_FAILED, cause: cause};
 }
 
@@ -1692,12 +1901,17 @@ pub fun accept_nonce_response(client: *Client, request: *SignedRequest,
     if (client == nil || request == nil ||
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
-        !client.initialized ||
+        !client.initialized || client.callback_active ||
         request.client_owner != client::ptr ||
         request.client_generation != client.generation ||
         request.state != REQUEST_NEEDS_NONCE || !status.is_final(response.status)) {
         ret problem.local_code(problem.STATE, problem.INVALID_STATE,
             "nonce response is invalid for request state");
+    }
+    if (!spec_intact(request)) {
+        terminalize(request);
+        ret problem.local_code(problem.STATE, problem.INVALID_STATE,
+            "signed request inputs changed before nonce response");
     }
     val shaped: problem.Error = response_shape(response, client.limits);
     if (problem.failed(shaped)) {
@@ -1708,6 +1922,7 @@ pub fun accept_nonce_response(client: *Client, request: *SignedRequest,
     if (!nonce.descriptor_valid(client.nonces) ||
         response_overlaps(response, request::*u8, $size_of(SignedRequest)) ||
         response_overlaps(response, client::*u8, $size_of(Client))) {
+        terminalize(request);
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "nonce response aliases signed request state");
     }

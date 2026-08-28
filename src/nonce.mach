@@ -13,6 +13,14 @@ use acme.problem;
 
 pub val EMPTY:     u8 = 0;
 pub val AVAILABLE: u8 = 1;
+pub val RESERVED:  u8 = 2;
+
+pub rec Reservation {
+    error: problem.Error;
+    found: bool;
+    token: u64;
+    value: view.View;
+}
 
 pub rec Taken {
     error: problem.Error;
@@ -20,19 +28,24 @@ pub rec Taken {
     value: view.View;
 }
 
-pub def TakeFun: fun(ptr, *u8, usize) Taken;
+pub def ReserveFun: fun(ptr, *u8, usize) Reservation;
+pub def FinishFun: fun(ptr, u64) problem.Error;
 pub def PutFun: fun(ptr, view.View) problem.Error;
 pub def ClearFun: fun(ptr) problem.Error;
 pub def ReadyFun: fun(ptr) bool;
 pub def AliasesFun: fun(ptr, *u8, usize) bool;
+pub def OwnsSecretFun: fun(ptr, ptr) bool;
 
 pub rec Pool {
     ctx:             ptr;
-    take:            TakeFun;
+    reserve:         ReserveFun;
+    commit:          FinishFun;
+    release:         FinishFun;
     put:             PutFun;
     clear:           ClearFun;
     ready:           ReadyFun;
     aliases:         AliasesFun;
+    owns_secret:     OwnsSecretFun;
     max_nonce_bytes: usize;
     capacity:        usize;
 }
@@ -41,6 +54,7 @@ pub rec Slot {
     state:    u8;
     len:      usize;
     sequence: u64;
+    reservation: u64;
 }
 
 pub rec Memory {
@@ -50,12 +64,14 @@ pub rec Memory {
     storage_capacity: usize;
     max_nonce_bytes:  usize;
     next_sequence:    u64;
+    next_reservation: u64;
     lock:             mutex.Mutex;
     initialized:      bool;
 }
 
-fun empty_taken(error: problem.Error) Taken {
-    ret Taken{error: error, found: false, value: view.view(nil, 0)};
+fun empty_reservation(error: problem.Error) Reservation {
+    ret Reservation{error: error, found: false, token: 0,
+        value: view.view(nil, 0)};
 }
 
 fun valid_nonce(value: view.View, max_nonce_bytes: usize) bool {
@@ -99,15 +115,25 @@ fun layout(memory: *Memory, require_initialized: bool) bool {
 }
 
 fun state_valid(memory: *Memory) bool {
-    if (!layout(memory, true) || memory.next_sequence == 0) { ret false; }
+    if (!layout(memory, true) || memory.next_sequence == 0 ||
+        memory.next_reservation == 0) { ret false; }
     var i: usize = 0;
     for (i < memory.capacity) {
         val slot: Slot = memory.slots[i];
         if (slot.state == EMPTY) {
-            if (slot.len != 0 || slot.sequence != 0) { ret false; }
+            if (slot.len != 0 || slot.sequence != 0 ||
+                slot.reservation != 0) { ret false; }
         } or (slot.state == AVAILABLE) {
             if (slot.len == 0 || slot.len > memory.max_nonce_bytes ||
                 slot.sequence == 0 || slot.sequence >= memory.next_sequence ||
+                slot.reservation != 0 ||
+                !valid_nonce(view.view(slot_data(memory, i), slot.len),
+                    memory.max_nonce_bytes)) { ret false; }
+        } or (slot.state == RESERVED) {
+            if (slot.len == 0 || slot.len > memory.max_nonce_bytes ||
+                slot.sequence == 0 || slot.sequence >= memory.next_sequence ||
+                slot.reservation == 0 ||
+                slot.reservation >= memory.next_reservation ||
                 !valid_nonce(view.view(slot_data(memory, i), slot.len),
                     memory.max_nonce_bytes)) { ret false; }
         } or { ret false; }
@@ -130,6 +156,10 @@ fun aliases_memory(memory: *Memory, data: *u8, len: usize) bool {
 
 pub fun memory_aliases(ctx: ptr, data: *u8, len: usize) bool {
     ret aliases_memory(ctx::*Memory, data, len);
+}
+
+pub fun memory_owns_secret(ctx: ptr, owner: ptr) bool {
+    ret false;
 }
 
 fun slot_data(memory: *Memory, index: usize) *u8 {
@@ -159,6 +189,7 @@ fun wipe_slot(memory: *Memory, index: usize) {
     memory.slots[index].state = EMPTY;
     memory.slots[index].len = 0;
     memory.slots[index].sequence = 0;
+    memory.slots[index].reservation = 0;
 }
 
 pub fun init_memory(memory: *Memory, slots: *Slot, capacity: usize,
@@ -188,6 +219,7 @@ pub fun init_memory(memory: *Memory, slots: *Slot, capacity: usize,
     memory.storage_capacity = storage_capacity;
     memory.max_nonce_bytes = max_nonce_bytes;
     memory.next_sequence = 1;
+    memory.next_reservation = 1;
     memory.lock = mutex.make();
     memory.initialized = true;
     var i: usize = 0;
@@ -254,12 +286,13 @@ pub fun memory_put(ctx: ptr, value: view.View) problem.Error {
     ret result;
 }
 
-fun take_locked(memory: *Memory, output: *u8, capacity: usize) Taken {
+fun reserve_locked(memory: *Memory, output: *u8,
+    capacity: usize) Reservation {
     if (!state_valid(memory) || output == nil ||
         !memory_range.valid(output, capacity) ||
         aliases_memory(memory, output, capacity)) {
-        ret empty_taken(problem.local_code(problem.NONCE, problem.INVALID_INPUT,
-            "invalid nonce take"));
+        ret empty_reservation(problem.local_code(problem.NONCE,
+            problem.INVALID_INPUT, "invalid nonce reservation"));
     }
     var selected: usize = memory.capacity;
     var sequence: u64 = 0;
@@ -272,11 +305,16 @@ fun take_locked(memory: *Memory, output: *u8, capacity: usize) Taken {
         }
         i = i + 1;
     }
-    if (selected == memory.capacity) { ret empty_taken(problem.none()); }
+    if (selected == memory.capacity) { ret empty_reservation(problem.none()); }
     val len: usize = memory.slots[selected].len;
     if (capacity < len) {
-        ret empty_taken(problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
-            "nonce output is too small"));
+        ret empty_reservation(problem.local_code(problem.LIMIT,
+            problem.OUTPUT_TOO_SMALL, "nonce output is too small"));
+    }
+    if (memory.next_reservation == 18446744073709551615) {
+        ret empty_reservation(problem.local_code(problem.STATE,
+            problem.INVALID_STATE,
+            "nonce reservation sequence is exhausted; clear the pool"));
     }
     val input: *u8 = slot_data(memory, selected);
     i = 0;
@@ -284,26 +322,81 @@ fun take_locked(memory: *Memory, output: *u8, capacity: usize) Taken {
         output[i] = input[i];
         i = i + 1;
     }
-    wipe_slot(memory, selected);
-    ret Taken{error: problem.none(), found: true, value: view.view(output, len)};
+    val token: u64 = memory.next_reservation;
+    memory.next_reservation = memory.next_reservation + 1;
+    memory.slots[selected].state = RESERVED;
+    memory.slots[selected].reservation = token;
+    ret Reservation{error: problem.none(), found: true, token: token,
+        value: view.view(output, len)};
 }
 
-pub fun memory_take(ctx: ptr, output: *u8, capacity: usize) Taken {
+pub fun memory_reserve(ctx: ptr, output: *u8,
+    capacity: usize) Reservation {
     val memory: *Memory = ctx::*Memory;
     if (!layout(memory, true) || output == nil ||
         !memory_range.valid(output, capacity) ||
         aliases_memory(memory, output, capacity)) {
-        ret empty_taken(problem.local_code(problem.NONCE, problem.INVALID_INPUT,
-            "invalid nonce take"));
+        ret empty_reservation(problem.local_code(problem.NONCE,
+            problem.INVALID_INPUT, "invalid nonce reservation"));
     }
     mutex.lock(?memory.lock);
-    var result: Taken;
+    var result: Reservation;
     if (!state_valid(memory) || aliases_memory(memory, output, capacity)) {
-        result = empty_taken(problem.local_code(problem.NONCE,
+        result = empty_reservation(problem.local_code(problem.NONCE,
             problem.INVALID_INPUT, "invalid nonce output storage"));
-    } or { result = take_locked(memory, output, capacity); }
+    } or { result = reserve_locked(memory, output, capacity); }
     mutex.unlock(?memory.lock);
     ret result;
+}
+
+fun finish_locked(memory: *Memory, token: u64, consume: bool) problem.Error {
+    if (!state_valid(memory) || token == 0) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_INPUT,
+            "invalid nonce reservation token");
+    }
+    var selected: usize = memory.capacity;
+    var i: usize = 0;
+    for (i < memory.capacity) {
+        if (memory.slots[i].state == RESERVED &&
+            memory.slots[i].reservation == token) {
+            if (selected != memory.capacity) {
+                ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+                    "duplicate nonce reservation token");
+            }
+            selected = i;
+        }
+        i = i + 1;
+    }
+    if (selected == memory.capacity) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "nonce reservation is not active");
+    }
+    if (consume) { wipe_slot(memory, selected); }
+    or {
+        memory.slots[selected].state = AVAILABLE;
+        memory.slots[selected].reservation = 0;
+    }
+    ret problem.none();
+}
+
+fun memory_finish(ctx: ptr, token: u64, consume: bool) problem.Error {
+    val memory: *Memory = ctx::*Memory;
+    if (!layout(memory, true) || token == 0) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_INPUT,
+            "invalid nonce reservation token");
+    }
+    mutex.lock(?memory.lock);
+    val result: problem.Error = finish_locked(memory, token, consume);
+    mutex.unlock(?memory.lock);
+    ret result;
+}
+
+pub fun memory_commit(ctx: ptr, token: u64) problem.Error {
+    ret memory_finish(ctx, token, true);
+}
+
+pub fun memory_release(ctx: ptr, token: u64) problem.Error {
+    ret memory_finish(ctx, token, false);
 }
 
 fun clear_locked(memory: *Memory) problem.Error {
@@ -322,6 +415,7 @@ fun clear_locked(memory: *Memory) problem.Error {
         i = i + 1;
     }
     memory.next_sequence = 1;
+    memory.next_reservation = 1;
     ret problem.none();
 }
 
@@ -351,6 +445,7 @@ pub fun release_memory(memory: *Memory) problem.Error {
         memory.storage_capacity = 0;
         memory.max_nonce_bytes = 0;
         memory.next_sequence = 0;
+        memory.next_reservation = 0;
         memory.initialized = false;
     }
     mutex.unlock(?memory.lock);
@@ -368,30 +463,40 @@ pub fun memory_ready(ctx: ptr) bool {
 
 pub fun pool(memory: *Memory) Pool {
     if (!layout(memory, true) || !memory_ready(memory::ptr)) {
-        ret Pool{ctx: nil, take: memory_take, put: memory_put, clear: memory_clear,
+        ret Pool{ctx: nil, reserve: memory_reserve, commit: memory_commit,
+            release: memory_release, put: memory_put, clear: memory_clear,
             ready: memory_ready, aliases: memory_aliases,
+            owns_secret: memory_owns_secret,
             max_nonce_bytes: 0, capacity: 0};
     }
-    ret Pool{ctx: memory::ptr, take: memory_take, put: memory_put,
+    ret Pool{ctx: memory::ptr, reserve: memory_reserve, commit: memory_commit,
+        release: memory_release, put: memory_put,
         clear: memory_clear, ready: memory_ready, aliases: memory_aliases,
+        owns_secret: memory_owns_secret,
         max_nonce_bytes: memory.max_nonce_bytes,
         capacity: memory.capacity};
 }
 
 pub fun descriptor_valid(value: Pool) bool {
-    ret value.ctx != nil && value.take::usize != 0 &&
+    ret value.ctx != nil && value.reserve::usize != 0 &&
+        value.commit::usize != 0 && value.release::usize != 0 &&
         value.put::usize != 0 && value.clear::usize != 0 &&
         value.ready::usize != 0 && value.aliases::usize != 0 &&
+        value.owns_secret::usize != 0 &&
         value.max_nonce_bytes != 0 &&
         value.capacity != 0;
 }
 
 pub fun same(first: Pool, second: Pool) bool {
-    ret first.ctx == second.ctx && first.take::usize == second.take::usize &&
+    ret first.ctx == second.ctx &&
+        first.reserve::usize == second.reserve::usize &&
+        first.commit::usize == second.commit::usize &&
+        first.release::usize == second.release::usize &&
         first.put::usize == second.put::usize &&
         first.clear::usize == second.clear::usize &&
         first.ready::usize == second.ready::usize &&
         first.aliases::usize == second.aliases::usize &&
+        first.owns_secret::usize == second.owns_secret::usize &&
         first.max_nonce_bytes == second.max_nonce_bytes &&
         first.capacity == second.capacity;
 }
@@ -403,6 +508,24 @@ pub fun valid(value: *Pool) bool {
     val snapshot: Pool = @value;
     ret descriptor_valid(snapshot) && snapshot.ready(snapshot.ctx) &&
         same(snapshot, @value);
+}
+
+pub fun take(value: Pool, output: *u8, capacity: usize) Taken {
+    if (!descriptor_valid(value)) {
+        ret Taken{error: problem.local_code(problem.NONCE,
+            problem.INVALID_INPUT, "invalid nonce pool"), found: false,
+            value: view.view(nil, 0)};
+    }
+    val reserved: Reservation = value.reserve(value.ctx, output, capacity);
+    if (problem.failed(reserved.error) || !reserved.found) {
+        ret Taken{error: reserved.error, found: false,
+            value: view.view(nil, 0)};
+    }
+    val committed: problem.Error = value.commit(value.ctx, reserved.token);
+    if (problem.failed(committed)) {
+        ret Taken{error: committed, found: false, value: view.view(nil, 0)};
+    }
+    ret Taken{error: problem.none(), found: true, value: reserved.value};
 }
 
 rec PutContext {
@@ -428,19 +551,19 @@ test "acme.nonce: take consumes the newest nonce exactly once" {
     if (problem.failed(value.put(value.ctx, view.view("first", 5))) ||
         problem.failed(value.put(value.ctx, view.view("second", 6)))) { ret 2; }
     var output: [8]u8;
-    val newest: Taken = value.take(value.ctx, ?output[0], 8);
+    val newest: Taken = take(value, ?output[0], 8);
     if (problem.failed(newest.error) || !newest.found || newest.value.len != 6 ||
         output[0] != 's') { ret 3; }
-    val older: Taken = value.take(value.ctx, ?output[0], 8);
+    val older: Taken = take(value, ?output[0], 8);
     if (problem.failed(older.error) || !older.found || older.value.len != 5 ||
         output[0] != 'f') { ret 4; }
-    if (value.take(value.ctx, ?output[0], 8).found) { ret 5; }
+    if (take(value, ?output[0], 8).found) { ret 5; }
     memory.next_sequence = 18446744073709551615;
     if (value.put(value.ctx, view.view("blocked", 7)).code != problem.INVALID_STATE ||
         problem.failed(value.clear(value.ctx)) || memory.next_sequence != 1 ||
         problem.failed(value.put(value.ctx, view.view("after", 5)))) { ret 6; }
     if (problem.failed(release_memory(?memory)) || memory.initialized || valid(?value) ||
-        value.take(value.ctx, ?output[0], 8).error.code != problem.INVALID_INPUT) { ret 7; }
+        take(value, ?output[0], 8).error.code != problem.INVALID_INPUT) { ret 7; }
     var i: usize = 0;
     for (i < 17) {
         if (storage[i] != 0) { ret 8; }
@@ -489,11 +612,11 @@ test "acme.nonce: concurrent producers preserve every slot" {
     var output: [16]u8;
     i = 0;
     for (i < 4) {
-        val taken: Taken = value.take(value.ctx, ?output[0], 16);
+        val taken: Taken = take(value, ?output[0], 16);
         if (problem.failed(taken.error) || !taken.found) { ret 4; }
         i = i + 1;
     }
-    if (value.take(value.ctx, ?output[0], 16).found ||
+    if (take(value, ?output[0], 16).found ||
         problem.failed(release_memory(?memory))) { ret 5; }
     ret 0;
 }
@@ -525,16 +648,16 @@ test "acme.nonce: ranges and aliases fail before ownership changes" {
         problem.failed(value.put(value.ctx, view.view("owned_nonce", 11)))) {
         ret 4;
     }
-    val storage_take: Taken = value.take(value.ctx, ?storage[0], 16);
-    val slot_take: Taken = value.take(value.ctx, (?slots[0])::*u8, 16);
-    val overflow_take: Taken = value.take(value.ctx, near_end, 32);
+    val storage_take: Taken = take(value, ?storage[0], 16);
+    val slot_take: Taken = take(value, (?slots[0])::*u8, 16);
+    val overflow_take: Taken = take(value, near_end, 32);
     if (storage_take.error.code != problem.INVALID_INPUT || storage_take.found ||
         slot_take.error.code != problem.INVALID_INPUT || slot_take.found ||
         overflow_take.error.code != problem.INVALID_INPUT || overflow_take.found) {
         ret 5;
     }
     var output: [16]u8;
-    val taken: Taken = value.take(value.ctx, ?output[0], 16);
+    val taken: Taken = take(value, ?output[0], 16);
     if (problem.failed(taken.error) || !taken.found || taken.value.data != ?output[0] ||
         taken.value.len != 11 || output[0] != 'o') { ret 6; }
     if (value.put(value.ctx, view.view(near_end, 32)).code !=
@@ -546,5 +669,42 @@ test "acme.nonce: ranges and aliases fail before ownership changes" {
         !memory_ready(value.ctx) || problem.failed(release_memory(?memory))) {
         ret 8;
     }
+    ret 0;
+}
+
+test "acme.nonce: reservation commit and release are exact transactions" {
+    var slots: [2]Slot;
+    var storage: [32]u8;
+    var memory: Memory;
+    if (problem.failed(init_memory(?memory, ?slots[0], 2,
+        ?storage[0], 32, 16))) { ret 1; }
+    val value: Pool = pool(?memory);
+    if (problem.failed(value.put(value.ctx, view.view("older", 5))) ||
+        problem.failed(value.put(value.ctx, view.view("newer", 5)))) { ret 2; }
+    var first_output: [16]u8;
+    var second_output: [16]u8;
+    val first: Reservation = value.reserve(value.ctx, ?first_output[0], 16);
+    val second: Reservation = value.reserve(value.ctx, ?second_output[0], 16);
+    if (problem.failed(first.error) || !first.found || first.token == 0 ||
+        first.value.len != 5 || first_output[0] != 'n' ||
+        problem.failed(second.error) || !second.found || second.token == 0 ||
+        second.token == first.token || second_output[0] != 'o') { ret 3; }
+    if (problem.failed(value.release(value.ctx, first.token)) ||
+        !problem.failed(value.release(value.ctx, first.token)) ||
+        problem.failed(value.commit(value.ctx, second.token)) ||
+        !problem.failed(value.commit(value.ctx, second.token))) { ret 4; }
+    val again: Reservation = value.reserve(value.ctx, ?first_output[0], 16);
+    if (problem.failed(again.error) || !again.found ||
+        again.value.len != 5 || first_output[0] != 'n' ||
+        problem.failed(value.commit(value.ctx, again.token))) { ret 5; }
+    val empty: Reservation = value.reserve(value.ctx, ?first_output[0], 16);
+    if (problem.failed(empty.error) || empty.found || empty.token != 0 ||
+        empty.value.data != nil || empty.value.len != 0) { ret 6; }
+    if (problem.failed(value.put(value.ctx, view.view("clear_me", 8)))) { ret 7; }
+    val active: Reservation = value.reserve(value.ctx, ?first_output[0], 16);
+    if (problem.failed(active.error) || !active.found ||
+        problem.failed(value.clear(value.ctx)) ||
+        !problem.failed(value.commit(value.ctx, active.token)) ||
+        take(value, ?first_output[0], 16).found) { ret 8; }
     ret 0;
 }
