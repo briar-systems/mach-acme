@@ -443,6 +443,62 @@ that identity back to its key material. A store's declared ceilings on URLs,
 contacts, keys, chains, and identifiers are refusals, not truncations: what is
 written is always what can be read back.
 
+## Renewal information
+
+`renewal_info.certificate_id` builds the draft-ietf-acme-ari identifier from
+the certificate's own authority key identifier and serial number, base64url and
+unpadded, over the exact DER octets. `request_url` joins it to the directory's
+`renewalInfo` base without doubling a trailing slash and re-validates the
+result as an HTTPS URL. The request is an unauthenticated GET.
+
+`renewal_info.parse` requires HTTP 200 and a suggested window whose start and
+end are RFC 3339 instants, accepting a fractional second and a numeric offset,
+and requires the window to end after it starts. Any Retry-After the authority
+sent is retained alongside it. A window that is inverted, unparseable, or
+absent is reported rather than retained, so the caller falls back to its own
+policy instead of acting on advice that was never understood.
+
+## Renewal scheduling
+
+The scheduler owns no clock, no timer, and no randomness. Every decision is a
+pure function of the caller's supplied wall-clock reading, the certificate's
+lifetime, the authority's advice, and an injected random source. Randomness is
+injected rather than drawn, so a fleet spreads its renewals while a test stays
+deterministic.
+
+The authority's window wins when it is usable, because it is the only party
+that knows about a mass revocation, and a time is drawn uniformly within it.
+The window is still clamped to the certificate's own `notBefore` and
+`notAfter`, so a wild suggestion cannot schedule a renewal after expiry or
+before the certificate exists. Without usable advice the target is a policy
+lead before expiry, spread by jitter, and never at or after expiry.
+
+Scheduling state is derived entirely from the durable certificate record and
+the policy, so a restart replans to a schedule of the same shape rather than
+needing its own durable copy.
+
+Urgency comes from the certificate's own lifetime, not only from the instant
+that was planned, so a certificate inside its renewal lead is due even if the
+clock drifted back a little. A schedule that is backing off is excluded from
+that shortcut; otherwise an expiring certificate that kept failing would retry
+without pause, which is exactly the unbounded loop the contract forbids.
+
+A failed attempt backs off by doubling within a ceiling, adds jitter without
+passing that ceiling, and counts against a fixed attempt budget. Exhausting the
+budget is terminal, so a prolonged outage produces a bounded number of widely
+spaced attempts. A clock that moved backwards further than the tolerated skew
+is not evidence that a renewal is due: the schedule is replanned from the new
+reading rather than firing, so a corrected clock cannot cause a renewal storm.
+
+Every state change is reported to an observer with the previous and current
+state, the attempt count, the next run, and the cause. Cancellation is
+terminal and cannot be undone or replanned.
+
+`select_next` picks the certificate closest to expiry among those actually
+ready. A schedule that is backing off is not ready until its delay elapses, so
+urgency cannot turn into a spin, and the most urgent certificate regains
+priority once its backoff passes.
+
 ## Replay nonce ownership
 
 A `nonce.Pool` owns copies of available nonces. The supplied memory implementation
