@@ -6,7 +6,6 @@ use std.types.bool.bool;
 use std.types.size.usize;
 use std.types.view;
 use http_client: http.client.client;
-use tls.config;
 use acme.account;
 use acme.challenge;
 use acme.certificate;
@@ -52,7 +51,6 @@ pub rec Operations {
 
 pub rec Client {
     http:          *http_client.Client;
-    tls:           *config.ClientConfig;
     directory_url: view.View;
     nonces:        *nonce.Pool;
     storage:       *storage.Store;

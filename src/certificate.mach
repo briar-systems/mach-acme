@@ -4,10 +4,24 @@ use R: std.types.result;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
-use tls.cert;
 use acme.identifier;
 
-pub def GenerateCsrFun: fun(ptr, *identifier.Identifier, usize, *u8, usize, *cert.PrivateKey) R.Result[usize, str];
+pub rec Certificate {
+    der: view.View;
+}
+
+pub rec Chain {
+    certificates: *Certificate;
+    len:          usize;
+}
+
+# the provider owns the key material behind this opaque reference
+pub rec PrivateKey {
+    ctx:       ptr;
+    algorithm: u16;
+}
+
+pub def GenerateCsrFun: fun(ptr, *identifier.Identifier, usize, *u8, usize, *PrivateKey) R.Result[usize, str];
 
 pub rec CsrProvider {
     ctx:                ptr;
@@ -18,8 +32,8 @@ pub rec CsrProvider {
 pub rec Issued {
     storage_key:    view.View;
     certificate_url: view.View;
-    chain:          cert.Chain;
-    private_key:    cert.PrivateKey;
+    chain:          Chain;
+    private_key:    PrivateKey;
     identifiers:    *identifier.Identifier;
     identifier_len: usize;
     not_before_unix: u64;
