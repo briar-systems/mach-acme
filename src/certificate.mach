@@ -1,10 +1,50 @@
-# csr and issued certificate boundary
+# csr generation, issuance, alternate chains, and revocation
 
+use crypto.contracts;
+use http.core.field;
+use http.core.status;
+use std.encoding.base64;
+use std.net.ip;
 use R: std.types.result;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
+use acme.client;
 use acme.identifier;
+use acme.jose;
+use acme.memory_range;
+use acme.problem;
+
+pub def Algorithm: u16;
+
+pub val ECDSA_P256_SHA256: Algorithm = 1;
+pub val ED25519:           Algorithm = 2;
+pub val RSA_SHA256:        Algorithm = 3;
+
+pub val MAX_CERTIFICATE_BYTES: usize = 65536;
+pub val MAX_CHAIN_LENGTH:      usize = 10;
+pub val MAX_ALTERNATES:        usize = 8;
+pub val MAX_CSR_BYTES:         usize = 16384;
+pub val MAX_SPKI_BYTES:        usize = 2048;
+pub val MAX_SIGNATURE_BYTES:   usize = 1024;
+
+pub def Reason: u8;
+
+# rfc 5280 section 5.3.1 crl reasons acme admits
+pub val UNSPECIFIED:            Reason = 0;
+pub val KEY_COMPROMISE:         Reason = 1;
+pub val AFFILIATION_CHANGED:    Reason = 3;
+pub val SUPERSEDED:             Reason = 4;
+pub val CESSATION_OF_OPERATION: Reason = 5;
+
+pub fun reason_valid(value: Reason) bool {
+    ret value == UNSPECIFIED || value == KEY_COMPROMISE ||
+        value == AFFILIATION_CHANGED || value == SUPERSEDED ||
+        value == CESSATION_OF_OPERATION;
+}
 
 pub rec Certificate {
     der: view.View;
@@ -18,24 +58,1125 @@ pub rec Chain {
 # the provider owns the key material behind this opaque reference
 pub rec PrivateKey {
     ctx:       ptr;
-    algorithm: u16;
-}
-
-pub def GenerateCsrFun: fun(ptr, *identifier.Identifier, usize, *u8, usize, *PrivateKey) R.Result[usize, str];
-
-pub rec CsrProvider {
-    ctx:                ptr;
-    generate:           GenerateCsrFun;
-    max_csr_der_bytes:  usize;
+    algorithm: Algorithm;
 }
 
 pub rec Issued {
-    storage_key:    view.View;
+    storage_key:     view.View;
     certificate_url: view.View;
-    chain:          Chain;
-    private_key:    PrivateKey;
-    identifiers:    *identifier.Identifier;
-    identifier_len: usize;
+    chain:           Chain;
+    private_key:     PrivateKey;
+    identifiers:     *identifier.Identifier;
+    identifier_len:  usize;
     not_before_unix: u64;
     not_after_unix:  u64;
+}
+
+# the caller owns the key. it signs the exact certification request info this
+# module produced and returns a raw signature, so no secret ever reaches here.
+pub def SignFun: fun(ptr, *u8, usize, *u8, usize) usize;
+
+pub rec CsrSigner {
+    ctx:            ptr;
+    sign:           SignFun;
+    algorithm:      Algorithm;
+    public_key_der: view.View;
+}
+
+pub rec Operation {
+    error:   problem.Error;
+    written: usize;
+    value:   view.View;
+}
+
+fun failed(kind: problem.Kind, code: problem.Code, detail: str) Operation {
+    ret Operation{error: problem.local_code(kind, code, detail), written: 0,
+        value: view.view(nil, 0)};
+}
+
+# der nests length-prefixed, so the writer fills the buffer from the end
+# toward the front. wrapping a finished child is then a prepend, and no length
+# ever needs a second measuring pass.
+rec Back {
+    data: *u8;
+    cap:  usize;
+    pos:  usize;
+}
+
+fun back(output: contracts.Buffer) Back {
+    ret Back{data: output.data, cap: output.capacity, pos: 0};
+}
+
+fun body(writer: *Back) view.View {
+    ret view.view(?writer.data[writer.cap - writer.pos], writer.pos);
+}
+
+fun prepend(writer: *Back, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len) || len > writer.cap - writer.pos) {
+        ret false;
+    }
+    val start: usize = writer.cap - writer.pos - len;
+    var i: usize = len;
+    for (i > 0) {
+        i = i - 1;
+        writer.data[start + i] = data[i];
+    }
+    writer.pos = writer.pos + len;
+    ret true;
+}
+
+fun prepend_byte(writer: *Back, value: u8) bool {
+    if (writer.pos == writer.cap) { ret false; }
+    writer.data[writer.cap - writer.pos - 1] = value;
+    writer.pos = writer.pos + 1;
+    ret true;
+}
+
+fun prepend_length(writer: *Back, len: usize) bool {
+    if (len < 128) { ret prepend_byte(writer, len::u8); }
+    var value: usize = len;
+    var count: usize = 0;
+    for (value > 0) {
+        if (!prepend_byte(writer, (value & 0xff)::u8)) { ret false; }
+        value = value >> 8;
+        count = count + 1;
+    }
+    if (count > 126) { ret false; }
+    ret prepend_byte(writer, (0x80 + count)::u8);
+}
+
+# wraps the `len` bytes most recently written with a tag and length
+fun wrap(writer: *Back, tag: u8, len: usize) bool {
+    ret prepend_length(writer, len) && prepend_byte(writer, tag);
+}
+
+fun mark(writer: *Back) usize { ret writer.pos; }
+
+fun since(writer: *Back, start: usize) usize { ret writer.pos - start; }
+
+val TAG_SEQUENCE:     u8 = 0x30;
+val TAG_SET:          u8 = 0x31;
+val TAG_INTEGER:      u8 = 0x02;
+val TAG_BIT_STRING:   u8 = 0x03;
+val TAG_OCTET_STRING: u8 = 0x04;
+val TAG_OBJECT_ID:    u8 = 0x06;
+val TAG_CONTEXT_0:    u8 = 0xa0;
+val TAG_DNS_NAME:     u8 = 0x82;
+val TAG_IP_ADDRESS:   u8 = 0x87;
+
+fun oid(writer: *Back, encoded: *u8, len: usize) bool {
+    ret prepend(writer, encoded, len) && wrap(writer, TAG_OBJECT_ID, len);
+}
+
+fun signature_oid(writer: *Back, algorithm: Algorithm) bool {
+    if (algorithm == ECDSA_P256_SHA256) {
+        val value: [8]u8 = [8]u8{0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03,
+            0x02};
+        ret oid(writer, ?value[0], 8);
+    }
+    if (algorithm == ED25519) {
+        val value: [3]u8 = [3]u8{0x2b, 0x65, 0x70};
+        ret oid(writer, ?value[0], 3);
+    }
+    if (algorithm == RSA_SHA256) {
+        val value: [9]u8 = [9]u8{0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01,
+            0x01, 0x0b};
+        ret oid(writer, ?value[0], 9);
+    }
+    ret false;
+}
+
+# ed25519 signature algorithm identifiers carry no parameters, the other two
+# named here carry either absent or null parameters per their own rfcs
+fun signature_algorithm(writer: *Back, algorithm: Algorithm) bool {
+    val start: usize = mark(writer);
+    if (algorithm == RSA_SHA256) {
+        # rfc 4055: the parameters field must be present and null
+        if (!prepend_byte(writer, 0x00) || !prepend_byte(writer, 0x05)) {
+            ret false;
+        }
+    }
+    if (!signature_oid(writer, algorithm)) { ret false; }
+    ret wrap(writer, TAG_SEQUENCE, since(writer, start));
+}
+
+fun ip_bytes(value: view.View, output: *u8, len: *usize) bool {
+    var text: [46]u8;
+    if (value.len == 0 || value.len > 45) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        if (value.data[i] == 0) { ret false; }
+        text[i] = value.data[i];
+        i = i + 1;
+    }
+    text[value.len] = 0;
+    val four: R.Result[ip.IPv4, str] = ip.ipv4_parse(?text[0]);
+    if (!R.is_err[ip.IPv4, str](four)) {
+        var address: ip.IPv4 = R.unwrap_ok[ip.IPv4, str](four);
+        i = 0;
+        for (i < 4) {
+            output[i] = address.octets[i];
+            i = i + 1;
+        }
+        @len = 4;
+        ret true;
+    }
+    val six: R.Result[ip.IPv6, str] = ip.ipv6_parse(?text[0]);
+    if (R.is_err[ip.IPv6, str](six)) { ret false; }
+    var address: ip.IPv6 = R.unwrap_ok[ip.IPv6, str](six);
+    i = 0;
+    for (i < 16) {
+        output[i] = address.octets[i];
+        i = i + 1;
+    }
+    @len = 16;
+    ret true;
+}
+
+# rfc 5280 subjectAltName GeneralNames. entries are written in reverse so the
+# encoded order matches the caller's identifier order.
+fun general_names(writer: *Back, names: *identifier.Identifier,
+    len: usize) bool {
+    var i: usize = len;
+    for (i > 0) {
+        i = i - 1;
+        val entry: identifier.Identifier = names[i];
+        if (entry.kind == identifier.DNS) {
+            # a wildcard order requests the wildcard name itself
+            if (!prepend(writer, entry.value.data, entry.value.len) ||
+                !wrap(writer, TAG_DNS_NAME, entry.value.len)) { ret false; }
+        } or (entry.kind == identifier.IP) {
+            var packed: [16]u8;
+            var packed_len: usize = 0;
+            if (!ip_bytes(entry.value, ?packed[0], ?packed_len) ||
+                !prepend(writer, ?packed[0], packed_len) ||
+                !wrap(writer, TAG_IP_ADDRESS, packed_len)) { ret false; }
+        } or { ret false; }
+    }
+    ret true;
+}
+
+fun extension_request(writer: *Back, names: *identifier.Identifier,
+    len: usize) bool {
+    val attributes: usize = mark(writer);
+    val set_start: usize = mark(writer);
+    val extensions: usize = mark(writer);
+    val extension: usize = mark(writer);
+    val octet: usize = mark(writer);
+    val general: usize = mark(writer);
+    if (!general_names(writer, names, len) ||
+        !wrap(writer, TAG_SEQUENCE, since(writer, general)) ||
+        !wrap(writer, TAG_OCTET_STRING, since(writer, octet))) { ret false; }
+    val san: [3]u8 = [3]u8{0x55, 0x1d, 0x11};
+    if (!oid(writer, ?san[0], 3) ||
+        !wrap(writer, TAG_SEQUENCE, since(writer, extension)) ||
+        !wrap(writer, TAG_SEQUENCE, since(writer, extensions)) ||
+        !wrap(writer, TAG_SET, since(writer, set_start))) { ret false; }
+    val request: [9]u8 = [9]u8{0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09,
+        0x0e};
+    if (!oid(writer, ?request[0], 9) ||
+        !wrap(writer, TAG_SEQUENCE, since(writer, attributes))) { ret false; }
+    ret wrap(writer, TAG_CONTEXT_0, since(writer, attributes));
+}
+
+fun signer_valid(value: CsrSigner) bool {
+    ret value.sign != nil &&
+        (value.algorithm == ECDSA_P256_SHA256 || value.algorithm == ED25519 ||
+            value.algorithm == RSA_SHA256) &&
+        memory_range.valid(value.public_key_der.data,
+            value.public_key_der.len) &&
+        value.public_key_der.len != 0 &&
+        value.public_key_der.len <= MAX_SPKI_BYTES;
+}
+
+fun names_valid(names: *identifier.Identifier, len: usize,
+    policy: identifier.Policy) bool {
+    if (len == 0 || len > 100) { ret false; }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(len, $size_of(identifier.Identifier),
+            ?item_bytes) ||
+        !memory_range.valid(names::*u8, item_bytes)) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (!identifier.valid(names[i], policy)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# rfc 2986 CertificationRequestInfo. the subject is an empty Name, because an
+# acme certificate is identified entirely by its subjectAltName entries.
+fun request_info(writer: *Back, names: *identifier.Identifier, len: usize,
+    public_key_der: view.View) bool {
+    val start: usize = mark(writer);
+    if (!extension_request(writer, names, len) ||
+        !prepend(writer, public_key_der.data, public_key_der.len) ||
+        !wrap(writer, TAG_SEQUENCE, 0) ||
+        !prepend_byte(writer, 0x00) || !prepend_byte(writer, 0x01) ||
+        !prepend_byte(writer, TAG_INTEGER)) { ret false; }
+    ret wrap(writer, TAG_SEQUENCE, since(writer, start));
+}
+
+# the signature a csr carries is exactly the form its signature algorithm
+# names: the rfc 3279 der sequence for ecdsa, and raw octets for ed25519 and
+# rsa. mach-crypto emits each in that form already, so the boundary validates
+# the returned shape rather than re-deriving it.
+fun der_integer_at(data: *u8, len: usize, at: usize, next: *usize) bool {
+    if (at + 2 > len || data[at] != TAG_INTEGER) { ret false; }
+    val size: usize = data[at + 1]::usize;
+    # every integer in a p-256 signature is short form and non-empty
+    if (size == 0 || size > 127 || at + 2 + size > len) { ret false; }
+    if (size > 1 && data[at + 2] == 0 && (data[at + 3] & 0x80) == 0) {
+        ret false;
+    }
+    if ((data[at + 2] & 0x80) != 0) { ret false; }
+    @next = at + 2 + size;
+    ret true;
+}
+
+fun ecdsa_signature_valid(data: *u8, len: usize) bool {
+    if (len < 8 || len > 72 || data[0] != TAG_SEQUENCE) { ret false; }
+    val size: usize = data[1]::usize;
+    if (size > 127 || size + 2 != len) { ret false; }
+    var next: usize = 0;
+    if (!der_integer_at(data, len, 2, ?next)) { ret false; }
+    var finish: usize = 0;
+    ret der_integer_at(data, len, next, ?finish) && finish == len;
+}
+
+fun signature_shape_valid(algorithm: Algorithm, data: *u8, len: usize) bool {
+    if (algorithm == ECDSA_P256_SHA256) {
+        ret ecdsa_signature_valid(data, len);
+    }
+    if (algorithm == ED25519) { ret len == 64; }
+    # a sha256WithRSAEncryption signature is one modulus-sized block
+    ret len >= 128 && len <= MAX_SIGNATURE_BYTES;
+}
+
+# produces a complete rfc 2986 certification request. work holds the exact
+# certification request info handed to the caller's signer; output receives the
+# finished request only after signing succeeds.
+pub fun encode_csr(names: *identifier.Identifier, len: usize,
+    policy: identifier.Policy, signer: CsrSigner, work: contracts.Buffer,
+    output: contracts.Buffer) Operation {
+    if (work.data == nil || output.data == nil ||
+        !memory_range.valid(work.data, work.capacity) ||
+        !memory_range.valid(output.data, output.capacity) ||
+        work.capacity > MAX_CSR_BYTES || output.capacity > MAX_CSR_BYTES ||
+        memory_range.overlap(work.data, work.capacity, output.data,
+            output.capacity) ||
+        !signer_valid(signer) || !names_valid(names, len, policy) ||
+        memory_range.overlap(work.data, work.capacity,
+            signer.public_key_der.data, signer.public_key_der.len) ||
+        memory_range.overlap(output.data, output.capacity,
+            signer.public_key_der.data, signer.public_key_der.len)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid certificate request inputs");
+    }
+    var info: Back = back(work);
+    if (!request_info(?info, names, len, signer.public_key_der)) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "certificate request work storage is too small");
+    }
+    val tbs: view.View = body(?info);
+    var raw: [1024]u8;
+    val signature_len: usize = signer.sign(signer.ctx, tbs.data, tbs.len,
+        ?raw[0], MAX_SIGNATURE_BYTES);
+    if (signature_len == 0 || signature_len > MAX_SIGNATURE_BYTES) {
+        ret failed(problem.SIGNING, problem.SIGNATURE_FAILED,
+            "certificate request signing failed");
+    }
+    # the signer must not have disturbed the bytes it was asked to sign
+    var check: Back = back(work);
+    if (!request_info(?check, names, len, signer.public_key_der) ||
+        check.pos != info.pos) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "certification request info changed during signing");
+    }
+    if (!signature_shape_valid(signer.algorithm, ?raw[0], signature_len)) {
+        ret failed(problem.SIGNING, problem.SIGNATURE_FAILED,
+            "signer returned a signature the algorithm does not admit");
+    }
+    var request: Back = back(output);
+    val start: usize = mark(?request);
+    val signature_start: usize = mark(?request);
+    if (!prepend(?request, ?raw[0], signature_len)) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "certificate request output is too small");
+    }
+    # a bit string carries its count of unused trailing bits, always zero here
+    if (!prepend_byte(?request, 0x00) ||
+        !wrap(?request, TAG_BIT_STRING, since(?request, signature_start)) ||
+        !signature_algorithm(?request, signer.algorithm) ||
+        !prepend(?request, tbs.data, tbs.len) ||
+        !wrap(?request, TAG_SEQUENCE, since(?request, start))) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "certificate request output is too small");
+    }
+    # the request is built from the end of the buffer, so move it to the front
+    val encoded: view.View = body(?request);
+    var i: usize = 0;
+    for (i < encoded.len) {
+        output.data[i] = encoded.data[i];
+        i = i + 1;
+    }
+    ret Operation{error: problem.none(), written: encoded.len,
+        value: view.view(output.data, encoded.len)};
+}
+
+# a strict forward der reader. the dependency's reader admits only the tag set
+# it needs for key containers, and a certificate carries context-specific and
+# constructed tags it rejects, so parsing is bounded here instead.
+rec Reader {
+    data: *u8;
+    len:  usize;
+    pos:  usize;
+}
+
+fun reader(value: view.View) Reader {
+    ret Reader{data: value.data, len: value.len, pos: 0};
+}
+
+fun reader_done(value: *Reader) bool { ret value.pos == value.len; }
+
+# rejects high-tag-number form, indefinite length, and non-minimal lengths
+fun read_tlv(value: *Reader, tag: *u8, content: *view.View) bool {
+    if (value.pos + 2 > value.len) { ret false; }
+    val current: u8 = value.data[value.pos];
+    if ((current & 0x1f) == 0x1f) { ret false; }
+    var at: usize = value.pos + 1;
+    val first: u8 = value.data[at];
+    at = at + 1;
+    var size: usize = 0;
+    if (first < 128) {
+        size = first::usize;
+    } or {
+        val count: usize = (first & 0x7f)::usize;
+        if (count == 0 || count > 8 || at + count > value.len) { ret false; }
+        var i: usize = 0;
+        for (i < count) {
+            size = (size << 8) + value.data[at + i]::usize;
+            i = i + 1;
+        }
+        at = at + count;
+        if (size < 128) { ret false; }
+    }
+    if (size > value.len - at) { ret false; }
+    @tag = current;
+    @content = view.view(?value.data[at], size);
+    value.pos = at + size;
+    ret true;
+}
+
+fun read_expect(value: *Reader, expected: u8, content: *view.View) bool {
+    var tag: u8 = 0;
+    ret read_tlv(value, ?tag, content) && tag == expected;
+}
+
+fun skip(value: *Reader, count: usize) bool {
+    var i: usize = 0;
+    var tag: u8 = 0;
+    var content: view.View;
+    for (i < count) {
+        if (!read_tlv(value, ?tag, ?content)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun digits2(data: *u8, at: usize) i64 {
+    ret ((data[at] - '0')::i64) * 10 + (data[at + 1] - '0')::i64;
+}
+
+fun all_digits(data: *u8, at: usize, count: usize) bool {
+    var i: usize = 0;
+    for (i < count) {
+        if (data[at + i] < '0' || data[at + i] > '9') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# proleptic gregorian days since the unix epoch
+fun days_from_civil(year: i64, month: i64, day: i64) i64 {
+    var y: i64 = year;
+    if (month <= 2) { y = y - 1; }
+    var era: i64 = y / 400;
+    if (y < 0) { era = (y - 399) / 400; }
+    val yoe: i64 = y - era * 400;
+    var shifted: i64 = month + 9;
+    if (month > 2) { shifted = month - 3; }
+    val doy: i64 = (153 * shifted + 2) / 5 + day - 1;
+    val doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    ret era * 146097 + doe - 719468;
+}
+
+# rfc 5280 requires utctime through 2049 and generalizedtime after, both in
+# zulu with seconds present
+fun read_time(tag: u8, content: view.View, output: *u64) bool {
+    var year: i64 = 0;
+    var at: usize = 0;
+    if (tag == 0x17) {
+        if (content.len != 13 || content.data[12] != 'Z' ||
+            !all_digits(content.data, 0, 12)) { ret false; }
+        year = digits2(content.data, 0);
+        # rfc 5280 section 4.1.2.5.1
+        if (year >= 50) { year = year + 1900; } or { year = year + 2000; }
+        at = 2;
+    } or (tag == 0x18) {
+        if (content.len != 15 || content.data[14] != 'Z' ||
+            !all_digits(content.data, 0, 14)) { ret false; }
+        year = digits2(content.data, 0) * 100 + digits2(content.data, 2);
+        at = 4;
+    } or { ret false; }
+    val month: i64 = digits2(content.data, at);
+    val day: i64 = digits2(content.data, at + 2);
+    val hour: i64 = digits2(content.data, at + 4);
+    val minute: i64 = digits2(content.data, at + 6);
+    val second: i64 = digits2(content.data, at + 8);
+    if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 ||
+        minute > 59 || second > 60) { ret false; }
+    val stamp: i64 = days_from_civil(year, month, day) * 86400 + hour * 3600 +
+        minute * 60 + second;
+    if (stamp < 0) { ret false; }
+    @output = stamp::u64;
+    ret true;
+}
+
+pub rec Parsed {
+    names:           *identifier.Identifier;
+    name_len:        usize;
+    not_before_unix: u64;
+    not_after_unix:  u64;
+}
+
+# extracts the subjectAltName entries and validity window from a leaf
+# certificate. only the fields acme decisions depend on are decoded.
+pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
+    capacity: usize, output: *Parsed) problem.Error {
+    var item_bytes: usize = 0;
+    if (!memory_range.valid(der.data, der.len) || der.len == 0 ||
+        der.len > MAX_CERTIFICATE_BYTES || output == nil ||
+        !memory_range.valid(output::*u8, $size_of(Parsed)) ||
+        capacity == 0 ||
+        !memory_range.size(capacity, $size_of(identifier.Identifier),
+            ?item_bytes) ||
+        !memory_range.valid(names::*u8, item_bytes) ||
+        memory_range.overlap(names::*u8, item_bytes, output::*u8,
+            $size_of(Parsed))) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid certificate parse inputs");
+    }
+    var outer: Reader = reader(der);
+    var body_bytes: view.View;
+    if (!read_expect(?outer, TAG_SEQUENCE, ?body_bytes) ||
+        !reader_done(?outer)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate is not a single der sequence");
+    }
+    var certificate: Reader = reader(body_bytes);
+    var tbs_bytes: view.View;
+    if (!read_expect(?certificate, TAG_SEQUENCE, ?tbs_bytes)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate has no tbsCertificate");
+    }
+    var tbs: Reader = reader(tbs_bytes);
+    var tag: u8 = 0;
+    var content: view.View;
+    if (!read_tlv(?tbs, ?tag, ?content)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "tbsCertificate is empty");
+    }
+    # [0] version is optional; when absent the first element is the serial
+    if (tag == 0xa0) {
+        if (!read_tlv(?tbs, ?tag, ?content)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "tbsCertificate has no serial number");
+        }
+    }
+    # signature algorithm, issuer, then validity
+    var validity_bytes: view.View;
+    if (!skip(?tbs, 2) ||
+        !read_expect(?tbs, TAG_SEQUENCE, ?validity_bytes)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "tbsCertificate has no validity");
+    }
+    var validity: Reader = reader(validity_bytes);
+    var not_before_bytes: view.View;
+    var not_after_bytes: view.View;
+    var before_tag: u8 = 0;
+    var after_tag: u8 = 0;
+    var result: Parsed;
+    if (!read_tlv(?validity, ?before_tag, ?not_before_bytes) ||
+        !read_tlv(?validity, ?after_tag, ?not_after_bytes) ||
+        !reader_done(?validity) ||
+        !read_time(before_tag, not_before_bytes, ?result.not_before_unix) ||
+        !read_time(after_tag, not_after_bytes, ?result.not_after_unix) ||
+        result.not_after_unix <= result.not_before_unix) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate validity is invalid");
+    }
+    # subject, then subjectPublicKeyInfo
+    if (!skip(?tbs, 2)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "tbsCertificate has no subject public key");
+    }
+    var extensions_bytes: view.View;
+    var found: bool = false;
+    for (!reader_done(?tbs) && !found) {
+        if (!read_tlv(?tbs, ?tag, ?content)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "tbsCertificate is malformed after the public key");
+        }
+        if (tag == 0xa3) {
+            extensions_bytes = content;
+            found = true;
+        }
+    }
+    result.names = names;
+    result.name_len = 0;
+    if (!found) {
+        # a certificate with no extensions has no subjectAltName at all
+        @output = result;
+        ret problem.none();
+    }
+    var wrapper: Reader = reader(extensions_bytes);
+    var list_bytes: view.View;
+    if (!read_expect(?wrapper, TAG_SEQUENCE, ?list_bytes) ||
+        !reader_done(?wrapper)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate extensions are malformed");
+    }
+    var extensions: Reader = reader(list_bytes);
+    var san: view.View = view.view(nil, 0);
+    var seen: bool = false;
+    for (!reader_done(?extensions)) {
+        var extension_bytes: view.View;
+        if (!read_expect(?extensions, TAG_SEQUENCE, ?extension_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "certificate extension is malformed");
+        }
+        var extension: Reader = reader(extension_bytes);
+        var oid_bytes: view.View;
+        if (!read_expect(?extension, TAG_OBJECT_ID, ?oid_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "certificate extension has no oid");
+        }
+        var value_bytes: view.View;
+        if (!read_tlv(?extension, ?tag, ?value_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "certificate extension has no value");
+        }
+        # an optional critical boolean precedes the value
+        if (tag == 0x01 && !read_tlv(?extension, ?tag, ?value_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "critical certificate extension has no value");
+        }
+        if (tag != TAG_OCTET_STRING) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "certificate extension value is not an octet string");
+        }
+        if (oid_bytes.len == 3 && oid_bytes.data[0] == 0x55 &&
+            oid_bytes.data[1] == 0x1d && oid_bytes.data[2] == 0x11) {
+            if (seen) {
+                ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                    "certificate carries more than one subjectAltName");
+            }
+            san = value_bytes;
+            seen = true;
+        }
+    }
+    if (!seen) {
+        @output = result;
+        ret problem.none();
+    }
+    var san_reader: Reader = reader(san);
+    var general_bytes: view.View;
+    if (!read_expect(?san_reader, TAG_SEQUENCE, ?general_bytes) ||
+        !reader_done(?san_reader)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "subjectAltName is malformed");
+    }
+    var general: Reader = reader(general_bytes);
+    var count: usize = 0;
+    for (!reader_done(?general)) {
+        if (!read_tlv(?general, ?tag, ?content)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "subjectAltName entry is malformed");
+        }
+        # only the two general names acme identifiers can produce are retained
+        if (tag == TAG_DNS_NAME || tag == TAG_IP_ADDRESS) {
+            if (count >= capacity) {
+                ret problem.local_code(problem.LIMIT,
+                    problem.OUTPUT_TOO_SMALL,
+                    "certificate name storage is too small");
+            }
+            if (tag == TAG_DNS_NAME) {
+                names[count] = identifier.Identifier{kind: identifier.DNS,
+                    value: content};
+            } or {
+                if (content.len != 4 && content.len != 16) {
+                    ret problem.local_code(problem.PROTOCOL,
+                        problem.INVALID_INPUT,
+                        "subjectAltName ip address has an invalid width");
+                }
+                names[count] = identifier.Identifier{kind: identifier.IP,
+                    value: content};
+            }
+            count = count + 1;
+        }
+    }
+    result.name_len = count;
+    @output = result;
+    ret problem.none();
+}
+
+fun same_identifier(certificate_name: identifier.Identifier,
+    requested: identifier.Identifier) bool {
+    if (certificate_name.kind != requested.kind) { ret false; }
+    if (certificate_name.kind == identifier.DNS) {
+        ret identifier.same(certificate_name, requested);
+    }
+    # a certificate carries an ip address as raw octets, the order carried text
+    var packed: [16]u8;
+    var packed_len: usize = 0;
+    if (!ip_bytes(requested.value, ?packed[0], ?packed_len) ||
+        packed_len != certificate_name.value.len) { ret false; }
+    var i: usize = 0;
+    for (i < packed_len) {
+        if (certificate_name.value.data[i] != packed[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# every requested identifier must appear in the certificate. an extra name the
+# authority added is reported rather than ignored, because a certificate that
+# covers more than was ordered is not the certificate that was ordered.
+pub fun covers(value: Parsed, requested: *identifier.Identifier,
+    len: usize) bool {
+    if (value.name_len != len || len == 0) { ret false; }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(len, $size_of(identifier.Identifier),
+            ?item_bytes) ||
+        !memory_range.valid(requested::*u8, item_bytes) ||
+        !memory_range.valid(value.names::*u8, item_bytes)) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        var matched: bool = false;
+        var j: usize = 0;
+        for (j < value.name_len) {
+            if (same_identifier(value.names[j], requested[i])) {
+                matched = true;
+            }
+            j = j + 1;
+        }
+        if (!matched) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun literal_at(body: view.View, at: usize, text: str, len: usize) bool {
+    if (at + len > body.len) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (body.data[at + i] != text[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun base64_byte(value: u8) bool {
+    ret (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+        (value >= '0' && value <= '9') || value == '+' || value == '/' ||
+        value == '=';
+}
+
+# splits an application/pem-certificate-chain body into der certificates. each
+# certificate is decoded into caller storage and never points at the response.
+pub fun parse_chain(body: view.View, certificates: *Certificate,
+    capacity: usize, der_storage: *u8, der_capacity: usize,
+    output: *Chain) problem.Error {
+    var item_bytes: usize = 0;
+    if (!memory_range.valid(body.data, body.len) || body.len == 0 ||
+        body.len > MAX_CERTIFICATE_BYTES * MAX_CHAIN_LENGTH ||
+        capacity == 0 || capacity > MAX_CHAIN_LENGTH ||
+        !memory_range.size(capacity, $size_of(Certificate), ?item_bytes) ||
+        !memory_range.valid(certificates::*u8, item_bytes) ||
+        der_storage == nil ||
+        !memory_range.valid(der_storage, der_capacity) || output == nil ||
+        !memory_range.valid(output::*u8, $size_of(Chain)) ||
+        memory_range.overlap(der_storage, der_capacity, certificates::*u8,
+            item_bytes) ||
+        memory_range.overlap(der_storage, der_capacity, body.data, body.len) ||
+        memory_range.overlap(certificates::*u8, item_bytes, body.data,
+            body.len) ||
+        memory_range.overlap(output::*u8, $size_of(Chain), der_storage,
+            der_capacity) ||
+        memory_range.overlap(output::*u8, $size_of(Chain),
+            certificates::*u8, item_bytes)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid certificate chain inputs");
+    }
+    val begin: str = "-----BEGIN CERTIFICATE-----";
+    val finish: str = "-----END CERTIFICATE-----";
+    var count: usize = 0;
+    var cursor: usize = 0;
+    var used: usize = 0;
+    var encoded: [65536]u8;
+    for (cursor < body.len) {
+        if (!literal_at(body, cursor, begin, 27)) {
+            # only whitespace may separate or surround the blocks
+            val current: u8 = body.data[cursor];
+            if (current != '\n' && current != '\r' && current != ' ' &&
+                current != '\t') {
+                ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                    "certificate chain has content outside a pem block");
+            }
+            cursor = cursor + 1;
+            cnt;
+        }
+        cursor = cursor + 27;
+        var encoded_len: usize = 0;
+        var closed: bool = false;
+        for (cursor < body.len && !closed) {
+            if (literal_at(body, cursor, finish, 25)) {
+                cursor = cursor + 25;
+                closed = true;
+                cnt;
+            }
+            val current: u8 = body.data[cursor];
+            if (current == '\n' || current == '\r' || current == ' ' ||
+                current == '\t') {
+                cursor = cursor + 1;
+                cnt;
+            }
+            if (!base64_byte(current) || encoded_len == 65536) {
+                ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                    "certificate chain has a malformed pem body");
+            }
+            encoded[encoded_len] = current;
+            encoded_len = encoded_len + 1;
+            cursor = cursor + 1;
+        }
+        if (!closed || encoded_len == 0) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "certificate chain has an unterminated pem block");
+        }
+        if (count == capacity) {
+            ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+                "certificate chain storage is too small");
+        }
+        val written: usize = base64.decode(?encoded[0], encoded_len,
+            ?der_storage[used], der_capacity - used);
+        if (written == 0) {
+            ret problem.local_code(problem.PROTOCOL, problem.OUTPUT_TOO_SMALL,
+                "certificate chain body is not decodable into storage");
+        }
+        certificates[count] = Certificate{
+            der: view.view(?der_storage[used], written)};
+        used = used + written;
+        count = count + 1;
+    }
+    if (count == 0) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate chain contains no certificates");
+    }
+    @output = Chain{certificates: certificates, len: count};
+    ret problem.none();
+}
+
+# parses the leaf and requires it to cover exactly the requested identifiers.
+# a caller runs this before anything is written to durable storage.
+pub fun verify_issued(value: Chain, requested: *identifier.Identifier,
+    len: usize, names: *identifier.Identifier, capacity: usize,
+    output: *Parsed) problem.Error {
+    if (value.len == 0 || value.len > MAX_CHAIN_LENGTH) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate chain is empty");
+    }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(value.len, $size_of(Certificate), ?item_bytes) ||
+        !memory_range.valid(value.certificates::*u8, item_bytes)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate chain range is invalid");
+    }
+    var parsed: Parsed;
+    val decoded: problem.Error = parse_certificate(value.certificates[0].der,
+        names, capacity, ?parsed);
+    if (problem.failed(decoded)) { ret decoded; }
+    if (!covers(parsed, requested, len)) {
+        ret problem.local_code(problem.POLICY, problem.INVALID_INPUT,
+            "issued certificate does not match the requested identifiers");
+    }
+    @output = parsed;
+    ret problem.none();
+}
+
+fun base64url_len(len: usize) usize {
+    val whole: usize = len / 3;
+    val remainder: usize = len - whole * 3;
+    if (remainder == 0) { ret whole * 4; }
+    ret whole * 4 + remainder + 1;
+}
+
+fun put(output: contracts.Buffer, at: usize, text: str, len: usize) bool {
+    if (len > output.capacity - at) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        output.data[at + i] = text[i];
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun encoded(output: contracts.Buffer, written: usize) Operation {
+    ret Operation{error: problem.none(), written: written,
+        value: view.view(output.data, written)};
+}
+
+# rfc 8555 section 7.4: {"csr":"<base64url der>"}
+pub fun encode_finalize(csr: view.View, output: contracts.Buffer) Operation {
+    if (output.data == nil ||
+        !memory_range.valid(output.data, output.capacity) ||
+        !memory_range.valid(csr.data, csr.len) || csr.len == 0 ||
+        csr.len > MAX_CSR_BYTES ||
+        memory_range.overlap(output.data, output.capacity, csr.data,
+            csr.len)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid finalize inputs");
+    }
+    val body: usize = base64url_len(csr.len);
+    val total: usize = 8 + body + 2;
+    if (output.capacity < total) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "finalize output is too small");
+    }
+    if (!put(output, 0, "{\"csr\":\"", 8)) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "finalize preflight disagreed with encoding");
+    }
+    if (base64.encode_url(csr.data, csr.len, ?output.data[8],
+            output.capacity - 8) != body ||
+        !put(output, 8 + body, "\"}", 2)) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "finalize encoding disagreed with its preflight");
+    }
+    ret encoded(output, total);
+}
+
+fun decimal(output: contracts.Buffer, at: usize, value: u8,
+    written: *usize) bool {
+    if (value >= 10) {
+        if (at + 2 > output.capacity) { ret false; }
+        output.data[at] = ('0'::usize + (value / 10)::usize)::u8;
+        output.data[at + 1] = ('0'::usize + (value % 10)::usize)::u8;
+        @written = 2;
+        ret true;
+    }
+    if (at + 1 > output.capacity) { ret false; }
+    output.data[at] = ('0'::usize + value::usize)::u8;
+    @written = 1;
+    ret true;
+}
+
+# rfc 8555 section 7.6: {"certificate":"<base64url der>","reason":n}
+pub fun encode_revoke(der: view.View, reason: Reason,
+    output: contracts.Buffer) Operation {
+    if (output.data == nil ||
+        !memory_range.valid(output.data, output.capacity) ||
+        !memory_range.valid(der.data, der.len) || der.len == 0 ||
+        der.len > MAX_CERTIFICATE_BYTES || !reason_valid(reason) ||
+        memory_range.overlap(output.data, output.capacity, der.data,
+            der.len)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid revocation inputs");
+    }
+    val body: usize = base64url_len(der.len);
+    var digits: usize = 1;
+    if (reason >= 10) { digits = 2; }
+    val total: usize = 16 + body + 11 + digits + 1;
+    if (output.capacity < total) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "revocation output is too small");
+    }
+    if (!put(output, 0, "{\"certificate\":\"", 16)) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "revocation preflight disagreed with encoding");
+    }
+    if (base64.encode_url(der.data, der.len, ?output.data[16],
+            output.capacity - 16) != body ||
+        !put(output, 16 + body, "\",\"reason\":", 11)) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "revocation encoding disagreed with its preflight");
+    }
+    var actual: usize = 0;
+    if (!decimal(output, 16 + body + 11, reason, ?actual) ||
+        actual != digits || !put(output, total - 1, "}", 1)) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "revocation encoding disagreed with its preflight");
+    }
+    ret encoded(output, total);
+}
+
+fun payload_bound(encoded_value: Operation, payload: view.View) bool {
+    ret !problem.failed(encoded_value.error) &&
+        encoded_value.written == payload.len &&
+        encoded_value.value.data == payload.data &&
+        encoded_value.value.len == payload.len;
+}
+
+pub fun begin_finalize(protocol: *client.Client,
+    state: *client.SignedRequest, finalize_url: view.View,
+    account_url: view.View, payload: view.View, encoded_value: Operation,
+    signer: jose.Signer) problem.Error {
+    if (!payload_bound(encoded_value, payload) || account_url.len == 0) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "finalize request has invalid payload binding");
+    }
+    ret client.begin_signed_bound(protocol, state, client.SignedSpec{
+        url: finalize_url, payload: payload, kid: account_url,
+        use_jwk: false}, signer);
+}
+
+# rfc 8555 section 7.4.2: the certificate is fetched with post-as-get
+pub fun begin_download(protocol: *client.Client,
+    state: *client.SignedRequest, certificate_url: view.View,
+    account_url: view.View, signer: jose.Signer) problem.Error {
+    if (account_url.len == 0) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "certificate download requires an account url");
+    }
+    ret client.begin_signed_bound(protocol, state, client.SignedSpec{
+        url: certificate_url, payload: view.view(nil, 0), kid: account_url,
+        use_jwk: false}, signer);
+}
+
+# rfc 8555 section 7.6 admits either the account key or the certificate key.
+# `use_certificate_key` selects the jwk form for the latter, which is the only
+# way to revoke when the account that ordered it is gone.
+pub fun begin_revoke(protocol: *client.Client, state: *client.SignedRequest,
+    revoke_url: view.View, account_url: view.View, payload: view.View,
+    encoded_value: Operation, use_certificate_key: bool,
+    signer: jose.Signer) problem.Error {
+    if (!payload_bound(encoded_value, payload) ||
+        (use_certificate_key && account_url.len != 0) ||
+        (!use_certificate_key && account_url.len == 0)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "revocation request has invalid key identity");
+    }
+    var kid: view.View = account_url;
+    if (use_certificate_key) { kid = view.view(nil, 0); }
+    ret client.begin_signed_bound(protocol, state, client.SignedSpec{
+        url: revoke_url, payload: payload, kid: kid,
+        use_jwk: use_certificate_key}, signer);
+}
+
+pub rec Alternates {
+    urls: *view.View;
+    len:  usize;
+}
+
+fun is_space(value: u8) bool {
+    ret value == ' ' || value == '\t';
+}
+
+# rfc 8288 Link header. only `rel="alternate"` targets are retained, and each
+# url is copied into caller storage so it outlives the response fields.
+fun scan_link(value: view.View, storage: *u8, capacity: usize, used: *usize,
+    urls: *view.View, limit: usize, count: *usize,
+    max_url_bytes: usize) problem.Error {
+    var i: usize = 0;
+    for (i < value.len) {
+        for (i < value.len && (is_space(value.data[i]) ||
+            value.data[i] == ',')) { i = i + 1; }
+        if (i == value.len) { brk; }
+        if (value.data[i] != '<') {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "link header value is malformed");
+        }
+        i = i + 1;
+        val start: usize = i;
+        for (i < value.len && value.data[i] != '>') { i = i + 1; }
+        if (i == value.len) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "link header target is unterminated");
+        }
+        val target: view.View = view.view(?value.data[start], i - start);
+        i = i + 1;
+        var alternate: bool = false;
+        for (i < value.len && value.data[i] != ',') {
+            if (value.data[i] == ';') {
+                i = i + 1;
+                for (i < value.len && is_space(value.data[i])) {
+                    i = i + 1;
+                }
+                if (literal_at(value, i, "rel=\"alternate\"", 15) ||
+                    literal_at(value, i, "rel=alternate", 13)) {
+                    alternate = true;
+                }
+                cnt;
+            }
+            i = i + 1;
+        }
+        if (!alternate) { cnt; }
+        if (!client.url_valid(target, max_url_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "alternate chain url is not an https url");
+        }
+        if (@count == limit) {
+            ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+                "alternate chain storage is too small");
+        }
+        if (target.len > capacity - @used) {
+            ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+                "alternate chain text storage is too small");
+        }
+        var j: usize = 0;
+        for (j < target.len) {
+            storage[@used + j] = target.data[j];
+            j = j + 1;
+        }
+        urls[@count] = view.view(?storage[@used], target.len);
+        @used = @used + target.len;
+        @count = @count + 1;
+    }
+    ret problem.none();
+}
+
+pub fun parse_alternates(response: client.Response, max_url_bytes: usize,
+    storage: *u8, capacity: usize, urls: *view.View, limit: usize,
+    output: *Alternates) problem.Error {
+    var item_bytes: usize = 0;
+    if (response.fields == nil || output == nil ||
+        !memory_range.valid(output::*u8, $size_of(Alternates)) ||
+        limit == 0 || limit > MAX_ALTERNATES || storage == nil ||
+        capacity == 0 || !memory_range.valid(storage, capacity) ||
+        max_url_bytes == 0 || max_url_bytes > 4096 ||
+        !memory_range.size(limit, $size_of(view.View), ?item_bytes) ||
+        !memory_range.valid(urls::*u8, item_bytes) ||
+        memory_range.overlap(storage, capacity, urls::*u8, item_bytes) ||
+        memory_range.overlap(storage, capacity, output::*u8,
+            $size_of(Alternates)) ||
+        memory_range.overlap(urls::*u8, item_bytes, output::*u8,
+            $size_of(Alternates))) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid alternate chain inputs");
+    }
+    var used: usize = 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    for (i < response.fields.len) {
+        if (field.name_equal(response.fields.items[i].name,
+                view.view("link", 4))) {
+            val scanned: problem.Error = scan_link(
+                response.fields.items[i].value, storage, capacity, ?used,
+                urls, limit, ?count, max_url_bytes);
+            if (problem.failed(scanned)) { ret scanned; }
+        }
+        i = i + 1;
+    }
+    @output = Alternates{urls: urls, len: count};
+    ret problem.none();
 }

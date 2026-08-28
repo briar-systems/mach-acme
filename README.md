@@ -54,6 +54,14 @@ ownership contract.
   timeout, and cancellation, with a same-thread reentrancy guard
 - bounded, injectable DNS propagation policy requiring consecutive
   confirmations
+- RFC 2986 certification requests with subjectAltName DNS and IP entries,
+  built without ever holding the certificate key
+- strict X.509 decoding of subjectAltName and the validity window, and
+  verification of an issued certificate against the requested identifiers
+- PEM chain decoding, RFC 8288 alternate-chain links, order finalization,
+  certificate download, and revocation with CRL reasons
+- transactional certificate and private-key replacement over the same durable
+  gate, tokens, and one-active-transaction rule as account credentials
 
 ## Protocol boundary
 
@@ -216,3 +224,33 @@ count rather than proceeding. The wait is bounded by the shared poll policy.
 `acme.poll` holds the one bounded wait policy that orders, challenges, and
 renewal share. It is status agnostic: callers reduce their own status to
 `reached` and `terminal` and keep their own vocabulary.
+
+## Certificates
+
+`certificate.encode_csr` produces a complete RFC 2986 certification request.
+The library owns the DER encoding, which is the error-prone half, and never
+owns the key: the caller's signer receives the exact certification request info
+bytes and returns a signature. The signer's context is a plain pointer, so
+secret memory cannot be laundered through it. The returned signature's shape is
+validated against the algorithm it claims, and the request info is re-encoded
+and compared after signing, so a signer that disturbed its input cannot publish
+a request.
+
+`certificate.parse_certificate` decodes only what an ACME decision depends on:
+the subjectAltName entries and the validity window. `verify_issued` parses the
+leaf and requires it to cover exactly the requested identifiers. A certificate
+that omits a requested name, or carries one that was not ordered, is refused —
+before anything reaches durable storage. Chain bodies are decoded from PEM into
+caller storage, so a retained certificate never points at a response buffer.
+
+`certificate.parse_alternates` reads RFC 8288 `Link` headers and retains only
+`rel="alternate"` targets, copying each into caller storage so it outlives the
+response fields.
+
+Certificate and private-key replacement runs through the same durable manager
+as account credentials. `storage.RecordKind` is the axis durable state grows
+along: both kinds share the gate, the monotonic token sequence, the
+one-active-transaction rule, and callback serialization, and differ only in the
+staged payload and its ownership rules. A store declares which record kinds it
+holds; one that declares no certificate callbacks refuses certificate
+transactions rather than half-supporting them.
