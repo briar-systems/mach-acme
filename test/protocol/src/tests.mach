@@ -23,6 +23,7 @@ use std.types.string.str;
 use std.types.view;
 use acme.client;
 use acme.account;
+use acme.certificate;
 use acme.challenge;
 use acme.identifier;
 use acme.order;
@@ -2430,7 +2431,8 @@ fun account_store(value: *AccountStore) storage.Store {
         aliases: account_store_aliases, owns_secret: account_store_owns_secret,
         begin: account_store_begin, stage: account_store_stage,
         commit: account_store_commit, abort: account_store_abort,
-        load: account_store_load};
+        load: account_store_load, stage_certificate: nil,
+        load_certificate: nil};
 }
 
 fun credentials(key: jose.PublicKey, owner: ptr,
@@ -3890,5 +3892,606 @@ test "challenge: dns propagation is bounded, injectable, and consecutive" {
             poll.TERMINAL ||
         challenge.propagation_next(?state, injected, view.view(nil, 0),
             expected, 0).action != poll.TERMINAL) { ret 14; }
+    ret 0;
+}
+
+# a signing provider resolves its own key material. the opaque context never
+# carries a secret, so no public alias to the scalar can exist.
+fun csr_sign_p256(ctx: ptr, tbs: *u8, tbs_len: usize, output: *u8,
+    capacity: usize) usize {
+    var private_bytes: [32]^u8;
+    set_private(?private_bytes[0]);
+    val signed: contracts.Operation = signature.sign_ecdsa_p256_sha256(
+        contracts.SecretBytes{data: ?private_bytes[0], len: 32},
+        contracts.Bytes{data: tbs, len: tbs_len},
+        contracts.Buffer{data: output, capacity: capacity});
+    if (signed.error != contracts.OK) { ret 0; }
+    ret signed.written;
+}
+
+fun p256_spki(point: *u8, output: *u8) usize {
+    val prefix: [26]u8 = [26]u8{
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
+        0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+        0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
+        0x42, 0x00};
+    var i: usize = 0;
+    for (i < 26) { output[i] = prefix[i]; i = i + 1; }
+    i = 0;
+    for (i < 65) { output[26 + i] = point[i]; i = i + 1; }
+    ret 91;
+}
+
+# walks one der element so a test can reach the exact bytes a signature covers
+fun der_element(data: *u8, len: usize, at: usize, tag: *u8,
+    content_at: *usize, content_len: *usize, next: *usize) bool {
+    if (at + 2 > len) { ret false; }
+    @tag = data[at];
+    var cursor: usize = at + 1;
+    val first: u8 = data[cursor];
+    cursor = cursor + 1;
+    var size: usize = 0;
+    if (first < 128) {
+        size = first::usize;
+    } or {
+        val count: usize = (first & 0x7f)::usize;
+        if (count == 0 || count > 8 || cursor + count > len) { ret false; }
+        var i: usize = 0;
+        for (i < count) {
+            size = (size << 8) + data[cursor + i]::usize;
+            i = i + 1;
+        }
+        cursor = cursor + count;
+    }
+    if (size > len - cursor) { ret false; }
+    @content_at = cursor;
+    @content_len = size;
+    @next = cursor + size;
+    ret true;
+}
+
+test "certificate: a csr is valid der and its signature covers the request info" {
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 1; }
+    var spki: [128]u8;
+    val spki_len: usize = p256_spki(?public_bytes[0], ?spki[0]);
+    var names: [2]identifier.Identifier;
+    names[0] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("a.example.com", 13)};
+    names[1] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("*.b.example.com", 15)};
+    var work: [4096]u8;
+    var output: [4096]u8;
+    val signer: certificate.CsrSigner = certificate.CsrSigner{ctx: nil,
+        sign: csr_sign_p256, algorithm: certificate.ECDSA_P256_SHA256,
+        public_key_der: view.view(?spki[0], spki_len)};
+    val csr: certificate.Operation = certificate.encode_csr(?names[0], 2,
+        identifier.policy_default(), signer,
+        contracts.Buffer{data: ?work[0], capacity: 4096},
+        contracts.Buffer{data: ?output[0], capacity: 4096});
+    if (problem.failed(csr.error) || csr.written == 0) { ret 2; }
+
+    # the request is a single der sequence holding the request info, the
+    # signature algorithm, and the signature bit string
+    var tag: u8 = 0;
+    var content_at: usize = 0;
+    var content_len: usize = 0;
+    var next: usize = 0;
+    if (!der_element(?output[0], csr.written, 0, ?tag, ?content_at,
+            ?content_len, ?next) || tag != 0x30 ||
+        next != csr.written) { ret 3; }
+    val body_at: usize = content_at;
+    val body_len: usize = content_len;
+    var info_at: usize = 0;
+    var info_len: usize = 0;
+    var after_info: usize = 0;
+    if (!der_element(?output[0], body_at + body_len, body_at, ?tag, ?info_at,
+            ?info_len, ?after_info) || tag != 0x30) { ret 4; }
+    var algorithm_at: usize = 0;
+    var algorithm_len: usize = 0;
+    var after_algorithm: usize = 0;
+    if (!der_element(?output[0], body_at + body_len, after_info, ?tag,
+            ?algorithm_at, ?algorithm_len, ?after_algorithm) ||
+        tag != 0x30) { ret 5; }
+    var signature_at: usize = 0;
+    var signature_len: usize = 0;
+    var after_signature: usize = 0;
+    if (!der_element(?output[0], body_at + body_len, after_algorithm, ?tag,
+            ?signature_at, ?signature_len, ?after_signature) ||
+        tag != 0x03 || after_signature != body_at + body_len) { ret 6; }
+    # a bit string leads with its count of unused trailing bits
+    if (output[signature_at] != 0x00) { ret 7; }
+
+    # the signature must verify over the exact certification request info,
+    # tag and length included
+    if (signature.verify_ecdsa_p256_sha256(
+            contracts.Bytes{data: ?public_bytes[0], len: 65},
+            contracts.Bytes{data: ?output[body_at],
+                len: after_info - body_at},
+            contracts.Bytes{data: ?output[signature_at + 1],
+                len: signature_len - 1}) != contracts.OK) { ret 8; }
+
+    # both requested names appear in the subjectAltName, wildcard included
+    var found_a: bool = false;
+    var found_b: bool = false;
+    var i: usize = 0;
+    for (i + 15 <= csr.written) {
+        if (output[i] == 0x82 && output[i + 1] == 13 &&
+            equal(?output[i + 2], "a.example.com", 13)) { found_a = true; }
+        if (output[i] == 0x82 && output[i + 1] == 15 &&
+            equal(?output[i + 2], "*.b.example.com", 15)) { found_b = true; }
+        i = i + 1;
+    }
+    if (!found_a || !found_b) { ret 9; }
+
+    # a signer that returns a shape the algorithm does not admit is refused
+    fill(?output[0], 0xa5, 4096);
+    var wrong: certificate.CsrSigner = signer;
+    wrong.algorithm = certificate.ED25519;
+    if (certificate.encode_csr(?names[0], 2, identifier.policy_default(),
+            wrong, contracts.Buffer{data: ?work[0], capacity: 4096},
+            contracts.Buffer{data: ?output[0], capacity: 4096}).error.code !=
+            problem.SIGNATURE_FAILED || !filled(?output[0], 0xa5, 4096)) {
+        ret 10;
+    }
+    # a denied wildcard, an empty request, and a short output all fail closed
+    var strict: identifier.Policy = identifier.policy_default();
+    strict.allow_wildcard = false;
+    if (certificate.encode_csr(?names[0], 2, strict, signer,
+            contracts.Buffer{data: ?work[0], capacity: 4096},
+            contracts.Buffer{data: ?output[0], capacity: 4096}).error.code !=
+            problem.INVALID_INPUT ||
+        certificate.encode_csr(?names[0], 0, identifier.policy_default(),
+            signer, contracts.Buffer{data: ?work[0], capacity: 4096},
+            contracts.Buffer{data: ?output[0], capacity: 4096}).error.code !=
+            problem.INVALID_INPUT ||
+        certificate.encode_csr(?names[0], 2, identifier.policy_default(),
+            signer, contracts.Buffer{data: ?work[0], capacity: 32},
+            contracts.Buffer{data: ?output[0], capacity: 4096}).error.code !=
+            problem.OUTPUT_TOO_SMALL || !filled(?output[0], 0xa5, 4096)) {
+        ret 11;
+    }
+    ret 0;
+}
+
+# an openssl-generated leaf carrying two dns names and one ip address, with a
+# validity window computed independently of this implementation
+fun leaf_pem() *u8 {
+    ret "-----BEGIN CERTIFICATE-----\nMIIBiTCCAS6gAwIBAgIUbnYIUfdvfMCkoKJt0Eea62OURk4wCgYIKoZIzj0EAwIw\nADAeFw0yNjA4MjgyMjExMjlaFw0yNjExMjYyMjExMjlaMAAwWTATBgcqhkjOPQIB\nBggqhkjOPQMBBwNCAASJaX667nSrQmHvMORhTY5bdMthaA5tWnTEYE4IZrGRhbzq\ndmGLpaxPUw2l8UZ/OxASnhHykrG+7YPh+yuKDkUBo4GFMIGCMB0GA1UdDgQWBBQk\n3YkQ9uZntNvhuTAiHiTkx0z1tTAfBgNVHSMEGDAWgBQk3YkQ9uZntNvhuTAiHiTk\nx0z1tTAPBgNVHRMBAf8EBTADAQH/MC8GA1UdEQQoMCaCDWEuZXhhbXBsZS5jb22C\nDyouYi5leGFtcGxlLmNvbYcEwAACBzAKBggqhkjOPQQDAgNJADBGAiEA1ZNxagn1\ndjiUbqFt2W5ldU/YCi5LDTf3T3q8GhZfu88CIQDDnxCeO5FxsOCAICYh80tWlbeB\nUGdTd19IAG7vYnuVDA==\n-----END CERTIFICATE-----";
+}
+
+test "certificate: chains decode and are verified against requested identifiers" {
+    val pem: *u8 = leaf_pem();
+    val body: view.View = view.view(pem, length(pem));
+    var certificates: [4]certificate.Certificate;
+    var der: [8192]u8;
+    var chain: certificate.Chain;
+    if (problem.failed(certificate.parse_chain(body, ?certificates[0], 4,
+            ?der[0], 8192, ?chain))) { ret 1; }
+    if (chain.len != 1 || chain.certificates[0].der.len == 0) { ret 2; }
+
+    var names: [8]identifier.Identifier;
+    var parsed: certificate.Parsed;
+    if (problem.failed(certificate.parse_certificate(
+            chain.certificates[0].der, ?names[0], 8, ?parsed))) { ret 3; }
+    # the validity window is decoded from the certificate, not the clock
+    if (parsed.name_len != 3 || parsed.not_before_unix != 1787955089 ||
+        parsed.not_after_unix != 1795731089) { ret 4; }
+    if (parsed.names[0].kind != identifier.DNS ||
+        !equal(parsed.names[0].value.data, "a.example.com", 13) ||
+        parsed.names[1].kind != identifier.DNS ||
+        !equal(parsed.names[1].value.data, "*.b.example.com", 15) ||
+        parsed.names[2].kind != identifier.IP ||
+        parsed.names[2].value.len != 4) { ret 5; }
+
+    # a certificate covering exactly the requested identifiers is accepted
+    var requested: [3]identifier.Identifier;
+    requested[0] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("A.EXAMPLE.COM", 13)};
+    requested[1] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("*.b.example.com", 15)};
+    requested[2] = identifier.Identifier{kind: identifier.IP,
+        value: view.view("192.0.2.7", 9)};
+    var verified: certificate.Parsed;
+    if (problem.failed(certificate.verify_issued(chain, ?requested[0], 3,
+            ?names[0], 8, ?verified))) { ret 6; }
+
+    # a certificate that omits or exceeds the requested set is refused before
+    # anything reaches storage
+    var short_request: [2]identifier.Identifier;
+    short_request[0] = requested[0];
+    short_request[1] = requested[1];
+    if (certificate.verify_issued(chain, ?short_request[0], 2, ?names[0], 8,
+            ?verified).code != problem.INVALID_INPUT) { ret 7; }
+    var wrong: [3]identifier.Identifier;
+    wrong[0] = requested[0];
+    wrong[1] = requested[1];
+    wrong[2] = identifier.Identifier{kind: identifier.IP,
+        value: view.view("192.0.2.8", 9)};
+    if (certificate.verify_issued(chain, ?wrong[0], 3, ?names[0], 8,
+            ?verified).code != problem.INVALID_INPUT) { ret 8; }
+    var other: [3]identifier.Identifier;
+    other[0] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("c.example.com", 13)};
+    other[1] = requested[1];
+    other[2] = requested[2];
+    if (certificate.verify_issued(chain, ?other[0], 3, ?names[0], 8,
+            ?verified).code != problem.INVALID_INPUT) { ret 9; }
+
+    # name storage smaller than the certificate's own name count fails closed
+    if (certificate.parse_certificate(chain.certificates[0].der, ?names[0], 2,
+            ?parsed).code != problem.OUTPUT_TOO_SMALL) { ret 10; }
+
+    # a malformed chain never yields certificates
+    var guarded: certificate.Chain;
+    val truncated: *u8 = "-----BEGIN CERTIFICATE-----\nMIIB\n";
+    val junk: *u8 = "not a pem block at all";
+    val empty_block: *u8 = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n";
+    if (!problem.failed(certificate.parse_chain(
+            view.view(truncated, length(truncated)), ?certificates[0], 4,
+            ?der[0], 8192, ?guarded)) ||
+        !problem.failed(certificate.parse_chain(
+            view.view(junk, length(junk)), ?certificates[0], 4, ?der[0], 8192,
+            ?guarded)) ||
+        !problem.failed(certificate.parse_chain(
+            view.view(empty_block, length(empty_block)), ?certificates[0], 4,
+            ?der[0], 8192, ?guarded))) { ret 11; }
+    # der storage too small for the decoded certificate fails closed
+    if (certificate.parse_chain(body, ?certificates[0], 4, ?der[0], 16,
+            ?guarded).code != problem.OUTPUT_TOO_SMALL) { ret 12; }
+
+    # a truncated der body is rejected rather than partially decoded
+    var short_der: certificate.Certificate = chain.certificates[0];
+    short_der.der.len = short_der.der.len - 40;
+    if (!problem.failed(certificate.parse_certificate(short_der.der,
+            ?names[0], 8, ?parsed))) { ret 13; }
+    ret 0;
+}
+
+test "certificate: finalize, revocation, and alternate links encode exactly" {
+    # rfc 8555 section 7.4 finalize payload
+    var output: [256]u8;
+    val csr: *u8 = "abcde";
+    val finalize: certificate.Operation = certificate.encode_finalize(
+        view.view(csr, 5), contracts.Buffer{data: ?output[0], capacity: 256});
+    val expected_finalize: *u8 = "{\"csr\":\"YWJjZGU\"}";
+    if (problem.failed(finalize.error) ||
+        finalize.written != length(expected_finalize) ||
+        !equal(?output[0], expected_finalize, finalize.written)) { ret 1; }
+
+    # rfc 8555 section 7.6 revocation payload, with the crl reason
+    val revoke: certificate.Operation = certificate.encode_revoke(
+        view.view(csr, 5), certificate.KEY_COMPROMISE,
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    val expected_revoke: *u8 = "{\"certificate\":\"YWJjZGU\",\"reason\":1}";
+    if (problem.failed(revoke.error) ||
+        revoke.written != length(expected_revoke) ||
+        !equal(?output[0], expected_revoke, revoke.written)) { ret 2; }
+    val superseded: certificate.Operation = certificate.encode_revoke(
+        view.view(csr, 5), certificate.SUPERSEDED,
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    val expected_superseded: *u8 = "{\"certificate\":\"YWJjZGU\",\"reason\":4}";
+    if (problem.failed(superseded.error) ||
+        !equal(?output[0], expected_superseded, superseded.written)) { ret 3; }
+
+    # an undefined crl reason and a short output both fail closed
+    fill(?output[0], 0xa5, 256);
+    if (certificate.encode_revoke(view.view(csr, 5), 7::certificate.Reason,
+            contracts.Buffer{data: ?output[0], capacity: 256}).error.code !=
+            problem.INVALID_INPUT ||
+        certificate.encode_revoke(view.view(csr, 5), certificate.SUPERSEDED,
+            contracts.Buffer{data: ?output[0], capacity: 8}).error.code !=
+            problem.OUTPUT_TOO_SMALL ||
+        certificate.encode_finalize(view.view(csr, 5),
+            contracts.Buffer{data: ?output[0], capacity: 8}).error.code !=
+            problem.OUTPUT_TOO_SMALL ||
+        !filled(?output[0], 0xa5, 256)) { ret 4; }
+
+    # rfc 8288 Link headers: only rel="alternate" targets are retained
+    var items: [4]field.Field;
+    var fields: field.Fields = field.init(?items[0], 4,
+        field.limits(4, 65536, 256, 8192));
+    items[0] = field.Field{name: view.view("Link", 4),
+        value: view.view("<https://example.com/acme/directory>;rel=\"index\"", 48),
+        sensitive: false};
+    items[1] = field.Field{name: view.view("Link", 4),
+        value: view.view("<https://example.com/cert/alt/1>;rel=\"alternate\"", 48),
+        sensitive: false};
+    items[2] = field.Field{name: view.view("Link", 4),
+        value: view.view("<https://example.com/cert/alt/2>;rel=\"alternate\", <https://example.com/x>;rel=\"up\"", 82),
+        sensitive: false};
+    fields.len = 3;
+    var text: [512]u8;
+    var urls: [4]view.View;
+    var alternates: certificate.Alternates;
+    if (problem.failed(certificate.parse_alternates(
+            response(status.OK, ?fields, view.view(nil, 0)), 4096, ?text[0],
+            512, ?urls[0], 4, ?alternates))) { ret 5; }
+    if (alternates.len != 2 ||
+        !equal(alternates.urls[0].data, "https://example.com/cert/alt/1", 30) ||
+        !equal(alternates.urls[1].data, "https://example.com/cert/alt/2", 30)) {
+        ret 6;
+    }
+    # the retained urls are copies, so they outlive the response fields
+    if (alternates.urls[0].data == items[1].value.data) { ret 7; }
+
+    # a non-https alternate and a storage ceiling both fail closed
+    items[1].value = view.view("<http://example.com/cert/alt/1>;rel=\"alternate\"", 47);
+    if (certificate.parse_alternates(
+            response(status.OK, ?fields, view.view(nil, 0)), 4096, ?text[0],
+            512, ?urls[0], 4, ?alternates).code != problem.INVALID_INPUT) {
+        ret 8;
+    }
+    items[1].value = view.view("<https://example.com/cert/alt/1>;rel=\"alternate\"", 48);
+    if (certificate.parse_alternates(
+            response(status.OK, ?fields, view.view(nil, 0)), 4096, ?text[0],
+            8, ?urls[0], 4, ?alternates).code != problem.OUTPUT_TOO_SMALL ||
+        certificate.parse_alternates(
+            response(status.OK, ?fields, view.view(nil, 0)), 4096, ?text[0],
+            512, ?urls[0], 1, ?alternates).code != problem.OUTPUT_TOO_SMALL) {
+        ret 9;
+    }
+    ret 0;
+}
+
+# an in-memory certificate store. every returned range lives inside its own
+# declared context, so the manager's ownership checks are exercised for real.
+rec CertStore {
+    anchor:        u8;
+    gate:          storage.Gate;
+    token:         u64;
+    has_current:   bool;
+    has_pending:   bool;
+    current:       storage.CertificateRecord;
+    pending:       storage.CertificateRecord;
+    active:        storage.Transaction;
+    key_bytes:     [64]u8;
+    url_bytes:     [128]u8;
+    chain_bytes:   [256]u8;
+    name_bytes:    [64]u8;
+    names:         [1]identifier.Identifier;
+    secret_owner:  u8;
+    stage_status:  storage.Status;
+    commit_status: storage.Status;
+    ready_flag:    bool;
+}
+
+fun cert_store_ready(ctx: ptr) bool {
+    ret (ctx::*CertStore).ready_flag;
+}
+
+fun cert_store_aliases(ctx: ptr, data: *u8, len: usize) bool {
+    val store: *CertStore = ctx::*CertStore;
+    if (len == 0) { ret true; }
+    if (!memory_range.valid(data, len)) { ret false; }
+    val start: usize = (?store.anchor)::usize;
+    val finish: usize = start + $size_of(CertStore);
+    val at: usize = data::usize;
+    ret at >= start && at + len <= finish;
+}
+
+fun cert_store_owns_secret(ctx: ptr, owner: ptr) bool {
+    val store: *CertStore = ctx::*CertStore;
+    ret owner == (?store.secret_owner)::ptr;
+}
+
+fun cert_store_begin(ctx: ptr, key: view.View,
+    generation: u64) storage.BeginResult {
+    val store: *CertStore = ctx::*CertStore;
+    store.token = store.token + 1;
+    var result: storage.BeginResult;
+    result.status = storage.SUCCESS;
+    result.transaction = storage.Transaction{owner: ctx, token: store.token,
+        generation: generation};
+    store.active = result.transaction;
+    ret result;
+}
+
+fun cert_store_stage(ctx: ptr, transaction: storage.Transaction,
+    value: storage.CertificateRecord) storage.Status {
+    val store: *CertStore = ctx::*CertStore;
+    if (store.stage_status != storage.SUCCESS) { ret store.stage_status; }
+    store.pending = value;
+    store.has_pending = true;
+    store.active = transaction;
+    ret storage.SUCCESS;
+}
+
+fun cert_store_commit(ctx: ptr,
+    transaction: storage.Transaction) storage.Status {
+    val store: *CertStore = ctx::*CertStore;
+    if (store.commit_status != storage.SUCCESS) { ret store.commit_status; }
+    if (!store.has_pending ||
+        store.active.token != transaction.token) { ret storage.CONFLICT; }
+    store.current = store.pending;
+    store.has_current = true;
+    store.has_pending = false;
+    ret storage.SUCCESS;
+}
+
+fun cert_store_abort(ctx: ptr,
+    transaction: storage.Transaction) storage.Status {
+    val store: *CertStore = ctx::*CertStore;
+    if (store.active.token != transaction.token) { ret storage.CONFLICT; }
+    store.has_pending = false;
+    ret storage.SUCCESS;
+}
+
+fun cert_store_load(ctx: ptr, key: view.View,
+    output: *storage.CertificateSnapshot) storage.Status {
+    val store: *CertStore = ctx::*CertStore;
+    var result: storage.CertificateSnapshot;
+    result.status = storage.NOT_FOUND;
+    if (store.has_current) { result.status = storage.SUCCESS; }
+    result.current = store.current;
+    result.pending = store.pending;
+    result.transaction = store.active;
+    result.has_pending = store.has_pending;
+    @output = result;
+    ret result.status;
+}
+
+fun cert_store_account_begin(ctx: ptr, url: view.View,
+    generation: u64) storage.BeginResult {
+    var result: storage.BeginResult;
+    result.status = storage.FAILED;
+    ret result;
+}
+
+fun cert_store_account_stage(ctx: ptr, transaction: storage.Transaction,
+    value: account.Credentials) storage.Status {
+    ret storage.FAILED;
+}
+
+fun cert_store_account_load(ctx: ptr, url: view.View,
+    output: *storage.Snapshot) storage.Status {
+    ret storage.FAILED;
+}
+
+fun cert_store(value: *CertStore) storage.Store {
+    ret storage.Store{ctx: value::ptr, context_anchor: ?value.anchor,
+        context_size: $size_of(CertStore), gate: ?value.gate,
+        ready: cert_store_ready, aliases: cert_store_aliases,
+        owns_secret: cert_store_owns_secret, begin: cert_store_begin,
+        stage: cert_store_account_stage, commit: cert_store_commit,
+        abort: cert_store_abort, load: cert_store_account_load,
+        stage_certificate: cert_store_stage,
+        load_certificate: cert_store_load};
+}
+
+# builds a record whose every range lives inside the store's own context
+fun cert_record(store: *CertStore, generation: u64,
+    chain_len: usize) storage.CertificateRecord {
+    copy(?store.key_bytes[0], "issue.live.example", 18);
+    copy(?store.url_bytes[0], "https://example.com/cert/1", 26);
+    var i: usize = 0;
+    for (i < 256) { store.chain_bytes[i] = (i & 0xff)::u8; i = i + 1; }
+    copy(?store.name_bytes[0], "issue.live.example", 18);
+    store.names[0] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view(?store.name_bytes[0], 18)};
+    ret storage.CertificateRecord{
+        storage_key: view.view(?store.key_bytes[0], 18),
+        certificate_url: view.view(?store.url_bytes[0], 26),
+        chain_der: view.view(?store.chain_bytes[0], 256),
+        chain_len: chain_len,
+        private_key_owner: (?store.secret_owner)::ptr,
+        identifiers: ?store.names[0], identifier_len: 1,
+        not_before_unix: 1787955089, not_after_unix: 1795731089,
+        generation: generation};
+}
+
+fun init_cert_store(store: *CertStore, manager: *storage.Manager) bool {
+    store.token = 0;
+    store.has_current = false;
+    store.has_pending = false;
+    store.stage_status = storage.SUCCESS;
+    store.commit_status = storage.SUCCESS;
+    store.ready_flag = true;
+    store.gate.initialized = false;
+    store.gate.callback_owner = 0;
+    ret !problem.failed(storage.init_manager(manager, cert_store(store)));
+}
+
+test "certificate: private key and chain replacement is transactional" {
+    var store: CertStore;
+    var manager: storage.Manager;
+    if (!init_cert_store(?store, ?manager)) { ret 1; }
+
+    # the first record installs at generation one against expected zero
+    val first: storage.CertificateRecord = cert_record(?store, 1, 2);
+    val write: storage.Write = storage.begin_replace_certificate(?manager, 0,
+        first);
+    if (problem.failed(write.error) ||
+        write.state != storage.WRITE_STAGED ||
+        write.record != storage.RECORD_CERTIFICATE ||
+        !store.has_pending || store.has_current) { ret 2; }
+    if (problem.failed(storage.commit_certificate(?manager, write)) ||
+        !store.has_current || store.has_pending ||
+        store.current.generation != 1) { ret 3; }
+
+    # a second replacement must name the generation it replaces
+    val second: storage.CertificateRecord = cert_record(?store, 2, 2);
+    val stale: storage.Write = storage.begin_replace_certificate(?manager, 5,
+        second);
+    if (!problem.failed(stale.error)) { ret 4; }
+    val next: storage.Write = storage.begin_replace_certificate(?manager, 1,
+        second);
+    if (problem.failed(next.error) ||
+        next.transaction.token <= write.transaction.token) { ret 5; }
+
+    # abort rolls the staged replacement back and leaves the committed record
+    if (problem.failed(storage.abort_certificate(?manager, next)) ||
+        store.has_pending || store.current.generation != 1) { ret 6; }
+    # a retired transaction cannot be committed afterwards
+    if (!problem.failed(storage.commit_certificate(?manager, next))) { ret 7; }
+
+    # one active transaction at a time
+    val third: storage.Write = storage.begin_replace_certificate(?manager, 1,
+        second);
+    if (problem.failed(third.error)) { ret 8; }
+    if (!problem.failed(storage.begin_replace_certificate(?manager, 1,
+            second).error)) { ret 9; }
+
+    # a record changed after staging no longer matches its bound digest
+    store.pending.not_after_unix = store.pending.not_after_unix + 1;
+    if (storage.commit_certificate(?manager, third).code !=
+        problem.STORAGE_CONFLICT) { ret 10; }
+    store.pending.not_after_unix = store.pending.not_after_unix - 1;
+    if (problem.failed(storage.commit_certificate(?manager, third)) ||
+        store.current.generation != 2) { ret 11; }
+
+    # an interrupted replacement is recoverable after a restart
+    var restarted: storage.Manager;
+    store.gate.initialized = false;
+    store.gate.callback_owner = 0;
+    if (problem.failed(storage.init_manager(?restarted,
+            cert_store(?store)))) { ret 12; }
+    val fourth: storage.CertificateRecord = cert_record(?store, 3, 2);
+    val interrupted: storage.Write = storage.begin_replace_certificate(
+        ?restarted, 2, fourth);
+    if (problem.failed(interrupted.error)) { ret 13; }
+    var recovered: storage.Manager;
+    store.gate.initialized = false;
+    store.gate.callback_owner = 0;
+    if (problem.failed(storage.init_manager(?recovered,
+            cert_store(?store)))) { ret 14; }
+    var snapshot: storage.CertificateSnapshot;
+    if (problem.failed(storage.recover_certificate(?recovered,
+            view.view(?store.key_bytes[0], 18), ?snapshot))) { ret 15; }
+    if (!snapshot.has_pending || snapshot.pending.generation != 3 ||
+        snapshot.current.generation != 2) { ret 16; }
+    val resumed: storage.Write = storage.resume_certificate(snapshot);
+    if (problem.failed(resumed.error) ||
+        resumed.transaction.token != interrupted.transaction.token) {
+        ret 17;
+    }
+    if (problem.failed(storage.commit_certificate(?recovered, resumed)) ||
+        store.current.generation != 3) { ret 18; }
+
+    # a store that declares no certificate callbacks refuses the record kind
+    var plain: CertStore;
+    var plain_manager: storage.Manager;
+    plain.ready_flag = true;
+    plain.token = 0;
+    plain.has_current = false;
+    plain.has_pending = false;
+    plain.stage_status = storage.SUCCESS;
+    plain.commit_status = storage.SUCCESS;
+    plain.gate.initialized = false;
+    plain.gate.callback_owner = 0;
+    var account_only: storage.Store = cert_store(?plain);
+    account_only.stage_certificate = nil;
+    account_only.load_certificate = nil;
+    if (storage.supports_certificates(account_only)) { ret 19; }
+    if (problem.failed(storage.init_manager(?plain_manager, account_only))) {
+        ret 20;
+    }
+    val record: storage.CertificateRecord = cert_record(?plain, 1, 2);
+    if (!problem.failed(storage.begin_replace_certificate(?plain_manager, 0,
+            record).error)) { ret 21; }
     ret 0;
 }
