@@ -1,0 +1,511 @@
+use crypto.contracts;
+use crypto.group.p256;
+use crypto.signature;
+use http.core.field;
+use http.core.status;
+use std.runtime;
+use std.encoding.base64;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+use acme.client;
+use acme.jose;
+use acme.nonce;
+use acme.problem;
+
+fun equal(first: *u8, second: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun filled(data: *u8, value: u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (data[i] != value) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun fill(data: *u8, value: u8, len: usize) {
+    var i: usize = 0;
+    for (i < len) {
+        data[i] = value;
+        i = i + 1;
+    }
+}
+
+fun length(text: *u8) usize {
+    var len: usize = 0;
+    for (text[len] != 0) { len = len + 1; }
+    ret len;
+}
+
+fun deterministic_entropy(ctx: ptr, output: contracts.SecretBuffer) contracts.Error {
+    if (output.data == nil || output.capacity < 32) { ret contracts.INVALID_INPUT; }
+    var i: usize = 0;
+    for (i < 32) {
+        output.data[i] = i::u8;
+        i = i + 1;
+    }
+    ret contracts.OK;
+}
+
+fun unavailable_entropy(ctx: ptr, output: contracts.SecretBuffer) contracts.Error {
+    ret contracts.ENTROPY_UNAVAILABLE;
+}
+
+fun set_private(output: *^u8) {
+    val value: [32]u8 = [32]u8{
+        0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16,
+        0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6, 0x93,
+        0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12,
+        0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f, 0x67, 0x21
+    };
+    var i: usize = 0;
+    for (i < 32) {
+        output[i] = value[i];
+        i = i + 1;
+    }
+}
+
+fun es_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
+    private_bytes: *^u8, public_bytes: *u8) bool {
+    set_private(private_bytes);
+    val secret: contracts.SecretBytes = contracts.SecretBytes{data: private_bytes, len: 32};
+    val derived: contracts.Operation = p256.derive_public(secret,
+        contracts.Buffer{data: public_bytes, capacity: 65});
+    if (derived.error != contracts.OK) { ret false; }
+    @public_key = jose.PublicKey{algorithm: jose.ES256,
+        value: contracts.Bytes{data: public_bytes, len: 65}};
+    @private_key = jose.PrivateKey{algorithm: jose.ES256, value: secret};
+    ret true;
+}
+
+fun empty_fields(fields: *field.Fields) {
+    @fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+}
+
+fun response(code: u16, fields: *field.Fields, body: view.View) client.Response {
+    ret client.Response{status: code, fields: fields, body: body,
+        retry_after_seconds: 0};
+}
+
+test "jose: rfc 7638 rsa jwk and sha-256 thumbprint are exact" {
+    val modulus_text: *u8 = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw";
+    var modulus: [256]u8;
+    var exponent: [3]u8;
+    if (base64.decode(modulus_text, length(modulus_text), ?modulus[0], 256) != 256 ||
+        base64.decode("AQAB", 4, ?exponent[0], 3) != 3) { ret 1; }
+    val public_key: jose.PublicKey = jose.PublicKey{algorithm: jose.PS256,
+        rsa: signature.RsaPublicKey{
+            modulus: contracts.Bytes{data: ?modulus[0], len: 256},
+            exponent: contracts.Bytes{data: ?exponent[0], len: 3}}};
+    var jwk: [512]u8;
+    val encoded: jose.Operation = jose.key_encode_jwk(public_key,
+        contracts.Buffer{data: ?jwk[0], capacity: 512});
+    val prefix: *u8 = "{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"";
+    if (problem.failed(encoded.error) || encoded.written != 373 ||
+        !equal(?jwk[0], prefix, length(prefix)) ||
+        !equal(?jwk[length(prefix)], modulus_text, length(modulus_text)) ||
+        jwk[encoded.written - 2] != '"' || jwk[encoded.written - 1] != '}') { ret 2; }
+    var thumbprint: [43]u8;
+    val thumb: jose.Operation = jose.key_thumbprint(public_key,
+        contracts.Buffer{data: ?thumbprint[0], capacity: 43});
+    if (problem.failed(thumb.error) || thumb.written != 43 ||
+        !equal(?thumbprint[0], "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs", 43)) { ret 3; }
+    ret 0;
+}
+
+test "jose: rfc 8555 protected fields are canonical and output is transactional" {
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0], ?public_bytes[0])) { ret 1; }
+    val signer: jose.Signer = jose.signer(public_key);
+    val protected: jose.Protected = jose.Protected{
+        nonce: view.view("Q_s3MWoqT05TrdkM2MTDcw", 22),
+        url: view.view("https://example.com/acme/chall/prV_B7yEyA4", 42),
+        kid: view.view("https://example.com/acme/acct/evOfKhNU60wg", 42),
+        use_jwk: false};
+    var work: [2048]u8;
+    var output: [512]u8;
+    fill(?output[0], 0xa5, 512);
+    val too_small: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.Entropy{available: false}, protected, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 8});
+    if (too_small.error.code != problem.OUTPUT_TOO_SMALL ||
+        !filled(?output[0], 0xa5, 512)) { ret 2; }
+    fill(?work[0], 0x6d, 2048);
+    val overlap: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.Entropy{available: false}, protected, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 512},
+        contracts.Buffer{data: ?work[0], capacity: 512});
+    if (overlap.error.code != problem.INVALID_INPUT ||
+        !filled(?work[0], 0x6d, 2048)) { ret 3; }
+    fill(?output[0], 0xa5, 512);
+    var invalid_nonce: jose.Protected = protected;
+    invalid_nonce.nonce = view.view("bad+nonce", 9);
+    val rejected_nonce: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.Entropy{available: false}, invalid_nonce, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (rejected_nonce.error.code != problem.INVALID_INPUT ||
+        !filled(?output[0], 0xa5, 512)) { ret 4; }
+    val encoded: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.Entropy{available: false}, protected, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    val expected: *u8 = "{\"protected\":\"eyJhbGciOiJFUzI1NiIsImtpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vYWNtZS9hY2N0L2V2T2ZLaE5VNjB3ZyIsIm5vbmNlIjoiUV9zM01Xb3FUMDVUcmRrTTJNVERjdyIsInVybCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vYWNtZS9jaGFsbC9wclZfQjd5RXlBNCJ9\",\"payload\":\"e30\",\"signature\":\"";
+    if (problem.failed(encoded.error)) { ret 5; }
+    if (encoded.written != length(expected) + 88) { ret 6; }
+    if (!equal(?output[0], expected, length(expected))) { ret 7; }
+    if (output[encoded.written - 2] != '"' || output[encoded.written - 1] != '}') { ret 8; }
+    var i: usize = length(expected);
+    for (i < encoded.written - 2) {
+        val byte: u8 = output[i];
+        if (!((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_')) { ret 9; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "jose: rfc 8032 ed25519 account signing vector is exact" {
+    var seed: [32]^u8 = [32]^u8{
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60,
+        0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+        0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19,
+        0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60
+    };
+    val public_key_bytes: [32]u8 = [32]u8{
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+        0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+        0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+        0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a
+    };
+    val expected: [64]u8 = [64]u8{
+        0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72,
+        0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e, 0x82, 0x8a,
+        0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74,
+        0xd8, 0x73, 0xe0, 0x65, 0x22, 0x49, 0x01, 0x55,
+        0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac,
+        0xc6, 0x1e, 0x39, 0x70, 0x1c, 0xf9, 0xb4, 0x6b,
+        0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24,
+        0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x0b
+    };
+    val public_key: jose.PublicKey = jose.PublicKey{algorithm: jose.EDDSA,
+        value: contracts.Bytes{data: (?public_key_bytes[0]):~*u8, len: 32}};
+    val private_key: jose.PrivateKey = jose.PrivateKey{algorithm: jose.EDDSA,
+        value: contracts.SecretBytes{data: ?seed[0], len: 32}};
+    var jwk: [80]u8;
+    val encoded: jose.Operation = jose.key_encode_jwk(public_key,
+        contracts.Buffer{data: ?jwk[0], capacity: 80});
+    val expected_jwk: *u8 =
+        "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}";
+    if (problem.failed(encoded.error) || encoded.written != 79 ||
+        !equal(?jwk[0], expected_jwk, 79)) { ret 1; }
+    var output: [64]u8;
+    val signed: jose.Operation = jose.key_sign(private_key,
+        jose.Entropy{available: false}, contracts.Bytes{data: nil, len: 0},
+        contracts.Buffer{data: ?output[0], capacity: 64});
+    if (problem.failed(signed.error) || signed.written != 64 ||
+        !equal(?output[0], (?expected[0]):~*u8, 64)) { ret 2; }
+    ret 0;
+}
+
+test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures" {
+    val modulus_text: *u8 = "p_teNxO8by2eprJiu3ngRFferEuSKek_LmzyJCkogfOvJaUhm7J_SNN3xzaNNHpDvwsnw1sucOIckxzOySA-fqApVBCRo6R4zQ45x_hThuOcqKLMs4Pv4NngoOq-lbu4To76FfOFwgdrqqKPoOopivLyo-CmvmrcEvT21uBl_MKNeJw_LdqkVE6YyHmnBdESgcGSamwFKwBeF5UAZrr3mDD7HTNFR6OO5HBNokQdOWZ_U_PFoZGhrYp36JhvnNAewm1MDaItjskRlOWaE3mRmcscE855_ttHe_T_St-0LxH5Ik0Urtio0HY58zUT0MiZKVKluFQvlKo9fm_Nor5esQ";
+    val private_text: *u8 = "eTcvHD0dE50cY23fSAUBQpkTfu6uBeKYAr8kMv0AQqF1qvknOaVZGMHt3zxVDVb2As8FXe6gfab1kyCNctT61hKzv_pHHfgMs8cUvTy5LfQIJZYLl7WGcW0Qr6Ai8CmcmlzSEOmbzhC6d5mWpqd3N2P9c3G2mBYyCtdVWh3TeoKHcutpJXAdfkWfc-aLeOuF46OMY-HdBYkL3uG77bgkdXbfgrhzDNMRWxRyUxOD_RRQ6UvzHy0Xb3KnN971VZFWydjrH_Hz-aj5T7Kmfu8h-dDMc_DonPEzhJ4SyO5vITdm_llR2MJJf8NhsXl4lQqKm1deNI2x04m6Kr6nzBaB";
+    var modulus: [256]u8;
+    var exponent: [3]u8;
+    var private_public: [256]u8;
+    var private_bytes: [256]^u8;
+    if (base64.decode(modulus_text, length(modulus_text), ?modulus[0], 256) != 256 ||
+        base64.decode("AQAB", 4, ?exponent[0], 3) != 3 ||
+        base64.decode(private_text, length(private_text), ?private_public[1], 255) != 255) {
+        ret 1;
+    }
+    private_public[0] = 0;
+    var i: usize = 0;
+    for (i < 256) {
+        private_bytes[i] = private_public[i];
+        i = i + 1;
+    }
+    fill(?private_public[0], 0, 256);
+    val rsa_public: signature.RsaPublicKey = signature.RsaPublicKey{
+        modulus: contracts.Bytes{data: ?modulus[0], len: 256},
+        exponent: contracts.Bytes{data: ?exponent[0], len: 3}};
+    val rsa_private: signature.RsaPrivateKey = signature.RsaPrivateKey{
+        modulus: contracts.Bytes{data: ?modulus[0], len: 256},
+        public_exponent: contracts.Bytes{data: ?exponent[0], len: 3},
+        private_exponent: contracts.SecretBytes{data: ?private_bytes[0], len: 256}};
+    val key: jose.PrivateKey = jose.PrivateKey{algorithm: jose.PS256, rsa: rsa_private};
+    var output: [256]u8;
+    val message: *u8 = "mach-acme openssl rsa-pss vector";
+    val signed: jose.Operation = jose.key_sign(key,
+        jose.Entropy{ctx: nil, fill: deterministic_entropy, available: true},
+        contracts.Bytes{data: message, len: length(message)},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (problem.failed(signed.error) || signed.written != 256 ||
+        signature.verify_rsa_pss_sha256(rsa_public,
+            contracts.Bytes{data: message, len: length(message)},
+            contracts.Bytes{data: ?output[0], len: 256}) != contracts.OK) { ret 2; }
+    fill(?output[0], 0xa5, 256);
+    val unavailable: jose.Operation = jose.key_sign(key,
+        jose.Entropy{ctx: nil, fill: unavailable_entropy, available: true},
+        contracts.Bytes{data: message, len: length(message)},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (unavailable.error.code != problem.ENTROPY_UNAVAILABLE || unavailable.written != 0 ||
+        !filled(?output[0], 0xa5, 256)) { ret 3; }
+    ret 0;
+}
+
+test "client: lets encrypt staging directory fixture discovers bounded endpoints" {
+    val body: *u8 = "{\"FrDPtXot1mU\":\"https://community.letsencrypt.org/t/adding-random-entries-to-the-directory/33417\",\"keyChange\":\"https://acme-staging-v02.api.letsencrypt.org/acme/key-change\",\"meta\":{\"caaIdentities\":[\"letsencrypt.org\"],\"profiles\":{\"classic\":\"https://letsencrypt.org/docs/profiles#classic\"},\"termsOfService\":\"https://letsencrypt.org/documents/LE-SA-v1.8-July-06-2026.pdf\",\"website\":\"https://letsencrypt.org/docs/staging-environment/\"},\"newAccount\":\"https://acme-staging-v02.api.letsencrypt.org/acme/new-acct\",\"newNonce\":\"https://acme-staging-v02.api.letsencrypt.org/acme/new-nonce\",\"newOrder\":\"https://acme-staging-v02.api.letsencrypt.org/acme/new-order\",\"renewalInfo\":\"https://acme-staging-v02.api.letsencrypt.org/acme/renewal-info\",\"revokeCert\":\"https://acme-staging-v02.api.letsencrypt.org/acme/revoke-cert\"}";
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var scratch: [16384]u8;
+    var text: [1024]u8;
+    var caa: [4]view.View;
+    var directory: client.Directory;
+    val result: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(body, length(body))),
+        client.limits_default(), ?scratch[0], 16384,
+        client.DirectoryStorage{data: ?text[0], capacity: 1024,
+            caa_items: ?caa[0], caa_capacity: 4}, ?directory);
+    if (problem.failed(result)) { ret 1; }
+    if (directory.new_nonce_url.len != 59) { ret 2; }
+    if (directory.new_account_url.len != 58) { ret 3; }
+    if (directory.new_order_url.len != 59) { ret 4; }
+    if (directory.renewal_info_url.len != 62) { ret 5; }
+    if (directory.revoke_cert_url.len != 61) { ret 6; }
+    if (directory.key_change_url.len != 60) { ret 7; }
+    if (directory.caa_identity_len != 1 ||
+        !equal(directory.caa_identities[0].data, "letsencrypt.org", 15)) { ret 8; }
+    if (directory.external_account_required) { ret 9; }
+    ret 0;
+}
+
+test "client: hostile directory inputs preserve caller outputs" {
+    val duplicate: *u8 = "{\"newNonce\":\"https://a.example/nonce\",\"newNonce\":\"https://b.example/nonce\",\"newAccount\":\"https://a.example/account\",\"newOrder\":\"https://a.example/order\"}";
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var scratch: [8192]u8;
+    var text: [512]u8;
+    var caa: [2]view.View;
+    fill(?text[0], 0x5a, 512);
+    var directory: client.Directory;
+    directory.new_nonce_url = view.view("sentinel", 8);
+    val result: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(duplicate, length(duplicate))),
+        client.limits_default(), ?scratch[0], 8192,
+        client.DirectoryStorage{data: ?text[0], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 2}, ?directory);
+    if (result.code != problem.MALFORMED_JSON ||
+        directory.new_nonce_url.len != 8 || !filled(?text[0], 0x5a, 512)) { ret 1; }
+    val insecure: *u8 = "{\"newNonce\":\"http://a.example/nonce\",\"newAccount\":\"https://a.example/account\",\"newOrder\":\"https://a.example/order\"}";
+    val insecure_result: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(insecure, length(insecure))),
+        client.limits_default(), ?scratch[0], 8192,
+        client.DirectoryStorage{data: ?text[0], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 2}, ?directory);
+    if (insecure_result.code != problem.INVALID_DIRECTORY ||
+        directory.new_nonce_url.len != 8 || !filled(?text[0], 0x5a, 512)) { ret 2; }
+    val escaped_duplicate: *u8 = "{\"newNonce\":\"https://a.example/nonce\",\"new\\u004eonce\":\"https://b.example/nonce\",\"newAccount\":\"https://a.example/account\",\"newOrder\":\"https://a.example/order\"}";
+    val escaped_result: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(escaped_duplicate, length(escaped_duplicate))),
+        client.limits_default(), ?scratch[0], 8192,
+        client.DirectoryStorage{data: ?text[0], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 2}, ?directory);
+    if (escaped_result.code != problem.MALFORMED_JSON ||
+        directory.new_nonce_url.len != 8 || !filled(?text[0], 0x5a, 512)) { ret 3; }
+    ret 0;
+}
+
+test "client: badNonce consumes stale state and retries with the fresh response nonce" {
+    var slots: [3]nonce.Slot;
+    var nonce_storage: [192]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 3,
+        ?nonce_storage[0], 192, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var configured: client.Limits = client.limits_default();
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, configured)) ||
+        problem.failed(pool.put(pool.ctx, view.view("stale_nonce", 11))) ||
+        problem.failed(pool.put(pool.ctx, view.view("first_nonce", 11)))) { ret 2; }
+    var request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?request, client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31), use_jwk: false},
+        configured))) { ret 3; }
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0], ?public_bytes[0])) { ret 4; }
+    var work: [2048]u8;
+    var output: [512]u8;
+    val first: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.Entropy{available: false},
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(first.error) || request.state != client.REQUEST_AWAITING ||
+        request.attempts != 1) { ret 5; }
+    var response_items: [1]field.Field;
+    var response_fields: field.Fields = field.init(?response_items[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?response_fields, field.Field{
+        name: view.view("Replay-Nonce", 12), value: view.view("fresh_nonce", 11),
+        sensitive: false}) != field.ADD_OK) { ret 6; }
+    val body: *u8 = "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"title\":\"bad nonce\",\"status\":400,\"detail\":\"retry with a fresh nonce\"}";
+    var json_scratch: [8192]u8;
+    var problem_storage: [512]u8;
+    val decision: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.BAD_REQUEST, ?response_fields,
+            view.view(body, length(body))), ?json_scratch[0], 8192,
+        client.ProblemStorage{data: ?problem_storage[0], capacity: 512});
+    if (decision.action != client.ACTION_RETRY_SIGNED ||
+        decision.cause.code != problem.BAD_NONCE ||
+        decision.cause.http.status != status.BAD_REQUEST ||
+        request.state != client.REQUEST_RETRY || request.bad_nonce_retries != 1) { ret 7; }
+    val retry: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.Entropy{available: false},
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(retry.error) || request.attempts != 2 ||
+        request.state != client.REQUEST_AWAITING) { ret 8; }
+    var nonce_output: [64]u8;
+    val remaining: nonce.Taken = pool.take(pool.ctx, ?nonce_output[0], 64);
+    if (problem.failed(remaining.error) || remaining.found) { ret 9; }
+    ret 0;
+}
+
+test "client: badNonce acquisition and retry exhaustion preserve protocol causes" {
+    var slots: [2]nonce.Slot;
+    var nonce_storage: [128]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 2,
+        ?nonce_storage[0], 128, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var configured: client.Limits = client.limits_default();
+    configured.max_bad_nonce_retries = 1;
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, configured)) ||
+        problem.failed(pool.put(pool.ctx, view.view("stale_nonce", 11)))) { ret 2; }
+    var request: client.SignedRequest;
+    request.state = client.REQUEST_AWAITING;
+    val body: *u8 = "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"title\":\"bad nonce\",\"status\":400}";
+    var empty: field.Fields;
+    empty_fields(?empty);
+    var scratch: [8192]u8;
+    var storage: [512]u8;
+    val acquire: client.Decision = client.accept_signed_response(?protocol, ?request,
+        response(status.BAD_REQUEST, ?empty, view.view(body, length(body))),
+        ?scratch[0], 8192, client.ProblemStorage{data: ?storage[0], capacity: 512});
+    if (acquire.action != client.ACTION_ACQUIRE_NONCE ||
+        acquire.cause.code != problem.BAD_NONCE ||
+        request.state != client.REQUEST_NEEDS_NONCE || request.bad_nonce_retries != 1) {
+        ret 3;
+    }
+    var nonce_output: [64]u8;
+    val stale: nonce.Taken = pool.take(pool.ctx, ?nonce_output[0], 64);
+    if (problem.failed(stale.error) || stale.found) { ret 4; }
+    var fresh_items: [1]field.Field;
+    var fresh_fields: field.Fields = field.init(?fresh_items[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?fresh_fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("head_nonce", 10), sensitive: false}) != field.ADD_OK) { ret 5; }
+    val accepted: problem.Error = client.accept_nonce_response(?protocol, ?request,
+        response(status.NO_CONTENT, ?fresh_fields, view.view(nil, 0)));
+    if (problem.failed(accepted) || request.state != client.REQUEST_RETRY) { ret 6; }
+
+    request.state = client.REQUEST_AWAITING;
+    var limit_items: [1]field.Field;
+    var limit_fields: field.Fields = field.init(?limit_items[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?limit_fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("limit_nonce", 11), sensitive: false}) != field.ADD_OK) { ret 7; }
+    val limited: client.Decision = client.accept_signed_response(?protocol, ?request,
+        response(status.BAD_REQUEST, ?limit_fields, view.view(body, length(body))),
+        ?scratch[0], 8192, client.ProblemStorage{data: ?storage[0], capacity: 512});
+    if (limited.action != client.ACTION_FAILED || limited.cause.code != problem.RETRY_LIMIT ||
+        limited.cause.http.status != status.BAD_REQUEST || limited.cause.problem.typ.len == 0 ||
+        limited.cause.retryable || request.state != client.REQUEST_FAILED) { ret 8; }
+    val remaining: nonce.Taken = pool.take(pool.ctx, ?nonce_output[0], 64);
+    if (problem.failed(remaining.error) || !remaining.found || remaining.value.len != 11 ||
+        !equal(remaining.value.data, "limit_nonce", 11)) { ret 9; }
+    ret 0;
+}
+
+test "client: malformed acme problems retain their http cause transactionally" {
+    var slots: [1]nonce.Slot;
+    var nonce_storage: [64]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1,
+        ?nonce_storage[0], 64, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, client.limits_default()))) { ret 2; }
+    var request: client.SignedRequest;
+    request.state = client.REQUEST_AWAITING;
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var scratch: [4096]u8;
+    var storage: [64]u8;
+    fill(?storage[0], 0xb7, 64);
+    val body: *u8 = "{\"type\":7,\"detail\":\"wrong type\"}";
+    val decision: client.Decision = client.accept_signed_response(?protocol, ?request,
+        response(status.BAD_REQUEST, ?fields, view.view(body, length(body))),
+        ?scratch[0], 4096, client.ProblemStorage{data: ?storage[0], capacity: 64});
+    if (decision.action != client.ACTION_FAILED ||
+        decision.cause.code != problem.MALFORMED_JSON ||
+        decision.cause.http.status != status.BAD_REQUEST ||
+        decision.cause.http.body.len != length(body) ||
+        !filled(?storage[0], 0xb7, 64)) { ret 3; }
+    request.state = client.REQUEST_AWAITING;
+    val valid: *u8 = "{\"type\":\"urn:ietf:params:acme:error:rejectedIdentifier\",\"detail\":\"policy\"}";
+    val too_small: client.Decision = client.accept_signed_response(?protocol, ?request,
+        response(status.BAD_REQUEST, ?fields, view.view(valid, length(valid))),
+        ?scratch[0], 4096, client.ProblemStorage{data: ?storage[0], capacity: 1});
+    if (too_small.action != client.ACTION_FAILED ||
+        too_small.cause.code != problem.OUTPUT_TOO_SMALL ||
+        too_small.cause.http.status != status.BAD_REQUEST ||
+        !filled(?storage[0], 0xb7, 64)) { ret 4; }
+    ret 0;
+}
+
+test "nonce: hostile values, duplicates, and small outputs are transactional" {
+    var slots: [1]nonce.Slot;
+    var storage: [16]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1, ?storage[0], 16, 16))) {
+        ret 1;
+    }
+    val pool: nonce.Pool = nonce.pool(?memory);
+    if (pool.put(pool.ctx, view.view("bad+nonce", 9)).code != problem.INVALID_INPUT ||
+        problem.failed(pool.put(pool.ctx, view.view("valid_nonce", 11))) ||
+        pool.put(pool.ctx, view.view("valid_nonce", 11)).code != problem.DUPLICATE_NONCE) {
+        ret 2;
+    }
+    var output: [16]u8;
+    fill(?output[0], 0xcc, 16);
+    val small: nonce.Taken = pool.take(pool.ctx, ?output[0], 4);
+    if (small.error.code != problem.OUTPUT_TOO_SMALL || small.found ||
+        !filled(?output[0], 0xcc, 16)) { ret 3; }
+    val taken: nonce.Taken = pool.take(pool.ctx, ?output[0], 16);
+    if (problem.failed(taken.error) || !taken.found || taken.value.len != 11) { ret 4; }
+    val exhausted: nonce.Taken = pool.take(pool.ctx, ?output[0], 16);
+    if (problem.failed(exhausted.error) || exhausted.found) { ret 5; }
+    ret 0;
+}
