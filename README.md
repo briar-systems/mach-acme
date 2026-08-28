@@ -47,6 +47,13 @@ ownership contract.
 - challenge selection and the RFC 8555 wildcard challenge rule
 - Retry-After-aware order polling with an absolute deadline, bounded
   exponential backoff, an attempt ceiling, cancellation, and terminal statuses
+- RFC 8555 key authorization derived from the account key, with HTTP-01 paths,
+  DNS-01 record names and digests, and the RFC 8737 TLS-ALPN-01 digest and
+  `acmeIdentifier` extension value
+- exactly-once challenge presentation and cleanup across success, failure,
+  timeout, and cancellation, with a same-thread reentrancy guard
+- bounded, injectable DNS propagation policy requiring consecutive
+  confirmations
 
 ## Protocol boundary
 
@@ -178,3 +185,34 @@ would pass the absolute deadline rather than truncating it, stops at an
 attempt ceiling, and reports cancellation and terminal statuses distinctly.
 Backoff doubles from the floor and saturates, so a long poll can never produce
 an unbounded or overflowing wait.
+
+## Challenges
+
+`challenge.key_authorization` derives the RFC 8555 section 8.1 value from the
+account key itself rather than accepting a thumbprint from the caller, so a
+challenge can never be answered with a key the account does not hold. From that
+one value the library produces the HTTP-01 path and body, the DNS-01 record
+name and `base64url(SHA-256(keyAuthorization))` value, and the RFC 8737
+TLS-ALPN-01 digest and `acmeIdentifier` extension octet string. A wildcard
+order is validated against its base domain, so a DNS-01 record name never
+carries the wildcard label.
+
+`challenge.Attempt` owns one presentation through one provider. Cleanup is owed
+exactly when presentation succeeded: a provider that declined the challenge is
+never asked to present, and a presentation that failed owes nothing.
+`challenge.finish` is the single exit for success, failure, timeout, and
+cancellation, so every path retires the provider's state once and only once.
+Calling it again is accepted and does not reach the provider a second time. The
+presentation and cleanup call counters are public, so exactly-once is observed
+rather than inferred. A provider that re-enters its own attempt from inside a
+callback is refused before it can move the attempt's state.
+
+Waiting for a published record to become observable is a caller policy.
+`challenge.Probe` is an injectable observation callback, so a deployment
+supplies a resolver and a test supplies a deterministic answer. Confirmations
+must be consecutive, so a record that appears and then disappears restarts the
+count rather than proceeding. The wait is bounded by the shared poll policy.
+
+`acme.poll` holds the one bounded wait policy that orders, challenges, and
+renewal share. It is status agnostic: callers reduce their own status to
+`reached` and `terminal` and keep their own vocabulary.
