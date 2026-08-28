@@ -71,7 +71,10 @@ select a JWK and retain a `kid`.
 
 A `nonce.Pool` owns copies of available nonces. The supplied memory implementation
 uses fixed caller storage and rejects empty, oversized, non-base64url, duplicate,
-and over-capacity values.
+and over-capacity values. Its `Memory`, slot array, and complete declared byte
+store must be mathematically representable and pairwise disjoint. Put inputs and
+take outputs cannot alias any of those regions. Alias and range failures occur
+before a nonce is copied, consumed, or wiped.
 
 The memory implementation serializes put, take, and clear operations with its
 embedded mutex. Initialization and release require exclusive ownership. Release
@@ -82,6 +85,16 @@ exhaustion fails closed until the pool is cleared.
 Taking a nonce copies it to caller storage and then wipes and retires its slot. The
 newest available nonce is selected. A small destination does not consume or modify
 the stored nonce. Clearing the pool wipes every slot.
+
+`Client` copies the `Pool` callback descriptor during initialization. The source
+descriptor therefore need not remain alive, but its `ctx` and the storage behind
+that context must remain valid until client release. Callback pointers, dimensions,
+and readiness are checked at initialization and every callback boundary. A take
+result is accepted only when it identifies the exact supplied output buffer, has a
+bounded nonzero base64url length, and is internally consistent with its error and
+`found` fields. Readiness, take, put, and clear callbacks must not mutate the bound
+`Client` or `SignedRequest`. Such mutation fails closed and is never overwritten by
+the protocol layer.
 
 `client.prepare_signed` consumes a normal pool nonce before signing. Once handed
 to an attempt, that nonce is never returned to the pool. A nonce reserved for a
@@ -131,7 +144,7 @@ state.
 
 `client.Limits` bounds request bodies, response bodies, problem bodies, URL and
 nonce lengths, JSON scratch, JSON depth, JSON values, JSON key lengths, CAA entries,
-problem subproblems, response header fields, retry count, and the transport
+duplicate-key comparison work, problem subproblems, response header fields, retry count, and the transport
 timeout policy value. The caller's actual buffers may set tighter bounds.
 
 `max_request_bytes` bounds the complete flattened JWS body, not only its raw
@@ -141,6 +154,12 @@ valid only while the caller keeps the accepted output buffer alive and unchanged
 Signing buffers and parser storage must also be disjoint from `Client`,
 `SignedRequest`, and nonce-pool state. Invalid aliases fail before a stored nonce
 is consumed or an awaiting request loses its exact prepared body.
+
+JSON number grammar is checked before the pinned tree parser is entered. Leading
+zeroes, truncated fractions or exponents, and integer parts outside the parser's
+signed 64-bit accumulation range are rejected. `max_json_key_comparisons` bounds
+decoded duplicate-member detection independently of byte and value limits, so a
+large object cannot turn a bounded response into unbounded quadratic work.
 
 Response bodies and fields need only remain alive for the accepting call, except
 that `Error.http.body` retains the supplied view. Directory and parsed problem views

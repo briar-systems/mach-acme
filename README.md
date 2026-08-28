@@ -19,11 +19,13 @@ ownership contract.
 - separate public signer metadata and caller-owned private keys
 - caller-provided entropy for RSA-PSS with explicit salt zeroization
 - bounded one-use replay nonce storage with deterministic newest-first selection
+- immutable nonce callback descriptors with fail-closed result and state validation
 - signed-request state and bounded per-request `badNonce` recovery
 - exact prepared-body binding with timeout and response bounds on every wire request
 - structured local, HTTP, and ACME problem causes
 - bounded structured ACME subproblems for multi-identifier failures
 - caller-owned JSON scratch, output storage, signing work, and wire buffers
+- strict numeric grammar and an explicit duplicate-key comparison-work bound
 
 ## Protocol boundary
 
