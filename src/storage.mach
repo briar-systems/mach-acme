@@ -48,12 +48,25 @@ pub val WRITE_EMPTY:     WriteState = 0;
 pub val WRITE_STAGED:    WriteState = 1;
 pub val WRITE_UNCERTAIN: WriteState = 2;
 
+pub def WriteKind: u8;
+
+pub val WRITE_SAVE:    WriteKind = 1;
+pub val WRITE_REPLACE: WriteKind = 2;
+
+pub def ActiveState: u8;
+
+pub val ACTIVE_IDLE:      ActiveState = 0;
+pub val ACTIVE_STAGED:    ActiveState = 1;
+pub val ACTIVE_WIRE:      ActiveState = 2;
+pub val ACTIVE_RECOVERED: ActiveState = 3;
+
 pub rec Write {
     error:       problem.Error;
     transaction: Transaction;
     candidate:   account.Credentials;
     digest:      [32]u8;
     state:       WriteState;
+    kind:        WriteKind;
     prepared:    bool;
 }
 
@@ -65,10 +78,32 @@ pub def StageFun: fun(ptr, Transaction, account.Credentials) Status;
 pub def FinishFun: fun(ptr, Transaction) Status;
 pub def LoadFun: fun(ptr, view.View, *Snapshot) Status;
 
+pub rec Gate {
+    callback_owner: i64;
+    last_token: u64;
+    active_transaction: Transaction;
+    active_digest: [32]u8;
+    active_state: ActiveState;
+    active_kind: WriteKind;
+    ctx: ptr;
+    context_anchor: *u8;
+    context_size: usize;
+    ready: ReadyFun;
+    aliases: AliasesFun;
+    owns_secret: OwnsSecretFun;
+    begin: BeginFun;
+    stage: StageFun;
+    commit: FinishFun;
+    abort: FinishFun;
+    load: LoadFun;
+    initialized: bool;
+}
+
 pub rec Store {
     ctx:         ptr;
     context_anchor: *u8;
     context_size: usize;
+    gate:        *Gate;
     ready:       ReadyFun;
     aliases:     AliasesFun;
     owns_secret: OwnsSecretFun;
@@ -80,21 +115,20 @@ pub rec Store {
 }
 
 pub rec Manager {
-    store:          Store;
-    callback_owner: i64;
-    last_token:     u64;
-    active_transaction: Transaction;
-    active_digest:  [32]u8;
-    active:         bool;
-    initialized:    bool;
+    store:       Store;
+    gate:        *Gate;
+    self_owner:  *Manager;
+    initialized: bool;
 }
 
 rec ManagerGuard {
     store: Store;
+    gate: *Gate;
     last_token: u64;
     active_transaction: Transaction;
     active_digest: [32]u8;
-    active: bool;
+    active_state: ActiveState;
+    active_kind: WriteKind;
     initialized: bool;
 }
 
@@ -103,7 +137,10 @@ fun store_shape(value: Store) bool {
         value.context_size != 0 &&
         memory_range.valid(value.context_anchor, value.context_size) &&
         memory_range.overlap(value.ctx::*u8, 1, value.context_anchor,
-            value.context_size) && value.ready:^ != nil &&
+            value.context_size) && value.gate != nil &&
+        memory_range.valid(value.gate::*u8, $size_of(Gate)) &&
+        memory_range.overlap(value.gate::*u8, $size_of(Gate),
+            value.context_anchor, value.context_size) && value.ready:^ != nil &&
         value.aliases:^ != nil &&
         value.owns_secret:^ != nil && value.begin:^ != nil &&
         value.stage:^ != nil && value.commit:^ != nil &&
@@ -114,12 +151,24 @@ fun store_same(first: Store, second: Store) bool {
     ret first.ctx == second.ctx &&
         first.context_anchor == second.context_anchor &&
         first.context_size == second.context_size &&
+        first.gate == second.gate &&
         first.ready:^ == second.ready:^ &&
         first.aliases:^ == second.aliases:^ &&
         first.owns_secret:^ == second.owns_secret:^ &&
         first.begin:^ == second.begin:^ && first.stage:^ == second.stage:^ &&
         first.commit:^ == second.commit:^ && first.abort:^ == second.abort:^ &&
         first.load:^ == second.load:^;
+}
+
+fun gate_same(value: *Gate, store: Store) bool {
+    ret value != nil && value.initialized && value.ctx == store.ctx &&
+        value.context_anchor == store.context_anchor &&
+        value.context_size == store.context_size &&
+        value.ready:^ == store.ready:^ && value.aliases:^ == store.aliases:^ &&
+        value.owns_secret:^ == store.owns_secret:^ &&
+        value.begin:^ == store.begin:^ && value.stage:^ == store.stage:^ &&
+        value.commit:^ == store.commit:^ && value.abort:^ == store.abort:^ &&
+        value.load:^ == store.load:^;
 }
 
 fun status_valid(value: Status) bool {
@@ -255,31 +304,47 @@ fun view_digest_same(value: view.View, expected: *u8) bool {
 
 fun manager_ready(manager: *Manager) bool {
     ret manager != nil && memory_range.valid(manager::*u8, $size_of(Manager)) &&
-        manager.initialized && store_shape(manager.store) &&
-        ((!manager.active && transaction_empty(manager.active_transaction)) ||
-        (manager.active && transaction_valid(manager.active_transaction,
-            manager.store, manager.active_transaction.generation) &&
-            manager.active_transaction.token == manager.last_token));
+        manager.initialized && manager.self_owner == manager &&
+        manager.gate == manager.store.gate && store_shape(manager.store) &&
+        gate_same(manager.gate, manager.store);
+}
+
+fun gate_state_valid(manager: *Manager) bool {
+    ret (manager.gate.active_state == ACTIVE_IDLE &&
+            transaction_empty(manager.gate.active_transaction) &&
+            manager.gate.active_kind == 0) ||
+        (manager.gate.active_state != ACTIVE_IDLE &&
+            (manager.gate.active_state == ACTIVE_STAGED ||
+            manager.gate.active_state == ACTIVE_WIRE ||
+            manager.gate.active_state == ACTIVE_RECOVERED) &&
+            (manager.gate.active_kind == WRITE_SAVE ||
+            manager.gate.active_kind == WRITE_REPLACE) &&
+            transaction_valid(manager.gate.active_transaction,
+                manager.store, manager.gate.active_transaction.generation));
 }
 
 fun guard(manager: *Manager) ManagerGuard {
     var result: ManagerGuard = ManagerGuard{store: manager.store,
-        last_token: manager.last_token,
-        active_transaction: manager.active_transaction,
-        active: manager.active, initialized: manager.initialized};
-    digest_copy(?manager.active_digest[0], ?result.active_digest[0]);
+        gate: manager.gate, last_token: manager.gate.last_token,
+        active_transaction: manager.gate.active_transaction,
+        active_state: manager.gate.active_state,
+        active_kind: manager.gate.active_kind, initialized: manager.initialized};
+    digest_copy(?manager.gate.active_digest[0], ?result.active_digest[0]);
     ret result;
 }
 
 fun manager_intact(manager: *Manager, before: ManagerGuard) bool {
     ret manager != nil && before.initialized && manager.initialized &&
-        store_same(before.store, manager.store) &&
-        manager.last_token == before.last_token &&
-        manager.active == before.active &&
-        transaction_same(manager.active_transaction,
+        manager.self_owner == manager && before.gate == manager.gate &&
+        store_same(before.store, manager.store) && gate_same(manager.gate,
+            manager.store) && manager.gate.last_token == before.last_token &&
+        manager.gate.active_state == before.active_state &&
+        manager.gate.active_kind == before.active_kind &&
+        transaction_same(manager.gate.active_transaction,
             before.active_transaction) &&
-        same_bytes(?manager.active_digest[0], ?before.active_digest[0], 32) &&
-        atomic.load(?manager.callback_owner) == os.thread_current_id();
+        same_bytes(?manager.gate.active_digest[0],
+            ?before.active_digest[0], 32) &&
+        atomic.load(?manager.gate.callback_owner) == os.thread_current_id();
 }
 
 fun enter(manager: *Manager) bool {
@@ -287,17 +352,24 @@ fun enter(manager: *Manager) bool {
     val owner: i64 = os.thread_current_id();
     if (owner <= 0) { ret false; }
     for (true) {
-        var expected: i64 = atomic.load(?manager.callback_owner);
+        var expected: i64 = atomic.load(?manager.gate.callback_owner);
         if (expected == owner) { ret false; }
-        if (expected == 0 && atomic.cas(?manager.callback_owner,
-                ?expected, owner)) { ret true; }
-        if (expected != 0) { os.thread_wait(?manager.callback_owner, expected); }
+        if (expected == 0 && atomic.cas(?manager.gate.callback_owner,
+                ?expected, owner)) {
+            if (gate_state_valid(manager)) { ret true; }
+            atomic.store(?manager.gate.callback_owner, 0);
+            os.thread_wake(?manager.gate.callback_owner);
+            ret false;
+        }
+        if (expected != 0) {
+            os.thread_wait(?manager.gate.callback_owner, expected);
+        }
     }
 }
 
 fun leave(manager: *Manager) {
-    atomic.store(?manager.callback_owner, 0);
-    os.thread_wake(?manager.callback_owner);
+    atomic.store(?manager.gate.callback_owner, 0);
+    os.thread_wake(?manager.gate.callback_owner);
 }
 
 fun storage_error(code: problem.Code, detail: *u8) problem.Error {
@@ -389,28 +461,32 @@ fun digest_copy(source: *u8, output: *u8) {
 }
 
 fun clear_active(manager: *Manager) {
-    manager.active_transaction.owner = nil;
-    manager.active_transaction.token = 0;
-    manager.active_transaction.generation = 0;
+    manager.gate.active_transaction.owner = nil;
+    manager.gate.active_transaction.token = 0;
+    manager.gate.active_transaction.generation = 0;
     var i: usize = 0;
     for (i < 32) {
-        manager.active_digest[i] = 0;
+        manager.gate.active_digest[i] = 0;
         i = i + 1;
     }
-    manager.active = false;
+    manager.gate.active_state = ACTIVE_IDLE;
+    manager.gate.active_kind = 0;
 }
 
-fun set_active(manager: *Manager, transaction: Transaction, digest: *u8) {
-    manager.active_transaction = transaction;
-    digest_copy(digest, ?manager.active_digest[0]);
-    manager.active = true;
+fun set_active(manager: *Manager, transaction: Transaction, digest: *u8,
+    kind: WriteKind, state: ActiveState) {
+    manager.gate.active_transaction = transaction;
+    digest_copy(digest, ?manager.gate.active_digest[0]);
+    manager.gate.active_kind = kind;
+    manager.gate.active_state = state;
 }
 
 fun active_matches(manager: *Manager, transaction: Transaction,
-    digest: *u8) bool {
-    ret manager.active &&
-        transaction_same(manager.active_transaction, transaction) &&
-        same_bytes(?manager.active_digest[0], digest, 32);
+    digest: *u8, kind: WriteKind) bool {
+    ret manager.gate.active_state != ACTIVE_IDLE &&
+        manager.gate.active_kind == kind &&
+        transaction_same(manager.gate.active_transaction, transaction) &&
+        same_bytes(?manager.gate.active_digest[0], digest, 32);
 }
 
 fun credentials_owned(store: Store, value: account.Credentials) bool {
@@ -438,13 +514,23 @@ fun credentials_owned(store: Store, value: account.Credentials) bool {
         store.aliases(store.ctx, key.rsa.exponent.data, key.rsa.exponent.len);
 }
 
+fun credentials_disjoint_control(manager: *Manager,
+    value: account.Credentials) bool {
+    ret !account.credentials_overlap(value, manager::*u8,
+            $size_of(Manager)) &&
+        !account.credentials_overlap(value, manager.gate::*u8,
+            $size_of(Gate));
+}
+
 fun write_value(error: problem.Error, transaction: Transaction,
-    candidate: account.Credentials, digest: *u8, state: WriteState) Write {
+    candidate: account.Credentials, digest: *u8, state: WriteState,
+    kind: WriteKind) Write {
     var result: Write;
     result.error = error;
     result.transaction = transaction;
     result.candidate = candidate;
     result.state = state;
+    result.kind = kind;
     result.prepared = state == WRITE_STAGED;
     if (digest != nil) { digest_copy(digest, ?result.digest[0]); }
     ret result;
@@ -457,7 +543,10 @@ fun empty_write(detail: *u8) Write {
     result.transaction.owner = nil;
     result.transaction.token = 0;
     result.transaction.generation = 0;
+    var empty_candidate: account.Credentials;
+    result.candidate = empty_candidate;
     result.state = WRITE_EMPTY;
+    result.kind = 0;
     result.prepared = false;
     var i: usize = 0;
     for (i < 32) {
@@ -471,14 +560,57 @@ pub fun init_manager(manager: *Manager, value: Store) problem.Error {
     if (manager == nil || !memory_range.valid(manager::*u8, $size_of(Manager)) ||
         manager.initialized || !store_shape(value) ||
         memory_range.overlap(manager::*u8, $size_of(Manager),
-            value.context_anchor, value.context_size)) {
+            value.context_anchor, value.context_size) ||
+        memory_range.overlap(manager::*u8, $size_of(Manager),
+            value.gate::*u8, $size_of(Gate))) {
         ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
             "invalid account store");
     }
+    val owner: i64 = os.thread_current_id();
+    if (owner <= 0) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid account store");
+    }
+    var expected: i64 = atomic.load(?value.gate.callback_owner);
+    if (expected == owner || (expected != 0 && !value.gate.initialized)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "account store gate is initializing");
+    }
+    if (!value.gate.initialized) {
+        if (!atomic.cas(?value.gate.callback_owner, ?expected, owner)) {
+            ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+                "account store gate is initializing");
+        }
+        value.gate.last_token = 0;
+        value.gate.active_transaction.owner = nil;
+        value.gate.active_transaction.token = 0;
+        value.gate.active_transaction.generation = 0;
+        var i: usize = 0;
+        for (i < 32) { value.gate.active_digest[i] = 0; i = i + 1; }
+        value.gate.active_state = ACTIVE_IDLE;
+        value.gate.active_kind = 0;
+        value.gate.ctx = value.ctx;
+        value.gate.context_anchor = value.context_anchor;
+        value.gate.context_size = value.context_size;
+        value.gate.ready = value.ready;
+        value.gate.aliases = value.aliases;
+        value.gate.owns_secret = value.owns_secret;
+        value.gate.begin = value.begin;
+        value.gate.stage = value.stage;
+        value.gate.commit = value.commit;
+        value.gate.abort = value.abort;
+        value.gate.load = value.load;
+        value.gate.initialized = true;
+        atomic.store(?value.gate.callback_owner, 0);
+        os.thread_wake(?value.gate.callback_owner);
+    }
+    if (!gate_same(value.gate, value)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "account store gate has a different provider binding");
+    }
     manager.store = value;
-    manager.callback_owner = 0;
-    manager.last_token = 0;
-    clear_active(manager);
+    manager.gate = value.gate;
+    manager.self_owner = manager;
     manager.initialized = true;
     if (!enter(manager)) {
         manager.initialized = false;
@@ -505,6 +637,8 @@ pub fun init_manager(manager: *Manager, value: Store) problem.Error {
     if (!ready || !intact || manager_owned || !context_owned) {
         var empty: Store;
         manager.store = empty;
+        manager.gate = nil;
+        manager.self_owner = nil;
         manager.initialized = false;
         ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
             "invalid account store");
@@ -544,12 +678,14 @@ pub fun range_disjoint(manager: *Manager, data: *u8,
     ret problem.none();
 }
 
-fun snapshot_shape(value: Snapshot, account_url: view.View, store: Store,
-    transient: *Snapshot, output: *Snapshot) bool {
+fun snapshot_shape(manager: *Manager, value: Snapshot,
+    account_url: view.View, store: Store, transient: *Snapshot,
+    output: *Snapshot) bool {
     if (value.status != SUCCESS && value.status != NOT_FOUND) { ret false; }
     if (value.status == NOT_FOUND) {
         if (!value.has_pending) { ret transaction_empty(value.transaction); }
         ret account.credentials_valid(value.pending) &&
+            credentials_disjoint_control(manager, value.pending) &&
             value.pending.generation == 1 &&
             value.pending.account.url.len == account_url.len &&
             same_bytes(value.pending.account.url.data, account_url.data,
@@ -561,6 +697,7 @@ fun snapshot_shape(value: Snapshot, account_url: view.View, store: Store,
                 $size_of(Snapshot));
     }
     if (!account.credentials_valid(value.current) ||
+        !credentials_disjoint_control(manager, value.current) ||
         value.current.account.url.len != account_url.len ||
         !same_bytes(value.current.account.url.data, account_url.data,
             account_url.len) ||
@@ -570,6 +707,7 @@ fun snapshot_shape(value: Snapshot, account_url: view.View, store: Store,
             $size_of(Snapshot))) { ret false; }
     if (!value.has_pending) { ret transaction_empty(value.transaction); }
     ret account.credentials_valid(value.pending) &&
+        credentials_disjoint_control(manager, value.pending) &&
         ((value.pending.generation == value.current.generation &&
             value.pending.secret_owner == value.current.secret_owner &&
             signer_same(value.pending.signer, value.current.signer) &&
@@ -588,7 +726,8 @@ fun snapshot_shape(value: Snapshot, account_url: view.View, store: Store,
 fun validate_snapshot_locked(manager: *Manager, state: ManagerGuard,
     account_url: view.View, candidate: *Snapshot, output: *Snapshot) bool {
     val before: Store = state.store;
-    if (!snapshot_shape(@candidate, account_url, before, candidate, output)) {
+    if (!snapshot_shape(manager, @candidate, account_url, before,
+            candidate, output)) {
         ret false;
     }
     val status_before: Status = candidate.status;
@@ -617,7 +756,8 @@ fun validate_snapshot_locked(manager: *Manager, state: ManagerGuard,
             !credentials_descriptor_same(candidate.current, current_before)) ||
         (candidate.has_pending && !credentials_descriptor_same(
             candidate.pending, pending_value_before)) ||
-        !snapshot_shape(@candidate, account_url, before, candidate, output) ||
+        !snapshot_shape(manager, @candidate, account_url, before,
+            candidate, output) ||
         (candidate.status == SUCCESS &&
             !digest_same(candidate.current, ?current_digest[0])) ||
         (candidate.has_pending &&
@@ -631,7 +771,8 @@ fun validate_snapshot_locked(manager: *Manager, state: ManagerGuard,
             credentials_descriptor_same(candidate.current, current_before)) &&
         (!candidate.has_pending || credentials_descriptor_same(
             candidate.pending, pending_value_before)) &&
-        snapshot_shape(@candidate, account_url, before, candidate, output) &&
+        snapshot_shape(manager, @candidate, account_url, before,
+            candidate, output) &&
         (candidate.status != SUCCESS ||
             digest_same(candidate.current, ?current_digest[0])) &&
         (!candidate.has_pending ||
@@ -653,7 +794,11 @@ pub fun recover(manager: *Manager, account_url: view.View,
             "invalid account recovery request");
     }
     var url_digest: [32]u8;
-    if (!view_digest(account_url, ?url_digest[0]) || !enter(manager)) {
+    var output_digest: [32]u8;
+    val output_before: Snapshot = @output;
+    if (!view_digest(account_url, ?url_digest[0]) ||
+        !view_digest(view.view(output::*u8, $size_of(Snapshot)),
+            ?output_digest[0]) || !enter(manager)) {
         ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
             "account store callback is reentrant");
     }
@@ -668,8 +813,11 @@ pub fun recover(manager: *Manager, account_url: view.View,
         intact = manager_intact(manager, state);
     }
     if (!ready || !intact || output_owned ||
-        !view_digest_same(account_url, ?url_digest[0])) {
+        !view_digest_same(account_url, ?url_digest[0]) ||
+        !view_digest_same(view.view(output::*u8, $size_of(Snapshot)),
+            ?output_digest[0])) {
         leave(manager);
+        @output = output_before;
         ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
             "invalid account recovery storage");
     }
@@ -677,40 +825,61 @@ pub fun recover(manager: *Manager, account_url: view.View,
     val loaded: Status = before.load(before.ctx, account_url, ?candidate);
     if (!manager_intact(manager, state) || !status_valid(loaded) ||
         candidate.status != loaded ||
-        !view_digest_same(account_url, ?url_digest[0])) {
+        !view_digest_same(account_url, ?url_digest[0]) ||
+        !view_digest_same(view.view(output::*u8, $size_of(Snapshot)),
+            ?output_digest[0])) {
         leave(manager);
+        @output = output_before;
         ret storage_error(problem.INVALID_STATE,
             "account store returned an invalid recovery result");
     }
     if (loaded != SUCCESS && loaded != NOT_FOUND) {
         leave(manager);
+        @output = output_before;
         ret status_error(loaded, "account recovery failed");
     }
     var valid: bool = validate_snapshot_locked(manager, state,
         account_url, ?candidate, output) &&
-        view_digest_same(account_url, ?url_digest[0]);
+        view_digest_same(account_url, ?url_digest[0]) &&
+        view_digest_same(view.view(output::*u8, $size_of(Snapshot)),
+            ?output_digest[0]);
     var pending_digest: [32]u8;
+    var pending_kind: WriteKind = 0;
     if (valid && candidate.has_pending) {
+        if (candidate.status == NOT_FOUND ||
+            candidate.pending.generation == candidate.current.generation) {
+            pending_kind = WRITE_SAVE;
+        } or { pending_kind = WRITE_REPLACE; }
         valid = credentials_digest(candidate.pending, ?pending_digest[0]) &&
-            ((!manager.active && (manager.last_token == 0 ||
-                candidate.transaction.token > manager.last_token)) ||
+            ((manager.gate.active_state == ACTIVE_IDLE &&
+                (manager.gate.last_token == 0 ||
+                candidate.transaction.token > manager.gate.last_token)) ||
             active_matches(manager, candidate.transaction,
-                ?pending_digest[0]));
+                ?pending_digest[0], pending_kind)) &&
+            view_digest_same(view.view(output::*u8, $size_of(Snapshot)),
+                ?output_digest[0]);
     }
-    if (valid && candidate.has_pending && !manager.active) {
-        manager.last_token = candidate.transaction.token;
-        set_active(manager, candidate.transaction, ?pending_digest[0]);
+    if (valid && candidate.has_pending &&
+        manager.gate.active_state == ACTIVE_IDLE) {
+        manager.gate.last_token = candidate.transaction.token;
+        set_active(manager, candidate.transaction, ?pending_digest[0],
+            pending_kind, ACTIVE_RECOVERED);
     } or (valid && !candidate.has_pending) {
         clear_active(manager);
     }
     leave(manager);
     if (!valid) {
+        @output = output_before;
         ret storage_error(problem.INVALID_STATE,
             "account store returned an invalid recovery result");
     }
     if (loaded == NOT_FOUND && !candidate.has_pending) {
         var missing: Snapshot;
         missing.status = NOT_FOUND;
+        var empty_current: account.Credentials;
+        var empty_pending: account.Credentials;
+        missing.current = empty_current;
+        missing.pending = empty_pending;
         missing.has_pending = false;
         missing.transaction.owner = nil;
         missing.transaction.token = 0;
@@ -731,8 +900,11 @@ pub fun resume(value: Snapshot) Write {
     if (!credentials_digest(value.pending, ?digest[0])) {
         ret empty_write("snapshot pending credential is invalid");
     }
+    var kind: WriteKind = WRITE_SAVE;
+    if (value.status == SUCCESS && value.pending.generation !=
+        value.current.generation) { kind = WRITE_REPLACE; }
     ret write_value(problem.none(), value.transaction, value.pending,
-        ?digest[0], WRITE_STAGED);
+        ?digest[0], WRITE_STAGED, kind);
 }
 
 fun cleanup_locked(manager: *Manager, state: ManagerGuard,
@@ -750,16 +922,16 @@ fun cleanup_locked(manager: *Manager, state: ManagerGuard,
 
 fun begin_failure(manager: *Manager, state: ManagerGuard,
     transaction: Transaction, candidate: account.Credentials, digest: *u8,
-    detail: *u8) Write {
+    kind: WriteKind, detail: *u8) Write {
     val aborted: Status = cleanup_locked(manager, state, transaction);
     if (aborted == SUCCESS) {
         clear_active(manager);
         ret empty_write(detail);
     }
-    set_active(manager, transaction, digest);
+    set_active(manager, transaction, digest, kind, ACTIVE_RECOVERED);
     ret write_value(status_error(aborted,
         "credential transaction cleanup requires recovery"), transaction,
-        candidate, digest, WRITE_UNCERTAIN);
+        candidate, digest, WRITE_UNCERTAIN, kind);
 }
 
 pub fun begin_replace(manager: *Manager, current: account.Credentials,
@@ -767,13 +939,15 @@ pub fun begin_replace(manager: *Manager, current: account.Credentials,
     var failed_result: Write = empty_write("invalid credential replacement");
     if (!manager_ready(manager) || !enter(manager)) { ret failed_result; }
     val before: Store = manager.store;
-    var token: u64 = manager.last_token;
+    var token: u64 = manager.gate.last_token;
     var state: ManagerGuard = guard(manager);
     val ready: bool = before.ready(before.ctx);
     if (!ready || !manager_intact(manager, state) ||
-        manager.active ||
+        manager.gate.active_state != ACTIVE_IDLE ||
         !account.credentials_valid(current) ||
         !account.credentials_valid(replacement) ||
+        !credentials_disjoint_control(manager, current) ||
+        !credentials_disjoint_control(manager, replacement) ||
         current.generation == 0xffffffffffffffff ||
         replacement.generation != current.generation + 1 ||
         !account.same(current.account, replacement.account)) {
@@ -817,12 +991,12 @@ pub fun begin_replace(manager: *Manager, current: account.Credentials,
         var result: Write = failed_result;
         if (transaction_valid(begun.transaction, before, current.generation)) {
             if (begun.transaction.token > token) {
-                manager.last_token = begun.transaction.token;
-                token = manager.last_token;
+                manager.gate.last_token = begun.transaction.token;
+                token = manager.gate.last_token;
                 state = guard(manager);
             }
             result = begin_failure(manager, state, begun.transaction,
-                replacement, ?replacement_digest[0],
+                replacement, ?replacement_digest[0], WRITE_REPLACE,
                 "account store returned a transaction with failure status");
         } or (transaction_empty(begun.transaction)) {
             result.error = status_error(begun.status,
@@ -838,15 +1012,15 @@ pub fun begin_replace(manager: *Manager, current: account.Credentials,
         transaction_valid(begun.transaction, before, current.generation) &&
         begun.transaction.token > token;
     if (usable_transaction && manager_intact(manager, state)) {
-        manager.last_token = begun.transaction.token;
-        token = manager.last_token;
+        manager.gate.last_token = begun.transaction.token;
+        token = manager.gate.last_token;
         state = guard(manager);
     }
     if (!valid || !usable_transaction) {
         var result: Write = failed_result;
         if (transaction_valid(begun.transaction, before, current.generation)) {
             result = begin_failure(manager, state, begun.transaction,
-                replacement, ?replacement_digest[0],
+                replacement, ?replacement_digest[0], WRITE_REPLACE,
                 "credential transaction changed its inputs");
         }
         leave(manager);
@@ -872,14 +1046,16 @@ pub fun begin_replace(manager: *Manager, current: account.Credentials,
     if (!valid || staged != SUCCESS) {
         val result: Write = begin_failure(manager, state,
             begun.transaction, replacement, ?replacement_digest[0],
+            WRITE_REPLACE,
             "credential replacement was rejected");
         leave(manager);
         ret result;
     }
-    set_active(manager, begun.transaction, ?replacement_digest[0]);
+    set_active(manager, begun.transaction, ?replacement_digest[0],
+        WRITE_REPLACE, ACTIVE_STAGED);
     leave(manager);
     ret write_value(problem.none(), begun.transaction, replacement,
-        ?replacement_digest[0], WRITE_STAGED);
+        ?replacement_digest[0], WRITE_STAGED, WRITE_REPLACE);
 }
 
 pub fun begin_save(manager: *Manager, expected_generation: u64,
@@ -887,12 +1063,13 @@ pub fun begin_save(manager: *Manager, expected_generation: u64,
     var failed_result: Write = empty_write("invalid account credential save");
     if (!manager_ready(manager) || !enter(manager)) { ret failed_result; }
     val before: Store = manager.store;
-    var token: u64 = manager.last_token;
+    var token: u64 = manager.gate.last_token;
     var state: ManagerGuard = guard(manager);
     val ready: bool = before.ready(before.ctx);
     if (!ready || !manager_intact(manager, state) ||
-        manager.active ||
+        manager.gate.active_state != ACTIVE_IDLE ||
         !account.credentials_valid(candidate) ||
+        !credentials_disjoint_control(manager, candidate) ||
         (expected_generation == 0 && candidate.generation != 1) ||
         (expected_generation != 0 && candidate.generation != expected_generation)) {
         leave(manager);
@@ -921,12 +1098,12 @@ pub fun begin_save(manager: *Manager, expected_generation: u64,
         if (transaction_valid(begun.transaction, before,
                 expected_generation)) {
             if (begun.transaction.token > token) {
-                manager.last_token = begun.transaction.token;
-                token = manager.last_token;
+                manager.gate.last_token = begun.transaction.token;
+                token = manager.gate.last_token;
                 state = guard(manager);
             }
             result = begin_failure(manager, state, begun.transaction,
-                candidate, ?candidate_digest[0],
+                candidate, ?candidate_digest[0], WRITE_SAVE,
                 "account store returned a transaction with failure status");
         } or (transaction_empty(begun.transaction)) {
             result.error = status_error(begun.status,
@@ -942,8 +1119,8 @@ pub fun begin_save(manager: *Manager, expected_generation: u64,
         transaction_valid(begun.transaction, before, expected_generation) &&
         begun.transaction.token > token;
     if (usable_transaction && manager_intact(manager, state)) {
-        manager.last_token = begun.transaction.token;
-        token = manager.last_token;
+        manager.gate.last_token = begun.transaction.token;
+        token = manager.gate.last_token;
         state = guard(manager);
     }
     if (!valid || !usable_transaction) {
@@ -951,7 +1128,7 @@ pub fun begin_save(manager: *Manager, expected_generation: u64,
         if (transaction_valid(begun.transaction, before,
                 expected_generation)) {
             result = begin_failure(manager, state, begun.transaction,
-                candidate, ?candidate_digest[0],
+                candidate, ?candidate_digest[0], WRITE_SAVE,
                 "account credential transaction changed its inputs");
         }
         leave(manager);
@@ -969,54 +1146,161 @@ pub fun begin_save(manager: *Manager, expected_generation: u64,
     }
     if (!valid || staged != SUCCESS) {
         val result: Write = begin_failure(manager, state,
-            begun.transaction, candidate, ?candidate_digest[0],
+            begun.transaction, candidate, ?candidate_digest[0], WRITE_SAVE,
             "account credential save was rejected");
         leave(manager);
         ret result;
     }
-    set_active(manager, begun.transaction, ?candidate_digest[0]);
+    set_active(manager, begun.transaction, ?candidate_digest[0], WRITE_SAVE,
+        ACTIVE_STAGED);
     leave(manager);
     ret write_value(problem.none(), begun.transaction, candidate,
-        ?candidate_digest[0], WRITE_STAGED);
+        ?candidate_digest[0], WRITE_STAGED, WRITE_SAVE);
 }
 
-fun pending_matches_locked(manager: *Manager, state: ManagerGuard,
-    value: Write) bool {
+fun write_valid(manager: *Manager, value: Write) bool {
+    ret manager_ready(manager) && !problem.failed(value.error) &&
+        value.state == WRITE_STAGED && value.prepared &&
+        (value.kind == WRITE_SAVE || value.kind == WRITE_REPLACE) &&
+        account.credentials_valid(value.candidate) &&
+        credentials_disjoint_control(manager, value.candidate) &&
+        digest_same(value.candidate, ?value.digest[0]) &&
+        transaction_valid(value.transaction, manager.store,
+            value.transaction.generation);
+}
+
+fun pending_error_locked(manager: *Manager, state: ManagerGuard,
+    value: Write) problem.Error {
     val before: Store = state.store;
+    if (!manager_intact(manager, state)) {
+        ret storage_error(problem.STORAGE_UNKNOWN,
+            "account store changed during pending-state validation");
+    }
+    val ready: bool = before.ready(before.ctx);
+    if (!ready || !manager_intact(manager, state)) {
+        ret storage_error(problem.STORAGE_FAILED,
+            "account store is not ready to validate pending state");
+    }
     var snapshot: Snapshot;
     val loaded: Status = before.load(before.ctx, value.candidate.account.url,
         ?snapshot);
-    if (!manager_intact(manager, state) ||
-        (loaded != SUCCESS && loaded != NOT_FOUND) || snapshot.status != loaded ||
-        !validate_snapshot_locked(manager, state,
-            value.candidate.account.url, ?snapshot, ?snapshot) ||
-        !snapshot.has_pending ||
+    if (!manager_intact(manager, state) || !status_valid(loaded) ||
+        snapshot.status != loaded) {
+        ret storage_error(problem.STORAGE_UNKNOWN,
+            "account store returned an invalid pending-state result");
+    }
+    if (loaded != SUCCESS && loaded != NOT_FOUND) {
+        ret status_error(loaded, "pending credential lookup failed");
+    }
+    if (!validate_snapshot_locked(manager, state,
+            value.candidate.account.url, ?snapshot, ?snapshot)) {
+        ret storage_error(problem.INVALID_STATE,
+            "account store returned invalid pending state");
+    }
+    if (!snapshot.has_pending ||
         !transaction_same(snapshot.transaction, value.transaction) ||
         !digest_same(snapshot.pending, ?value.digest[0]) ||
         !digest_same(value.candidate, ?value.digest[0]) ||
         !active_matches(manager, value.transaction,
-            ?value.digest[0])) { ret false; }
-    ret true;
+            ?value.digest[0], value.kind)) {
+        ret storage_error(problem.STORAGE_CONFLICT,
+            "prepared credential no longer matches durable pending state");
+    }
+    ret problem.none();
 }
 
-pub fun commit_write(manager: *Manager, value: Write) problem.Error {
-    if (!manager_ready(manager) || problem.failed(value.error) ||
-        value.state != WRITE_STAGED || !value.prepared ||
-        !account.credentials_valid(value.candidate) ||
-        !digest_same(value.candidate, ?value.digest[0]) ||
-        !transaction_valid(value.transaction, manager.store,
-            value.transaction.generation) || !enter(manager)) {
+pub fun check_write(manager: *Manager, value: Write) problem.Error {
+    if (!write_valid(manager, value) || !enter(manager)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid prepared credential write");
+    }
+    val result: problem.Error = pending_error_locked(manager,
+        guard(manager), value);
+    leave(manager);
+    ret result;
+}
+
+pub fun bind_replace(manager: *Manager, value: Write) problem.Error {
+    if (!write_valid(manager, value) || value.kind != WRITE_REPLACE ||
+        !enter(manager)) {
         ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
             "invalid prepared credential replacement");
     }
-    val before: Store = manager.store;
     val state: ManagerGuard = guard(manager);
-    val ready: bool = before.ready(before.ctx);
-    if (!ready || !manager_intact(manager, state) ||
-        !pending_matches_locked(manager, state, value)) {
+    if (state.active_state != ACTIVE_STAGED ||
+        !active_matches(manager, value.transaction, ?value.digest[0],
+            WRITE_REPLACE)) {
         leave(manager);
         ret storage_error(problem.STORAGE_CONFLICT,
-            "prepared credential no longer matches durable pending state");
+            "credential replacement is not available for a request");
+    }
+    val result: problem.Error = pending_error_locked(manager, state, value);
+    if (!problem.failed(result)) { manager.gate.active_state = ACTIVE_WIRE; }
+    leave(manager);
+    ret result;
+}
+
+pub fun unbind_replace(manager: *Manager, value: Write) problem.Error {
+    if (!write_valid(manager, value) || value.kind != WRITE_REPLACE ||
+        !enter(manager)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid credential replacement request binding");
+    }
+    if (manager.gate.active_state != ACTIVE_WIRE ||
+        !active_matches(manager, value.transaction, ?value.digest[0],
+            WRITE_REPLACE)) {
+        leave(manager);
+        ret storage_error(problem.STORAGE_CONFLICT,
+            "credential replacement request is not active");
+    }
+    manager.gate.active_state = ACTIVE_STAGED;
+    leave(manager);
+    ret problem.none();
+}
+
+pub fun authorize_recovered_replace(manager: *Manager,
+    value: Write) problem.Error {
+    if (!write_valid(manager, value) || value.kind != WRITE_REPLACE ||
+        !enter(manager)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid recovered credential replacement");
+    }
+    val state: ManagerGuard = guard(manager);
+    if ((state.active_state != ACTIVE_RECOVERED &&
+            state.active_state != ACTIVE_WIRE) ||
+        !active_matches(manager, value.transaction, ?value.digest[0],
+            WRITE_REPLACE)) {
+        leave(manager);
+        ret storage_error(problem.STORAGE_CONFLICT,
+            "recovered credential replacement is not pending");
+    }
+    val result: problem.Error = pending_error_locked(manager, state, value);
+    if (!problem.failed(result)) { manager.gate.active_state = ACTIVE_WIRE; }
+    leave(manager);
+    ret result;
+}
+
+pub fun commit_write(manager: *Manager, value: Write) problem.Error {
+    if (!write_valid(manager, value) || !enter(manager)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid prepared credential write");
+    }
+    val before: Store = manager.store;
+    val state: ManagerGuard = guard(manager);
+    val state_valid: bool = (value.kind == WRITE_SAVE &&
+            (state.active_state == ACTIVE_STAGED ||
+            state.active_state == ACTIVE_RECOVERED)) ||
+        (value.kind == WRITE_REPLACE && state.active_state == ACTIVE_WIRE);
+    if (!state_valid) {
+        leave(manager);
+        ret storage_error(problem.STORAGE_CONFLICT,
+            "prepared credential is not authorized for commit");
+    }
+    val pending_error: problem.Error = pending_error_locked(manager,
+        state, value);
+    if (problem.failed(pending_error)) {
+        leave(manager);
+        ret pending_error;
     }
     val status: Status = before.commit(before.ctx, value.transaction);
     val valid: bool = manager_intact(manager, state) &&
@@ -1035,8 +1319,10 @@ pub fun commit_write(manager: *Manager, value: Write) problem.Error {
 pub fun abort_write(manager: *Manager, value: Write) problem.Error {
     if (!manager_ready(manager) ||
         (value.state != WRITE_STAGED && value.state != WRITE_UNCERTAIN) ||
+        (value.kind != WRITE_SAVE && value.kind != WRITE_REPLACE) ||
         (value.state == WRITE_STAGED && (!value.prepared ||
             !account.credentials_valid(value.candidate) ||
+            !credentials_disjoint_control(manager, value.candidate) ||
             !digest_same(value.candidate, ?value.digest[0]))) ||
         !transaction_valid(value.transaction, manager.store,
             value.transaction.generation) || !enter(manager)) {
@@ -1046,17 +1332,24 @@ pub fun abort_write(manager: *Manager, value: Write) problem.Error {
     val before: Store = manager.store;
     val state: ManagerGuard = guard(manager);
     val ready: bool = before.ready(before.ctx);
-    if (!ready || !manager_intact(manager, state) ||
-        !active_matches(manager, value.transaction, ?value.digest[0])) {
+    if (!ready || !manager_intact(manager, state)) {
         leave(manager);
-        ret storage_error(problem.STORAGE_UNKNOWN,
+        ret storage_error(problem.STORAGE_FAILED,
             "account store is not ready to abort");
     }
-    if (value.state == WRITE_STAGED &&
-        !pending_matches_locked(manager, state, value)) {
+    if (!active_matches(manager, value.transaction, ?value.digest[0],
+            value.kind)) {
         leave(manager);
         ret storage_error(problem.STORAGE_CONFLICT,
-            "prepared credential no longer matches durable pending state");
+            "credential transaction is not active");
+    }
+    if (value.state == WRITE_STAGED) {
+        val pending_error: problem.Error = pending_error_locked(manager,
+            state, value);
+        if (problem.failed(pending_error)) {
+            leave(manager);
+            ret pending_error;
+        }
     }
     val status: Status = before.abort(before.ctx, value.transaction);
     val valid: bool = manager_intact(manager, state) &&

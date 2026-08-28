@@ -123,7 +123,11 @@ private-key owner, and nonzero generation. The opaque identity allows a secret
 provider to retain every supported private-key shape without exposing a public
 pointer to secret storage.
 
-`storage.Manager` wraps an application durable store. A replacement transaction
+`storage.Manager` wraps an application durable store. Each store supplies a
+`storage.Gate` inside its provider context. All managers for that store share the
+gate, so callback serialization and the one-active-transaction rule hold across
+manager instances. Managers are location-bound and copying one invalidates the
+copy. A replacement transaction
 checks the expected credential generation, stages the complete next credential,
 then commits or aborts by an exact provider token and credential digest. The
 manager admits one active transaction and rejects forged, stale, or reused writes.
@@ -132,7 +136,9 @@ Commit and abort distinguish `STORAGE_CONFLICT`, `STORAGE_FAILED`, and
 any pending replacement, registers that exact transaction in a fresh manager, and
 allows restart and ambiguous wire outcomes to be reconciled without guessing
 which key is active. `storage.resume` converts a validated pending snapshot to the
-write accepted by commit or abort.
+exact write accepted by the remaining lifecycle operation. Same-generation saves
+may commit while staged or recovered. Next-generation replacements may commit
+only after a wire attempt or explicit recovered-replacement authorization.
 
 `storage.begin_save` uses expected generation zero for the first account record
 and the current generation for contact, terms, status, or other account metadata
@@ -142,7 +148,9 @@ initial save is recoverable as a pending generation-one credential even though n
 current record exists yet.
 
 Each `storage.Store` declares the complete representable provider context through
-`context_anchor` and `context_size`, with `ctx` located inside that range. The
+`context_anchor` and `context_size`, with both `ctx` and the zero-initialized
+`gate` located inside that range. The first manager permanently binds the gate to
+the complete callback descriptor. The
 provider must classify that complete range as owned and must never classify the
 manager, caller outputs, rollover work, or rollover output as owned. Transaction
 tokens are nonzero, globally monotonic for the lifetime of the durable store, and
@@ -151,7 +159,8 @@ an active transaction. `abort` must accept it before or after staging. Only
 `SUCCESS` proves rollback. Any other status leaves recovery responsible for the
 transaction.
 
-Every store callback is serialized. Same-thread reentrancy is rejected before a
+Every store callback is serialized through the provider's shared gate.
+Same-thread reentrancy is rejected before a
 nested callback can run. The callback descriptor is snapshotted, so direct
 mutation cannot redirect a later validation or cleanup call. Readiness, opaque
 secret ownership classification, exact credential descriptors and digests,
@@ -167,13 +176,20 @@ JWK, then signs a nonce-free nested JWS with the new ES256, EdDSA, or PS256 key.
 The prepared value binds the exact nested JWS bytes, both endpoint URLs, both old
 and replacement key thumbprints, the complete replacement credential, and the
 credential generation. Identical old and replacement keys are rejected.
-`key_change.begin_outer` submits that object under the old account `kid` and binds
-the outer request to the old signer. Accepted responses commit, rejected responses
+`key_change.begin_outer` takes the storage manager, consumes the exact staged
+replacement, submits that object under the old account `kid`, and binds the outer
+request to the old signer. A local client-begin failure returns the replacement to
+the staged state. Accepted responses commit, rejected responses
 abort, and ambiguous outcomes retain the pending transaction for explicit
 recovery. Work and output are proven disjoint from the complete store context and
 manager before and after staging. A local encoding or signing failure requests an
 abort before any nested JWS is published. If rollback is not proven successful,
 the exact transaction remains recoverable.
+
+The conformance suite includes an atomic filesystem-backed account store. It
+verifies restart recovery, persisted monotonic transaction tokens, exact pending
+writes, and rejection of truncated durable records without publishing a partially
+modified recovery output.
 
 ## Replay nonce ownership
 

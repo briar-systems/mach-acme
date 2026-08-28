@@ -88,7 +88,10 @@ mach test test/protocol --profile release
 `account.encode` creates each RFC 8555 account payload. `account.begin` selects
 JWK authentication for creation and lookup and account URL authentication for
 updates. `account.parse` validates a successful account representation into
-caller-owned text and contact storage.
+caller-owned text and contact storage. Encoding measures the complete bounded
+request before writing directly to caller output, so every admitted 64-contact,
+4096-byte-per-contact request is representable. Contact values use strict URI
+syntax, including complete percent escapes and constrained `mailto` addresses.
 `storage.begin_save` stages the first account credential or a same-generation
 account metadata update through the durable transaction boundary.
 
@@ -101,11 +104,14 @@ untrusted JSON, and `account.begin` binds the outer request to the same signer.
 
 Key rollover starts with `key_change.prepare`. It durably stages the replacement
 through `storage.Manager`, signs the inner JWS with the new key, and returns the
-nested payload for an outer request signed by the old account key. An accepted
+nested payload for an outer request signed by the old account key.
+`key_change.begin_outer` consumes that exact prepared replacement through the
+provider-owned storage gate before it creates the old-key request. An accepted
 response commits the staged credential. A rejected response aborts it. An
 ambiguous transport outcome retains the pending credential so `storage.recover`
 can reconcile the server's active key after restart. `key_change.resolve` accepts
-that recovered snapshot and commits or aborts its resumed exact transaction.
+only a recovered next-generation key replacement and commits or aborts its exact
+transaction.
 
 ## Remaining scope
 

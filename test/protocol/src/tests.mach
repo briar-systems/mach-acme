@@ -5,6 +5,12 @@ use http.core.field;
 use http.core.method;
 use http.core.status;
 use std.runtime;
+use fs: std.filesystem;
+use fixed: std.allocator.fixed;
+use A: std.allocator;
+use IO: std.io.error;
+use O: std.types.option;
+use R: std.types.result;
 use std.sync.atomic;
 use std.sync.thread;
 use J: std.data.json;
@@ -13,6 +19,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
 use std.types.view;
 use acme.client;
 use acme.account;
@@ -75,11 +82,39 @@ fun deterministic_entropy(ctx: ptr, output: contracts.SecretBuffer) contracts.Er
     ret contracts.OK;
 }
 
+rec ForeignEntropy {
+    target: *u8;
+}
+
+fun foreign_entropy(ctx: ptr,
+    output: contracts.SecretBuffer) contracts.Error {
+    val value: *ForeignEntropy = ctx::*ForeignEntropy;
+    if (output.data == nil || output.capacity < 32 || value.target == nil) {
+        ret contracts.INVALID_INPUT;
+    }
+    var i: usize = 0;
+    for (i < 32) {
+        output.data[i] = i::u8;
+        i = i + 1;
+    }
+    value.target[0] = value.target[0] ^ 1;
+    ret contracts.OK;
+}
+
 fun unavailable_entropy(ctx: ptr, output: contracts.SecretBuffer) contracts.Error {
     ret contracts.ENTROPY_UNAVAILABLE;
 }
 
 fun entropy_aliases_nothing(ctx: ptr, data: *u8, len: usize) bool {
+    ret false;
+}
+
+fun entropy_mutates_foreign(ctx: ptr, data: *u8, len: usize) bool {
+    val value: *ForeignEntropy = ctx::*ForeignEntropy;
+    if (value.target != nil) {
+        value.target[0] = value.target[0] ^ 1;
+        value.target = nil;
+    }
     ret false;
 }
 
@@ -2091,6 +2126,7 @@ test "nonce: hostile values, duplicates, and small outputs are transactional" {
 
 rec AccountStore {
     anchor: u8;
+    gate: storage.Gate;
     current: account.Credentials;
     pending: account.Credentials;
     manager: *storage.Manager;
@@ -2116,12 +2152,118 @@ rec AccountStore {
     abort_status: storage.Status;
     begin_status: storage.Status;
     mutate_manager: bool;
+    mutate_output: *u8;
+    load_status: storage.Status;
+    persistent: bool;
+    path: *u8;
+}
+
+fun disk_u64_write(data: *u8, offset: usize, value: u64) {
+    var i: usize = 0;
+    for (i < 8) {
+        data[offset + i] = (value >> (i::u64 * 8))::u8;
+        i = i + 1;
+    }
+}
+
+fun disk_u64_read(data: *u8, offset: usize) u64 {
+    var value: u64 = 0;
+    var i: usize = 0;
+    for (i < 8) {
+        value = value | ((data[offset + i]::u64) << (i::u64 * 8));
+        i = i + 1;
+    }
+    ret value;
+}
+
+fun disk_checksum(data: *u8, len: usize) u64 {
+    var result: u64 = 0xcbf29ce484222325;
+    var i: usize = 0;
+    for (i < len) {
+        result = (result ^ data[i]::u64) * 0x100000001b3;
+        i = i + 1;
+    }
+    ret result;
+}
+
+fun account_store_persist(value: *AccountStore) bool {
+    if (!value.persistent) { ret true; }
+    var record: [48]u8;
+    copy(?record[0], "MACACME1", 8);
+    record[8] = 0;
+    if (value.found) { record[8] = record[8] | 1; }
+    if (value.transaction_active) { record[8] = record[8] | 2; }
+    if (value.pending_ready) { record[8] = record[8] | 4; }
+    disk_u64_write(?record[0], 16, value.token);
+    var current_generation: u64 = 0;
+    var pending_generation: u64 = 0;
+    if (value.found) { current_generation = value.current.generation; }
+    if (value.pending_ready) { pending_generation = value.pending.generation; }
+    disk_u64_write(?record[0], 24, current_generation);
+    disk_u64_write(?record[0], 32, pending_generation);
+    disk_u64_write(?record[0], 40, disk_checksum(?record[0], 40));
+    var allocator_bytes: [4096]u8;
+    var allocator_state: fixed.FixedState;
+    var allocator: A.Allocator;
+    if (O.is_some[*u8](fixed.make(?allocator, ?allocator_state,
+            ?allocator_bytes[0], 4096))) { ret false; }
+    ret !O.is_some[str](fs.replace_bytes_atomic(?allocator, value.path,
+        ?record[0], 48, 384, 448));
+}
+
+fun account_store_reload(value: *AccountStore) bool {
+    if (!value.persistent || !fs.exists(value.path)) { ret true; }
+    val opened: R.Result[fs.File, IO.Error] = fs.open(value.path);
+    if (R.is_err[fs.File, IO.Error](opened)) { ret false; }
+    var file: fs.File = R.unwrap_ok[fs.File, IO.Error](opened);
+    var record: [49]u8;
+    var position: usize = 0;
+    var valid: bool = true;
+    for (position < 48 && valid) {
+        val read: R.Result[usize, IO.Error] = fs.read(file,
+            ?record[position], 48 - position);
+        if (R.is_err[usize, IO.Error](read)) { valid = false; }
+        or {
+            val count: usize = R.unwrap_ok[usize, IO.Error](read);
+            if (count == 0) { valid = false; }
+            or { position = position + count; }
+        }
+    }
+    if (valid) {
+        val extra: R.Result[usize, IO.Error] = fs.read(file, ?record[48], 1);
+        valid = !R.is_err[usize, IO.Error](extra) &&
+            R.unwrap_ok[usize, IO.Error](extra) == 0;
+    }
+    fs.close(?file);
+    if (!valid || position != 48 || !equal(?record[0], "MACACME1", 8) ||
+        disk_u64_read(?record[0], 40) != disk_checksum(?record[0], 40) ||
+        (record[8] & ~7) != 0) { ret false; }
+    val found: bool = (record[8] & 1) != 0;
+    val active: bool = (record[8] & 2) != 0;
+    val pending: bool = (record[8] & 4) != 0;
+    val current_generation: u64 = disk_u64_read(?record[0], 24);
+    val pending_generation: u64 = disk_u64_read(?record[0], 32);
+    if ((found && value.current.generation != current_generation) ||
+        (!found && current_generation != 0) ||
+        (pending && value.pending.generation != pending_generation) ||
+        (!pending && pending_generation != 0) || (pending && !active)) {
+        ret false;
+    }
+    value.token = disk_u64_read(?record[0], 16);
+    value.found = found;
+    value.transaction_active = active;
+    value.pending_ready = pending;
+    ret true;
 }
 
 fun account_store_ready(ctx: ptr) bool {
     val value: *AccountStore = ctx::*AccountStore;
+    if (value.mutate_output != nil) {
+        value.mutate_output[0] = value.mutate_output[0] ^ 1;
+        value.mutate_output = nil;
+    }
     if (value.mutate_manager && value.manager != nil) {
-        value.manager.last_token = value.manager.last_token + 1;
+        value.manager.gate.last_token = value.manager.gate.last_token + 1;
         value.mutate_manager = false;
     }
     ret value.ready;
@@ -2172,6 +2314,7 @@ fun account_store_begin(ctx: ptr, url: view.View,
     }
     var result_status: storage.Status = storage.SUCCESS;
     if (value.begin_status != 0) { result_status = value.begin_status; }
+    if (!account_store_persist(value)) { result_status = storage.FAILED; }
     ret storage.BeginResult{status: result_status,
         transaction: storage.Transaction{owner: ctx, token: value.token,
             generation: generation}};
@@ -2191,6 +2334,7 @@ fun account_store_stage(ctx: ptr, transaction: storage.Transaction,
     if (value.mutate != nil) {
         value.mutate[0] = value.mutate[0] ^ 1;
     }
+    if (!account_store_persist(value)) { ret storage.UNKNOWN; }
     ret storage.SUCCESS;
 }
 
@@ -2206,6 +2350,7 @@ fun account_store_commit(ctx: ptr,
     value.found = true;
     value.pending_ready = false;
     value.transaction_active = false;
+    if (!account_store_persist(value)) { ret storage.UNKNOWN; }
     ret storage.SUCCESS;
 }
 
@@ -2219,6 +2364,7 @@ fun account_store_abort(ctx: ptr,
     }
     value.pending_ready = false;
     value.transaction_active = false;
+    if (!account_store_persist(value)) { ret storage.UNKNOWN; }
     ret storage.SUCCESS;
 }
 
@@ -2235,6 +2381,18 @@ fun account_store_load(ctx: ptr, url: view.View,
         spin = spin + 1;
     }
     var result: storage.Snapshot;
+    if (!account_store_reload(value)) {
+        result.status = storage.FAILED;
+        @output = result;
+        atomic.fetch_sub(?value.load_active, 1);
+        ret storage.FAILED;
+    }
+    if (value.load_status != 0) {
+        result.status = value.load_status;
+        @output = result;
+        atomic.fetch_sub(?value.load_active, 1);
+        ret value.load_status;
+    }
     value.loaded_snapshot = output;
     if (value.mutate_snapshot) { value.snapshot_mutation_armed = true; }
     if (!value.found) {
@@ -2263,7 +2421,8 @@ fun account_store_load(ctx: ptr, url: view.View,
 
 fun account_store(value: *AccountStore) storage.Store {
     ret storage.Store{ctx: value::ptr, context_anchor: ?value.anchor,
-        context_size: $size_of(AccountStore), ready: account_store_ready,
+        context_size: $size_of(AccountStore), gate: ?value.gate,
+        ready: account_store_ready,
         aliases: account_store_aliases, owns_secret: account_store_owns_secret,
         begin: account_store_begin, stage: account_store_stage,
         commit: account_store_commit, abort: account_store_abort,
@@ -2403,6 +2562,55 @@ test "account: lifecycle payloads are exact and reject aliases" {
             external_account_binding: external_account.none()},
             contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
             problem.INVALID_INPUT) { ret 13; }
+    val malformed_percent: *u8 = "https://example.com/%zz";
+    val malformed_quote: *u8 = "https://example.com/a\"b";
+    val misplaced_bracket: *u8 = "https://example.com/a[b]";
+    val mailto_path: *u8 = "mailto:a@example.com/path";
+    val mailto_dot: *u8 = "mailto:.a@example.com";
+    var invalid_values: [5]*u8 = [5]*u8{malformed_percent,
+        malformed_quote, misplaced_bracket, mailto_path, mailto_dot};
+    var invalid_index: usize = 0;
+    for (invalid_index < 5) {
+        invalid_contacts[0] = view.view(invalid_values[invalid_index],
+            length(invalid_values[invalid_index]));
+        if (account.encode(account.CREATE, account.Request{
+                contacts: ?invalid_contacts[0], contact_len: 1,
+                terms_of_service_agreed: false, only_return_existing: false,
+                external_account_binding: external_account.none()},
+                contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
+                problem.INVALID_INPUT) { ret 14 + invalid_index::i32; }
+        invalid_index = invalid_index + 1;
+    }
+    ret 0;
+}
+
+test "account: public contact bounds encode without a hidden ceiling" {
+    var text: [4096]u8;
+    copy(?text[0], "https:", 6);
+    var i: usize = 6;
+    for (i < 4096) { text[i] = 'a'; i = i + 1; }
+    var contacts: [64]view.View;
+    i = 0;
+    for (i < 64) {
+        contacts[i] = view.view(?text[0], 4096);
+        i = i + 1;
+    }
+    var output: [270000]u8;
+    val encoded: account.Operation = account.encode(account.CREATE,
+        account.Request{contacts: ?contacts[0], contact_len: 64,
+            terms_of_service_agreed: false, only_return_existing: false,
+            external_account_binding: external_account.none()},
+        contracts.Buffer{data: ?output[0], capacity: 270000});
+    if (problem.failed(encoded.error) || encoded.written != 262349) { ret 1; }
+    fill(?output[0], 0xa5, 128);
+    val small: account.Operation = account.encode(account.CREATE,
+        account.Request{contacts: ?contacts[0], contact_len: 64,
+            terms_of_service_agreed: false, only_return_existing: false,
+            external_account_binding: external_account.none()},
+        contracts.Buffer{data: ?output[0], capacity: 128});
+    if (small.error.kind != problem.LIMIT ||
+        small.error.code != problem.OUTPUT_TOO_SMALL ||
+        !filled(?output[0], 0xa5, 128)) { ret 2; }
     ret 0;
 }
 
@@ -2666,7 +2874,8 @@ test "storage: replacement is durable across unknown commit and reentrancy" {
     if (problem.failed(replacement.error) || !replacement.prepared ||
         !provider.reentry_rejected ||
         atomic.load(?provider.load_calls) != 0) { ret 7; }
-    if (storage.commit_write(?manager, replacement).code !=
+    if (problem.failed(storage.bind_replace(?manager, replacement)) ||
+        storage.commit_write(?manager, replacement).code !=
             problem.STORAGE_UNKNOWN) { ret 8; }
     var recovered: storage.Snapshot;
     recovered.status = 99;
@@ -2707,7 +2916,7 @@ test "storage: replacement is durable across unknown commit and reentrancy" {
     if (atomic.load(?first_result) != 1 || atomic.load(?second_result) != 1 ||
         atomic.load(?provider.load_overlap) != 0 ||
         atomic.load(?provider.load_active) != 0 ||
-        atomic.load(?manager.callback_owner) != 0) { ret 14; }
+        atomic.load(?manager.gate.callback_owner) != 0) { ret 14; }
     ret 0;
 }
 
@@ -2771,12 +2980,18 @@ test "storage: hostile transactions and recovery stay exactly bound" {
             contracts.Buffer{data: ?new_public[0], capacity: 65}).error !=
             contracts.OK) { ret 8; }
 
+    provider.token = 1;
     provider.reuse_token = true;
+    provider.abort_status = storage.FAILED;
     val reused: storage.Write = storage.begin_replace(?manager,
         provider.current, next);
-    if (!problem.failed(reused.error) || provider.transaction_active ||
-        provider.pending_ready) { ret 9; }
+    if (reused.state != storage.WRITE_UNCERTAIN ||
+        reused.transaction.token != 1 || !provider.transaction_active) { ret 9; }
+    provider.abort_status = storage.SUCCESS;
+    if (problem.failed(storage.abort_write(?manager, reused)) ||
+        provider.transaction_active) { ret 18; }
     provider.reuse_token = false;
+    provider.token = manager.gate.last_token;
     val staged: storage.Write = storage.begin_replace(?manager,
         provider.current, next);
     if (problem.failed(staged.error) || !provider.pending_ready) { ret 10; }
@@ -2808,6 +3023,152 @@ test "storage: hostile transactions and recovery stay exactly bound" {
     if (storage.init_manager(?mutating_manager,
             account_store(?mutating_provider)).code != problem.INVALID_INPUT ||
         mutating_manager.initialized) { ret 16; }
+    ret 0;
+}
+
+test "storage: shared gates consume exact writes and preserve outputs" {
+    var old_secret: [32]^u8;
+    var old_public: [65]u8;
+    var old_key: jose.PublicKey;
+    var old_private: jose.PrivateKey;
+    var new_secret: [32]^u8;
+    var new_public: [65]u8;
+    var new_key: jose.PublicKey;
+    var new_private: jose.PrivateKey;
+    if (!es_keys(?old_key, ?old_private, ?old_secret[0], ?old_public[0]) ||
+        !es_keys(?new_key, ?new_private, ?new_secret[0], ?new_public[0])) {
+        ret 1;
+    }
+    new_secret[0] = 0xc8;
+    if (p256.derive_public(contracts.SecretBytes{data: ?new_secret[0], len: 32},
+            contracts.Buffer{data: ?new_public[0], capacity: 65}).error !=
+            contracts.OK) { ret 2; }
+    new_key.value = contracts.Bytes{data: ?new_public[0], len: 65};
+    var provider: AccountStore;
+    provider.current = credentials(old_key, old_private.secret_owner, 1);
+    provider.found = true;
+    provider.ready = true;
+    var first: storage.Manager;
+    var second: storage.Manager;
+    if (problem.failed(storage.init_manager(?first, account_store(?provider))) ||
+        problem.failed(storage.init_manager(?second,
+            account_store(?provider)))) { ret 3; }
+    var copied: storage.Manager = first;
+    var snapshot: storage.Snapshot;
+    snapshot.status = 77;
+    if (storage.recover(?copied, provider.current.account.url,
+            ?snapshot).code != problem.INVALID_INPUT || snapshot.status != 77) {
+        ret 4;
+    }
+    val next: account.Credentials = credentials(new_key,
+        new_private.secret_owner, 2);
+    val staged: storage.Write = storage.begin_replace(?first,
+        provider.current, next);
+    if (problem.failed(staged.error) ||
+        !problem.failed(storage.begin_replace(?second,
+            provider.current, next).error) ||
+        storage.commit_write(?first, staged).code != problem.STORAGE_CONFLICT) {
+        ret 5;
+    }
+    provider.load_status = storage.FAILED;
+    if (storage.check_write(?second, staged).code != problem.STORAGE_FAILED) {
+        ret 6;
+    }
+    provider.load_status = storage.UNKNOWN;
+    if (storage.check_write(?second, staged).code != problem.STORAGE_UNKNOWN) {
+        ret 7;
+    }
+    provider.load_status = storage.CONFLICT;
+    if (storage.check_write(?second, staged).code != problem.STORAGE_CONFLICT) {
+        ret 8;
+    }
+    provider.load_status = 0;
+    provider.mutate_output = (?snapshot)::*u8;
+    if (storage.recover(?second, provider.current.account.url,
+            ?snapshot).code != problem.INVALID_INPUT || snapshot.status != 77) {
+        ret 9;
+    }
+    var overlapping: account.Credentials = next;
+    overlapping.secret_owner = (?first)::ptr;
+    if (!problem.failed(storage.begin_replace(?second, provider.current,
+            overlapping).error)) { ret 10; }
+    if (problem.failed(storage.bind_replace(?second, staged)) ||
+        storage.bind_replace(?first, staged).code != problem.STORAGE_CONFLICT ||
+        problem.failed(storage.abort_write(?first, staged)) ||
+        provider.pending_ready) { ret 11; }
+    ret 0;
+}
+
+test "storage: persistent provider survives restart and rejects torn state" {
+    val path: *u8 = "/tmp/mach-acme-storage-conformance.bin";
+    fs.remove_file(path);
+    var old_secret: [32]^u8;
+    var old_public: [65]u8;
+    var old_key: jose.PublicKey;
+    var old_private: jose.PrivateKey;
+    var new_secret: [32]^u8;
+    var new_public: [65]u8;
+    var new_key: jose.PublicKey;
+    var new_private: jose.PrivateKey;
+    if (!es_keys(?old_key, ?old_private, ?old_secret[0], ?old_public[0]) ||
+        !es_keys(?new_key, ?new_private, ?new_secret[0], ?new_public[0])) {
+        ret 1;
+    }
+    new_secret[0] = 0xc8;
+    if (p256.derive_public(contracts.SecretBytes{data: ?new_secret[0], len: 32},
+            contracts.Buffer{data: ?new_public[0], capacity: 65}).error !=
+            contracts.OK) { ret 2; }
+    new_key.value = contracts.Bytes{data: ?new_public[0], len: 65};
+    val current: account.Credentials = credentials(old_key,
+        old_private.secret_owner, 1);
+    val next: account.Credentials = credentials(new_key,
+        new_private.secret_owner, 2);
+    var first_provider: AccountStore;
+    first_provider.current = current;
+    first_provider.pending = next;
+    first_provider.found = true;
+    first_provider.ready = true;
+    first_provider.persistent = true;
+    first_provider.path = path;
+    var first_manager: storage.Manager;
+    if (problem.failed(storage.init_manager(?first_manager,
+            account_store(?first_provider)))) { ret 3; }
+    val first_write: storage.Write = storage.begin_replace(?first_manager,
+        current, next);
+    if (problem.failed(first_write.error) || first_write.transaction.token == 0 ||
+        !fs.exists(path)) { ret 4; }
+    var restarted: AccountStore;
+    restarted.current = current;
+    restarted.pending = next;
+    restarted.ready = true;
+    restarted.persistent = true;
+    restarted.path = path;
+    if (!account_store_reload(?restarted)) { ret 5; }
+    var restarted_manager: storage.Manager;
+    if (problem.failed(storage.init_manager(?restarted_manager,
+            account_store(?restarted)))) { ret 6; }
+    var recovered: storage.Snapshot;
+    if (problem.failed(storage.recover(?restarted_manager,
+            current.account.url, ?recovered)) || !recovered.has_pending ||
+        recovered.transaction.token != first_write.transaction.token) { ret 7; }
+    val resumed: storage.Write = storage.resume(recovered);
+    if (problem.failed(storage.abort_write(?restarted_manager, resumed))) {
+        ret 8;
+    }
+    val second_write: storage.Write = storage.begin_replace(?restarted_manager,
+        current, next);
+    if (problem.failed(second_write.error) ||
+        second_write.transaction.token <= first_write.transaction.token) {
+        ret 9;
+    }
+    var torn: [12]u8;
+    copy(?torn[0], "MACACME1", 8);
+    if (O.is_some[str](fs.write_bytes(path, ?torn[0], 12, 384))) { ret 10; }
+    recovered.status = 91;
+    if (storage.recover(?restarted_manager, current.account.url,
+            ?recovered).code != problem.STORAGE_FAILED ||
+        recovered.status != 91) { ret 11; }
+    fs.remove_file(path);
     ret 0;
 }
 
@@ -2854,12 +3215,13 @@ test "key change: interruption retains a recoverable nested rollover" {
             contracts.Buffer{data: (?provider)::*u8,
                 capacity: $size_of(AccountStore)}).error) ||
         provider.transaction_active) { ret 17; }
-    val prepared: key_change.Prepared = key_change.prepare(?manager,
+    val stale_prepared: key_change.Prepared = key_change.prepare(?manager,
         provider.current, next, new_private, jose.no_entropy(),
         view.view("https://example.com/acme/key-change", 35),
         contracts.Buffer{data: ?work[0], capacity: 4096},
         contracts.Buffer{data: ?output[0], capacity: 2048});
-    if (problem.failed(prepared.error) || prepared.nested_jws.len == 0 ||
+    if (problem.failed(stale_prepared.error) ||
+        stale_prepared.nested_jws.len == 0 ||
         !provider.pending_ready) { ret 4; }
     var slots: [1]nonce.Slot;
     var nonce_bytes: [64]u8;
@@ -2872,20 +3234,38 @@ test "key change: interruption retains a recoverable nested rollover" {
             client.limits_default()))) { ret 6; }
     var request: client.SignedRequest;
     output[0] = output[0] ^ 1;
-    if (key_change.begin_outer(?protocol, ?request, provider.current,
-            view.view("https://example.com/acme/key-change", 35), prepared).code !=
+    if (key_change.begin_outer(?manager, ?protocol, ?request, provider.current,
+            view.view("https://example.com/acme/key-change", 35),
+            stale_prepared).code !=
             problem.INVALID_INPUT) { ret 14; }
     output[0] = output[0] ^ 1;
     new_public[1] = new_public[1] ^ 1;
-    if (key_change.begin_outer(?protocol, ?request, provider.current,
-            view.view("https://example.com/acme/key-change", 35), prepared).code !=
+    if (key_change.begin_outer(?manager, ?protocol, ?request, provider.current,
+            view.view("https://example.com/acme/key-change", 35),
+            stale_prepared).code !=
             problem.INVALID_INPUT) { ret 18; }
     new_public[1] = new_public[1] ^ 1;
-    if (problem.failed(key_change.begin_outer(?protocol, ?request,
+    if (problem.failed(storage.abort_write(?manager,
+            stale_prepared.replacement)) ||
+        key_change.begin_outer(?manager, ?protocol, ?request,
+            provider.current,
+            view.view("https://example.com/acme/key-change", 35),
+            stale_prepared).code != problem.STORAGE_CONFLICT) { ret 19; }
+    val prepared: key_change.Prepared = key_change.prepare(?manager,
+        provider.current, next, new_private, jose.no_entropy(),
+        view.view("https://example.com/acme/key-change", 35),
+        contracts.Buffer{data: ?work[0], capacity: 4096},
+        contracts.Buffer{data: ?output[0], capacity: 2048});
+    if (problem.failed(prepared.error)) { ret 20; }
+    if (problem.failed(key_change.begin_outer(?manager, ?protocol, ?request,
             provider.current,
             view.view("https://example.com/acme/key-change", 35), prepared)) ||
         request.spec.use_jwk || request.spec.payload.data != ?output[0] ||
         request.spec.kid.len != 31) { ret 7; }
+    if (key_change.begin_outer(?manager, ?protocol, ?request,
+            provider.current,
+            view.view("https://example.com/acme/key-change", 35),
+            prepared).code != problem.STORAGE_CONFLICT) { ret 21; }
     if (key_change.finish(?manager, prepared, key_change.AMBIGUOUS).code !=
             problem.STORAGE_UNKNOWN || !provider.pending_ready) { ret 8; }
     var restarted_manager: storage.Manager;
@@ -2897,6 +3277,13 @@ test "key change: interruption retains a recoverable nested rollover" {
             ?recovered)) || !recovered.has_pending) { ret 9; }
     if (problem.failed(key_change.resolve(?restarted_manager, recovered,
             true)) || provider.current.generation != 2) { ret 10; }
+    var metadata: storage.Snapshot = recovered;
+    metadata.current = provider.current;
+    metadata.pending = provider.current;
+    metadata.pending.account.status = account.DEACTIVATED;
+    metadata.transaction.generation = provider.current.generation;
+    if (key_change.resolve(?restarted_manager, metadata,
+            true).code != problem.INVALID_INPUT) { ret 22; }
 
     var ed_secret: [32]^u8;
     var ed_public: [32]u8;
@@ -2914,6 +3301,19 @@ test "key change: interruption retains a recoverable nested rollover" {
         problem.failed(key_change.finish(?restarted_manager, ed_prepared,
             key_change.REJECTED)) || provider.pending_ready) { ret 11; }
 
+    var hostile_alias: ForeignEntropy = ForeignEntropy{
+        target: ?output[2047]};
+    val alias_attack: key_change.Prepared = key_change.prepare(
+        ?restarted_manager, provider.current, ed_next, ed_private,
+        jose.entropy_provider((?hostile_alias)::ptr, foreign_entropy,
+            entropy_mutates_foreign, entropy_aliases_no_secret,
+            entropy_still_valid),
+        view.view("https://example.com/acme/key-change", 35),
+        contracts.Buffer{data: ?work[0], capacity: 4096},
+        contracts.Buffer{data: ?output[0], capacity: 2048});
+    if (!problem.failed(alias_attack.error) || provider.transaction_active ||
+        provider.pending_ready) { ret 23; }
+
     var rsa_secret: [256]^u8;
     var rsa_public: [256]u8;
     var rsa_exponent: [3]u8;
@@ -2924,6 +3324,18 @@ test "key change: interruption retains a recoverable nested rollover" {
             ?rsa_exponent[0], ?rsa_secret[0], ?rsa_decode[0])) { ret 12; }
     val rsa_next: account.Credentials = credentials(rsa_key,
         rsa_private.secret_owner, 3);
+    var hostile_fill: ForeignEntropy = ForeignEntropy{target: ?rsa_public[0]};
+    val credential_attack: key_change.Prepared = key_change.prepare(
+        ?restarted_manager, provider.current, rsa_next, rsa_private,
+        jose.entropy_provider((?hostile_fill)::ptr, foreign_entropy,
+            entropy_aliases_nothing, entropy_aliases_no_secret,
+            entropy_still_valid),
+        view.view("https://example.com/acme/key-change", 35),
+        contracts.Buffer{data: ?work[0], capacity: 4096},
+        contracts.Buffer{data: ?output[0], capacity: 2048});
+    if (!problem.failed(credential_attack.error) ||
+        provider.transaction_active || provider.pending_ready) { ret 24; }
+    rsa_public[0] = rsa_public[0] ^ 1;
     val rsa_prepared: key_change.Prepared = key_change.prepare(?restarted_manager,
         provider.current, rsa_next, rsa_private,
         jose.entropy_provider(nil, deterministic_entropy,

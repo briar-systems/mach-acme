@@ -326,7 +326,9 @@ pub fun encode(value: Binding, account_key: jose.PublicKey, url: view.View,
     val jwk: jose.Operation = jose.key_encode_jwk(account_key,
         contracts.Buffer{data: work.data, capacity: MAX_JWK_BYTES});
     if (problem.failed(jwk.error)) {
-        ret Operation{error: jwk.error, written: 0};
+        var result: Operation = none();
+        result.error = jwk.error;
+        ret result;
     }
     val protected_start: usize = MAX_JWK_BYTES;
     var protected: Writer = Writer{data: work.data, cap: work.capacity,
