@@ -24,6 +24,7 @@ use std.types.view;
 use acme.client;
 use acme.account;
 use acme.certificate;
+use acme.file_store;
 use acme.challenge;
 use acme.identifier;
 use acme.order;
@@ -751,7 +752,7 @@ test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures"
     if (signed.written != 256) { ret 21; }
     if (signature.verify_rsa_pss_sha256(rsa_public,
             contracts.Bytes{data: message, len: 32},
-            contracts.Bytes{data: ?output[0], len: 256}) != contracts.OK) { ret 22; }
+            contracts.Bytes{data: ?output[0], len: 256}) != contracts.OK) { ret 19; }
     var probe: SecretAliasProbe;
     val owned_private: jose.Operation = jose.key_sign(key,
         jose.entropy_provider((?probe)::ptr, deterministic_entropy,
@@ -759,7 +760,7 @@ test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures"
             entropy_still_valid), contracts.Bytes{data: message, len: 32},
         contracts.Buffer{data: ?output[0], capacity: 256});
     if (owned_private.error.code != problem.INVALID_INPUT ||
-        owned_private.written != 0 || !probe.private_queried) { ret 23; }
+        owned_private.written != 0 || !probe.private_queried) { ret 20; }
     fill(?output[0], 0xa5, 256);
     val unavailable: jose.Operation = jose.key_sign(key,
         jose.entropy_provider(nil, unavailable_entropy, entropy_aliases_nothing,
@@ -2490,7 +2491,7 @@ test "account: lifecycle payloads are exact and reject aliases" {
     var pool: nonce.Pool = nonce.pool(?nonce_memory);
     var protocol: client.Client;
     if (problem.failed(client.init(?protocol, ?pool,
-            client.limits_default()))) { ret 24; }
+            client.limits_default()))) { ret 21; }
     val public_bytes: [32]u8 = [32]u8{
         0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
         0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
@@ -2504,13 +2505,13 @@ test "account: lifecycle payloads are exact and reject aliases" {
     if (account.begin(?protocol, ?lookup_state, account.LOOKUP,
             view.view("https://example.com/acme/new-account", 36),
             view.view(nil, 0), view.view(?output[0], lookup.written), lookup,
-            signer).code != problem.INVALID_INPUT) { ret 26; }
+            signer).code != problem.INVALID_INPUT) { ret 23; }
     output[0] = output[0] ^ 1;
     if (problem.failed(account.begin(?protocol, ?lookup_state, account.LOOKUP,
             view.view("https://example.com/acme/new-account", 36),
             view.view(nil, 0), view.view(?output[0], lookup.written), lookup,
             signer)) ||
-        !lookup_state.spec.use_jwk) { ret 25; }
+        !lookup_state.spec.use_jwk) { ret 22; }
     val empty_contacts: account.Operation = account.encode(account.UPDATE_CONTACT,
         account.Request{contacts: nil, contact_len: 0,
             terms_of_service_agreed: false, only_return_existing: false,
@@ -4493,5 +4494,421 @@ test "certificate: private key and chain replacement is transactional" {
     val record: storage.CertificateRecord = cert_record(?plain, 1, 2);
     if (!problem.failed(storage.begin_replace_certificate(?plain_manager, 0,
             record).error)) { ret 21; }
+    ret 0;
+}
+
+fun read_raw(path: *u8, buffer: *u8, capacity: usize, len: *usize) bool {
+    val opened: R.Result[fs.File, IO.Error] = fs.open(path);
+    if (R.is_err[fs.File, IO.Error](opened)) { ret false; }
+    var file: fs.File = R.unwrap_ok[fs.File, IO.Error](opened);
+    var total: usize = 0;
+    var reading: bool = true;
+    for (reading) {
+        val received: R.Result[usize, IO.Error] = fs.read(file, ?buffer[total],
+            capacity - total);
+        if (R.is_err[usize, IO.Error](received)) {
+            fs.close(?file);
+            ret false;
+        }
+        val count: usize = R.unwrap_ok[usize, IO.Error](received);
+        if (count == 0 || total + count == capacity) { reading = false; }
+        total = total + count;
+    }
+    fs.close(?file);
+    @len = total;
+    ret true;
+}
+
+test "file store: documents are versioned, checksummed, and atomically replaced" {
+    val path: *u8 = "/tmp/mach-acme-document.bin";
+    fs.remove_file(path);
+    var scratch: [16384]u8;
+    var buffer: [8192]u8;
+    val payload: *u8 = "durable acme state";
+    var document: file_store.Document;
+
+    # a document that was never written is not a corrupt one
+    if (!problem.failed(file_store.read_document(path,
+            file_store.DOC_ORDER, ?buffer[0], 8192, ?document))) { ret 1; }
+
+    if (problem.failed(file_store.write_document(path, file_store.DOC_ORDER,
+            view.view(payload, 18), ?scratch[0], 16384))) { ret 2; }
+    if (problem.failed(file_store.read_document(path, file_store.DOC_ORDER,
+            ?buffer[0], 8192, ?document))) { ret 3; }
+    if (document.payload.len != 18 ||
+        !equal(document.payload.data, payload, 18) ||
+        document.version != file_store.SCHEMA_VERSION ||
+        file_store.needs_migration(document)) { ret 4; }
+
+    # durable acme state includes account keys, so the file is owner-only
+    val meta: R.Result[fs.Metadata, str] = fs.metadata(path);
+    if (R.is_err[fs.Metadata, str](meta)) { ret 5; }
+    var found: fs.Metadata = R.unwrap_ok[fs.Metadata, str](meta);
+    if ((found.mode & 511) != 384) { ret 6; }
+
+    # a document is refused when it names a different record kind
+    if (!problem.failed(file_store.read_document(path,
+            file_store.DOC_RENEWAL, ?buffer[0], 8192, ?document))) { ret 7; }
+
+    # corruption anywhere in the payload is detected by the digest
+    var raw: [8192]u8;
+    var raw_len: usize = 0;
+    if (!read_raw(path, ?raw[0], 8192, ?raw_len) ||
+        raw_len != file_store.HEADER_BYTES + 18) { ret 8; }
+    raw[file_store.HEADER_BYTES + 3] = raw[file_store.HEADER_BYTES + 3] ^ 1;
+    if (O.is_some[str](fs.write_bytes(path, ?raw[0], raw_len, 384))) { ret 9; }
+    if (file_store.read_document(path, file_store.DOC_ORDER, ?buffer[0], 8192,
+            ?document).code != problem.STORAGE_FAILED) { ret 10; }
+
+    # a truncated document, a wrong magic, and a future schema version are all
+    # refused rather than partly believed
+    raw[file_store.HEADER_BYTES + 3] = raw[file_store.HEADER_BYTES + 3] ^ 1;
+    if (O.is_some[str](fs.write_bytes(path, ?raw[0], raw_len - 4, 384)) ||
+        !problem.failed(file_store.read_document(path, file_store.DOC_ORDER,
+            ?buffer[0], 8192, ?document))) { ret 11; }
+    if (O.is_some[str](fs.write_bytes(path, ?raw[0], 20, 384)) ||
+        !problem.failed(file_store.read_document(path, file_store.DOC_ORDER,
+            ?buffer[0], 8192, ?document))) { ret 12; }
+    var broken: [8192]u8;
+    copy(?broken[0], ?raw[0], raw_len);
+    broken[0] = 'X';
+    if (O.is_some[str](fs.write_bytes(path, ?broken[0], raw_len, 384)) ||
+        !problem.failed(file_store.read_document(path, file_store.DOC_ORDER,
+            ?buffer[0], 8192, ?document))) { ret 13; }
+    copy(?broken[0], ?raw[0], raw_len);
+    broken[11] = 99;
+    if (O.is_some[str](fs.write_bytes(path, ?broken[0], raw_len, 384)) ||
+        !problem.failed(file_store.read_document(path, file_store.DOC_ORDER,
+            ?buffer[0], 8192, ?document))) { ret 14; }
+
+    # a replacement that fails inside the atomic write leaves the last
+    # committed document exactly as it was. the scratch here is large enough
+    # to encode the document but too small for the replacement's own
+    # temporary-path storage, so the write fails before the destination is
+    # touched, which is the path a full disk would also take.
+    if (O.is_some[str](fs.write_bytes(path, ?raw[0], raw_len, 384))) { ret 15; }
+    val locked: *u8 = "/tmp/mach-acme-preserve.bin";
+    fs.remove_file(locked);
+    if (problem.failed(file_store.write_document(locked,
+            file_store.DOC_ORDER, view.view(payload, 18), ?scratch[0],
+            16384))) { ret 16; }
+    val replaced: *u8 = "replacement that must not land";
+    val starved: usize = file_store.HEADER_BYTES + 30 + 64;
+    val outcome: problem.Error = file_store.write_document(locked,
+        file_store.DOC_ORDER, view.view(replaced, 30), ?scratch[0], starved);
+    if (!problem.failed(outcome)) { ret 17; }
+    if (problem.failed(file_store.read_document(locked,
+            file_store.DOC_ORDER, ?buffer[0], 8192, ?document)) ||
+        document.payload.len != 18 ||
+        !equal(document.payload.data, payload, 18)) { ret 18; }
+
+    # backup and restore round trip through a fully validated document
+    val backup: *u8 = "/tmp/mach-acme-document-backup.bin";
+    fs.remove_file(backup);
+    if (problem.failed(file_store.copy_document(locked, backup,
+            file_store.DOC_ORDER, ?buffer[0], 8192, ?scratch[0], 16384))) {
+        ret 22;
+    }
+    if (problem.failed(file_store.write_document(locked,
+            file_store.DOC_ORDER, view.view(replaced, 30), ?scratch[0],
+            16384))) { ret 23; }
+    if (problem.failed(file_store.copy_document(backup, locked,
+            file_store.DOC_ORDER, ?buffer[0], 8192, ?scratch[0], 16384))) {
+        ret 24;
+    }
+    if (problem.failed(file_store.read_document(locked,
+            file_store.DOC_ORDER, ?buffer[0], 8192, ?document)) ||
+        document.payload.len != 18 ||
+        !equal(document.payload.data, payload, 18)) { ret 25; }
+    # a corrupt source is never copied over a good destination
+    copy(?broken[0], ?raw[0], raw_len);
+    broken[file_store.HEADER_BYTES + 1] =
+        broken[file_store.HEADER_BYTES + 1] ^ 0xff;
+    if (O.is_some[str](fs.write_bytes(backup, ?broken[0], raw_len, 384))) {
+        ret 26;
+    }
+    if (!problem.failed(file_store.copy_document(backup, locked,
+            file_store.DOC_ORDER, ?buffer[0], 8192, ?scratch[0], 16384))) {
+        ret 27;
+    }
+    if (problem.failed(file_store.read_document(locked,
+            file_store.DOC_ORDER, ?buffer[0], 8192, ?document)) ||
+        document.payload.len != 18) { ret 25; }
+
+    fs.remove_file(path);
+    fs.remove_file(backup);
+    fs.remove_file(locked);
+    ret 0;
+}
+
+fun store_credentials(key: jose.PublicKey, owner: ptr,
+    generation: u64) account.Credentials {
+    ret account.Credentials{account: account.Account{
+        url: view.view("https://example.com/acme/acct/7", 31),
+        status: account.VALID, contacts: nil, contact_len: 0,
+        orders_url: view.view("https://example.com/acme/orders/7", 32),
+        terms_of_service_agreed: true},
+        signer: jose.signer(key), secret_owner: owner,
+        generation: generation};
+}
+
+test "file store: durable records survive restart and an interrupted write" {
+    val account_path: *u8 = "/tmp/mach-acme-fs-account.bin";
+    val certificate_path: *u8 = "/tmp/mach-acme-fs-cert.bin";
+    fs.remove_file(account_path);
+    fs.remove_file(certificate_path);
+    var public_bytes: [65]u8;
+    var private_bytes: [32]^u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 1; }
+
+    var store: file_store.Store;
+    var manager: storage.Manager;
+    if (problem.failed(file_store.open_store(?store, account_path,
+            certificate_path))) { ret 2; }
+    if (problem.failed(storage.init_manager(?manager,
+            file_store.descriptor(?store)))) { ret 3; }
+
+    # the first account record commits at generation one
+    val first: account.Credentials = store_credentials(public_key,
+        file_store.secret_owner(?store), 1);
+    val save: storage.Write = storage.begin_save(?manager, 0, first);
+    if (problem.failed(save.error)) { ret 4; }
+    if (problem.failed(storage.commit_write(?manager, save))) { ret 5; }
+
+    # a fresh store reads back exactly what was committed
+    var reopened: file_store.Store;
+    var reopened_manager: storage.Manager;
+    if (problem.failed(file_store.open_store(?reopened, account_path,
+            certificate_path))) { ret 6; }
+    if (problem.failed(storage.init_manager(?reopened_manager,
+            file_store.descriptor(?reopened)))) { ret 7; }
+    var recovered: storage.Snapshot;
+    if (problem.failed(storage.recover(?reopened_manager,
+            view.view("https://example.com/acme/acct/7", 31),
+            ?recovered))) { ret 8; }
+    if (recovered.status != storage.SUCCESS || recovered.has_pending ||
+        recovered.current.generation != 1 ||
+        recovered.current.account.status != account.VALID ||
+        !recovered.current.account.terms_of_service_agreed ||
+        !equal(recovered.current.account.url.data,
+            "https://example.com/acme/acct/7", 31) ||
+        !equal(recovered.current.account.orders_url.data,
+            "https://example.com/acme/orders/7", 32)) { ret 9; }
+    # the public key round trips exactly; the private key never went to disk
+    if (recovered.current.signer.public_key.algorithm != jose.ES256 ||
+        recovered.current.signer.public_key.value.len != 65 ||
+        !equal(recovered.current.signer.public_key.value.data,
+            ?public_bytes[0], 65) ||
+        recovered.current.secret_owner !=
+            file_store.secret_owner(?reopened)) { ret 10; }
+
+    # a staged replacement that is never committed is a crash. the next run
+    # sees it as pending with the committed record untouched.
+    val next: account.Credentials = store_credentials(public_key,
+        file_store.secret_owner(?reopened), 2);
+    val staged: storage.Write = storage.begin_replace(?reopened_manager,
+        recovered.current, next);
+    if (problem.failed(staged.error)) { ret 11; }
+
+    var crashed: file_store.Store;
+    var crashed_manager: storage.Manager;
+    if (problem.failed(file_store.open_store(?crashed, account_path,
+            certificate_path))) { ret 12; }
+    if (problem.failed(storage.init_manager(?crashed_manager,
+            file_store.descriptor(?crashed)))) { ret 13; }
+    var after_crash: storage.Snapshot;
+    if (problem.failed(storage.recover(?crashed_manager,
+            view.view("https://example.com/acme/acct/7", 31),
+            ?after_crash))) { ret 14; }
+    if (!after_crash.has_pending || after_crash.current.generation != 1 ||
+        after_crash.pending.generation != 2) { ret 15; }
+    # the token sequence is monotonic across the restart
+    if (after_crash.transaction.token != staged.transaction.token) { ret 16; }
+
+    # the recovered replacement can be finished deliberately
+    val resumed: storage.Write = storage.resume(after_crash);
+    if (problem.failed(resumed.error) ||
+        problem.failed(storage.authorize_recovered_replace(?crashed_manager,
+            resumed))) { ret 17; }
+    if (problem.failed(storage.commit_write(?crashed_manager, resumed))) {
+        ret 18;
+    }
+    var settled: file_store.Store;
+    var settled_manager: storage.Manager;
+    var final_snapshot: storage.Snapshot;
+    if (problem.failed(file_store.open_store(?settled, account_path,
+            certificate_path)) ||
+        problem.failed(storage.init_manager(?settled_manager,
+            file_store.descriptor(?settled))) ||
+        problem.failed(storage.recover(?settled_manager,
+            view.view("https://example.com/acme/acct/7", 31),
+            ?final_snapshot))) { ret 19; }
+    if (final_snapshot.has_pending ||
+        final_snapshot.current.generation != 2) { ret 20; }
+
+    # a certificate record uses the same manager, gate, and token sequence
+    var chain: [64]u8;
+    var i: usize = 0;
+    for (i < 64) { chain[i] = (i & 0xff)::u8; i = i + 1; }
+    var names: [1]identifier.Identifier;
+    names[0] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("issue.example.com", 17)};
+    val record: storage.CertificateRecord = storage.CertificateRecord{
+        storage_key: view.view("issue.example.com", 17),
+        certificate_url: view.view("https://example.com/cert/7", 26),
+        chain_der: view.view(?chain[0], 64), chain_len: 2,
+        private_key_owner: file_store.secret_owner(?settled),
+        identifiers: ?names[0], identifier_len: 1,
+        not_before_unix: 1787955089, not_after_unix: 1795731089,
+        generation: 1};
+    val certificate_write: storage.Write =
+        storage.begin_replace_certificate(?settled_manager, 0, record);
+    if (problem.failed(certificate_write.error)) { ret 21; }
+    # the certificate transaction draws from the same monotonic sequence
+    if (certificate_write.transaction.token <=
+        after_crash.transaction.token) { ret 22; }
+    if (problem.failed(storage.commit_certificate(?settled_manager,
+            certificate_write))) { ret 23; }
+
+    var final_store: file_store.Store;
+    var final_manager: storage.Manager;
+    var certificate_snapshot: storage.CertificateSnapshot;
+    if (problem.failed(file_store.open_store(?final_store, account_path,
+            certificate_path)) ||
+        problem.failed(storage.init_manager(?final_manager,
+            file_store.descriptor(?final_store))) ||
+        problem.failed(storage.recover_certificate(?final_manager,
+            view.view("issue.example.com", 17),
+            ?certificate_snapshot))) { ret 24; }
+    if (certificate_snapshot.status != storage.SUCCESS ||
+        certificate_snapshot.has_pending ||
+        certificate_snapshot.current.generation != 1 ||
+        certificate_snapshot.current.chain_len != 2 ||
+        certificate_snapshot.current.chain_der.len != 64 ||
+        !equal(certificate_snapshot.current.chain_der.data, ?chain[0], 64) ||
+        certificate_snapshot.current.identifier_len != 1 ||
+        !equal(certificate_snapshot.current.identifiers[0].value.data,
+            "issue.example.com", 17) ||
+        certificate_snapshot.current.not_after_unix != 1795731089) { ret 25; }
+    # the account record is still intact alongside it
+    var both: storage.Snapshot;
+    if (problem.failed(storage.recover(?final_manager,
+            view.view("https://example.com/acme/acct/7", 31), ?both)) ||
+        both.current.generation != 2) { ret 26; }
+
+    # a corrupt durable document is reported rather than read as absent
+    var raw: [8192]u8;
+    var raw_len: usize = 0;
+    if (!read_raw(account_path, ?raw[0], 8192, ?raw_len)) { ret 27; }
+    raw[file_store.HEADER_BYTES + 2] = raw[file_store.HEADER_BYTES + 2] ^ 0xff;
+    if (O.is_some[str](fs.write_bytes(account_path, ?raw[0], raw_len, 384))) {
+        ret 28;
+    }
+    var corrupt: file_store.Store;
+    if (!problem.failed(file_store.open_store(?corrupt, account_path,
+            certificate_path))) { ret 29; }
+
+    fs.remove_file(account_path);
+    fs.remove_file(certificate_path);
+    ret 0;
+}
+
+rec StoreRaceContext {
+    manager:     *storage.Manager;
+    credentials: *account.Credentials;
+    result:      *i64;
+}
+
+fun store_race_worker(arg: *u8) {
+    val context: *StoreRaceContext = arg::*StoreRaceContext;
+    val write: storage.Write = storage.begin_save(context.manager, 0,
+        @context.credentials);
+    if (problem.failed(write.error)) {
+        atomic.store(context.result, -1);
+        ret;
+    }
+    if (problem.failed(storage.commit_write(context.manager, write))) {
+        atomic.store(context.result, -2);
+        ret;
+    }
+    atomic.store(context.result, 1);
+}
+
+test "file store: concurrent writers are serialized to one committed record" {
+    val account_path: *u8 = "/tmp/mach-acme-fs-race-account.bin";
+    val certificate_path: *u8 = "/tmp/mach-acme-fs-race-cert.bin";
+    fs.remove_file(account_path);
+    fs.remove_file(certificate_path);
+    var public_bytes: [65]u8;
+    var private_bytes: [32]^u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 1; }
+    var store: file_store.Store;
+    if (problem.failed(file_store.open_store(?store, account_path,
+            certificate_path))) { ret 2; }
+
+    # two managers over one store share its gate, so the one-active-transaction
+    # rule holds across manager instances and across threads
+    var first_manager: storage.Manager;
+    var second_manager: storage.Manager;
+    if (problem.failed(storage.init_manager(?first_manager,
+            file_store.descriptor(?store))) ||
+        problem.failed(storage.init_manager(?second_manager,
+            file_store.descriptor(?store)))) { ret 3; }
+
+    var credentials: account.Credentials = store_credentials(public_key,
+        file_store.secret_owner(?store), 1);
+    var first_result: i64 = 0;
+    var second_result: i64 = 0;
+    var first_context: StoreRaceContext = StoreRaceContext{
+        manager: ?first_manager, credentials: ?credentials,
+        result: ?first_result};
+    var second_context: StoreRaceContext = StoreRaceContext{
+        manager: ?second_manager, credentials: ?credentials,
+        result: ?second_result};
+    var first_thread: thread.Thread;
+    var second_thread: thread.Thread;
+    thread.spawn_with(store_race_worker, (?first_context)::*u8,
+        ?first_thread);
+    if (first_thread.tid < 0) { ret 4; }
+    thread.spawn_with(store_race_worker, (?second_context)::*u8,
+        ?second_thread);
+    if (second_thread.tid < 0) {
+        thread.join(?first_thread);
+        ret 5;
+    }
+    thread.join(?first_thread);
+    thread.join(?second_thread);
+
+    # exactly one writer may install the first record; the other is refused
+    # rather than both landing or the file being interleaved
+    val first_outcome: i64 = atomic.load(?first_result);
+    val second_outcome: i64 = atomic.load(?second_result);
+    if (first_outcome == 1 && second_outcome == 1) { ret 6; }
+    if (first_outcome != 1 && second_outcome != 1) { ret 7; }
+    if (atomic.load(?store.gate.callback_owner) != 0) { ret 8; }
+
+    # the durable document is a complete, valid record afterwards
+    var settled: file_store.Store;
+    var settled_manager: storage.Manager;
+    var snapshot: storage.Snapshot;
+    if (problem.failed(file_store.open_store(?settled, account_path,
+            certificate_path)) ||
+        problem.failed(storage.init_manager(?settled_manager,
+            file_store.descriptor(?settled))) ||
+        problem.failed(storage.recover(?settled_manager,
+            view.view("https://example.com/acme/acct/7", 31), ?snapshot))) {
+        ret 9;
+    }
+    if (snapshot.status != storage.SUCCESS || snapshot.has_pending ||
+        snapshot.current.generation != 1) { ret 10; }
+
+    fs.remove_file(account_path);
+    fs.remove_file(certificate_path);
     ret 0;
 }

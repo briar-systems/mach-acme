@@ -395,6 +395,54 @@ any pending replacement and registers that exact transaction in a fresh
 manager; `resume_certificate` converts it to the exact write commit will
 accept.
 
+## Durable documents
+
+Every durable record is one self-describing document. The header carries a
+magic, a schema version, the record kind, a reserved field, the payload length,
+and a SHA-256 of the payload. A reader validates all of them before publishing
+any payload, so a truncated, corrupt, foreign, or future-versioned document is
+reported rather than partly believed. A document written by an older schema is
+readable and reported through `needs_migration`, so migration is deliberate
+rather than a reader guessing at a layout.
+
+`write_document` replaces atomically: the replacement is written to a sibling
+temporary, flushed, closed, and renamed, and the parent directory is flushed
+after. A reader therefore sees either the previous committed document or the
+complete new one. A write that fails at any point before the rename leaves the
+previous document exactly as it was, which is the path an exhausted disk also
+takes. Files are created owner-only and their directories owner-only, because
+durable ACME state includes account keys.
+
+`copy_document` validates the source completely before writing the
+destination, so a backup cannot capture a corrupt document and a restore cannot
+install one.
+
+## The file-backed store
+
+`file_store.Store` implements the durable store contract for both transactional
+record kinds, holding one document per kind. The document records the committed
+record, any pending replacement, and the transaction that staged it, so a
+restart sees exactly what was in flight.
+
+The transaction token is persisted before it is handed out, so the sequence
+stays globally monotonic across a restart even if nothing is ever staged
+against that token. The expected generation is enforced durably: `begin`
+compares it against what is committed under that key and returns `CONFLICT` on
+a mismatch, so a writer working from a stale read is refused rather than
+overwriting a newer record. That check is what makes two writers over one store
+safe, and it holds across manager instances, threads, and processes.
+
+A staged record is copied into the store's own slots so it survives a restart.
+The caller's own bytes are adopted for the life of the transaction, so the
+manager's ownership checks can be answered truthfully while the durable copy is
+what actually persists.
+
+The private key is never written to disk. The store persists public credential
+material and one opaque key identity, and the application's secret provider maps
+that identity back to its key material. A store's declared ceilings on URLs,
+contacts, keys, chains, and identifiers are refusals, not truncations: what is
+written is always what can be read back.
+
 ## Replay nonce ownership
 
 A `nonce.Pool` owns copies of available nonces. The supplied memory implementation

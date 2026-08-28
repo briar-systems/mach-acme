@@ -1,0 +1,1062 @@
+# file-backed durable acme state
+#
+# every durable record is one self-describing document: a versioned header, a
+# sha-256 of the payload, and the payload. Documents are replaced atomically,
+# so a reader sees either the previous committed document or the complete new
+# one, and a failed write leaves the previous one exactly as it was.
+
+use A: std.allocator;
+use F: std.allocator.fixed;
+use crypto.contracts;
+use crypto.hash;
+use fs: std.filesystem;
+use IO: std.io.error;
+use O: std.types.option;
+use R: std.types.result;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use acme.account;
+use acme.identifier;
+use acme.jose;
+use acme.memory_range;
+use acme.problem;
+use acme.storage;
+
+# "MACHACME" then a schema version. a reader that does not recognize the
+# version refuses the document rather than guessing at its layout.
+pub val MAGIC_BYTES:    usize = 8;
+pub val HEADER_BYTES:   usize = 56;
+pub val SCHEMA_VERSION: u32   = 1;
+pub val MAX_DOCUMENT_BYTES: usize = 1048576;
+
+pub def DocumentKind: u16;
+
+pub val DOC_ACCOUNT:        DocumentKind = 1;
+pub val DOC_CERTIFICATE:    DocumentKind = 2;
+pub val DOC_ORDER:          DocumentKind = 3;
+pub val DOC_RENEWAL:        DocumentKind = 4;
+pub val DOC_KEY_GENERATION: DocumentKind = 5;
+pub val DOC_NONCE:          DocumentKind = 6;
+
+# durable acme state includes account keys, so files are owner-only and the
+# directories that hold them are owner-only too
+pub val FILE_MODE: i32 = 384;
+pub val DIR_MODE:  i32 = 448;
+
+pub rec Document {
+    kind:    DocumentKind;
+    version: u32;
+    payload: view.View;
+}
+
+pub fun kind_valid(value: DocumentKind) bool {
+    ret value == DOC_ACCOUNT || value == DOC_CERTIFICATE ||
+        value == DOC_ORDER || value == DOC_RENEWAL ||
+        value == DOC_KEY_GENERATION || value == DOC_NONCE;
+}
+
+fun storage_error(code: problem.Code, detail: str) problem.Error {
+    ret problem.local_code(problem.STORAGE, code, detail);
+}
+
+fun put_u32(data: *u8, at: usize, value: u32) {
+    data[at] = (value >> 24)::u8;
+    data[at + 1] = (value >> 16)::u8;
+    data[at + 2] = (value >> 8)::u8;
+    data[at + 3] = value::u8;
+}
+
+fun get_u32(data: *u8, at: usize) u32 {
+    ret (data[at]::u32 << 24) | (data[at + 1]::u32 << 16) |
+        (data[at + 2]::u32 << 8) | data[at + 3]::u32;
+}
+
+pub fun put_u64(data: *u8, at: usize, value: u64) {
+    var i: usize = 0;
+    for (i < 8) {
+        data[at + i] = (value >> ((7 - i) << 3))::u8;
+        i = i + 1;
+    }
+}
+
+pub fun get_u64(data: *u8, at: usize) u64 {
+    var value: u64 = 0;
+    var i: usize = 0;
+    for (i < 8) {
+        value = (value << 8) | data[at + i]::u64;
+        i = i + 1;
+    }
+    ret value;
+}
+
+fun magic_bytes() str { ret "MACHACME"; }
+
+fun sha256(data: *u8, len: usize, digest: *u8) bool {
+    if (!memory_range.valid(data, len) || !memory_range.valid(digest, 32)) {
+        ret false;
+    }
+    var context: hash.Sha256 = hash.empty_sha256();
+    if (hash.init_sha256(?context) != contracts.OK) { ret false; }
+    if (len != 0 && hash.update_sha256(?context,
+            contracts.Bytes{data: data, len: len}) != contracts.OK) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    val result: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: digest, capacity: 32});
+    ret result.error == contracts.OK && result.written == 32;
+}
+
+# layout: magic[8] version[4] kind[2] reserved[2] length[8] digest[32]
+fun write_header(data: *u8, kind: DocumentKind, len: usize) bool {
+    val magic: str = magic_bytes();
+    var i: usize = 0;
+    for (i < MAGIC_BYTES) {
+        data[i] = magic[i];
+        i = i + 1;
+    }
+    put_u32(data, 8, SCHEMA_VERSION);
+    data[12] = (kind >> 8)::u8;
+    data[13] = kind::u8;
+    data[14] = 0;
+    data[15] = 0;
+    put_u64(data, 16, len::u64);
+    ret sha256(?data[HEADER_BYTES], len, ?data[24]);
+}
+
+# encodes a document into caller scratch and replaces the file atomically. the
+# temporary is created beside the destination, flushed, and renamed, and the
+# parent directory is flushed after, so an interrupted write can never leave a
+# partial document where the committed one was.
+pub fun write_document(path: str, kind: DocumentKind, payload: view.View,
+    scratch: *u8, scratch_capacity: usize) problem.Error {
+    if (path == nil || !kind_valid(kind) ||
+        !memory_range.valid(payload.data, payload.len) ||
+        payload.len > MAX_DOCUMENT_BYTES || scratch == nil ||
+        !memory_range.valid(scratch, scratch_capacity) ||
+        memory_range.overlap(scratch, scratch_capacity, payload.data,
+            payload.len)) {
+        ret storage_error(problem.INVALID_INPUT,
+            "invalid durable document inputs");
+    }
+    # the scratch holds the encoded document and the atomic replacement's own
+    # temporary path allocations. the reserve is deliberately small: a scratch
+    # that cannot cover the replacement's own working storage fails the write
+    # rather than reaching the destination.
+    val encoded: usize = HEADER_BYTES + payload.len;
+    if (scratch_capacity < encoded + 64) {
+        ret storage_error(problem.OUTPUT_TOO_SMALL,
+            "durable document scratch is too small");
+    }
+    var i: usize = 0;
+    for (i < payload.len) {
+        scratch[HEADER_BYTES + i] = payload.data[i];
+        i = i + 1;
+    }
+    if (!write_header(scratch, kind, payload.len)) {
+        ret storage_error(problem.INVALID_STATE,
+            "durable document header could not be sealed");
+    }
+    var allocator: A.Allocator;
+    var state: F.FixedState;
+    if (O.is_some[*u8](F.make(?allocator, ?state, ?scratch[encoded],
+            scratch_capacity - encoded))) {
+        ret storage_error(problem.INVALID_INPUT,
+            "durable document allocator is invalid");
+    }
+    val replaced: O.Option[str] = fs.replace_bytes_atomic(?allocator, path,
+        scratch, encoded, FILE_MODE, DIR_MODE);
+    if (O.is_some[str](replaced)) {
+        # the previous committed document is untouched
+        ret storage_error(problem.STORAGE_FAILED,
+            "durable document could not be replaced");
+    }
+    ret problem.none();
+}
+
+# reads and fully validates a document. magic, schema version, kind, declared
+# length, and payload digest must all agree before any payload is published.
+pub fun read_document(path: str, kind: DocumentKind, buffer: *u8,
+    capacity: usize, output: *Document) problem.Error {
+    if (path == nil || !kind_valid(kind) || buffer == nil || capacity == 0 ||
+        !memory_range.valid(buffer, capacity) || output == nil ||
+        !memory_range.valid(output::*u8, $size_of(Document)) ||
+        memory_range.overlap(buffer, capacity, output::*u8,
+            $size_of(Document))) {
+        ret storage_error(problem.INVALID_INPUT,
+            "invalid durable document read");
+    }
+    val opened: R.Result[fs.File, IO.Error] = fs.open(path);
+    if (R.is_err[fs.File, IO.Error](opened)) {
+        ret storage_error(problem.STORAGE_FAILED,
+            "durable document could not be opened");
+    }
+    var file: fs.File = R.unwrap_ok[fs.File, IO.Error](opened);
+    var total: usize = 0;
+    var reading: bool = true;
+    for (reading) {
+        val received: R.Result[usize, IO.Error] = fs.read(file,
+            ?buffer[total], capacity - total);
+        if (R.is_err[usize, IO.Error](received)) {
+            fs.close(?file);
+            ret storage_error(problem.STORAGE_FAILED,
+                "durable document could not be read");
+        }
+        val count: usize = R.unwrap_ok[usize, IO.Error](received);
+        if (count == 0) { reading = false; }
+        or {
+            total = total + count;
+            if (total == capacity) { reading = false; }
+        }
+    }
+    fs.close(?file);
+    if (total < HEADER_BYTES) {
+        ret storage_error(problem.STORAGE_FAILED,
+            "durable document is truncated");
+    }
+    val magic: str = magic_bytes();
+    var i: usize = 0;
+    for (i < MAGIC_BYTES) {
+        if (buffer[i] != magic[i]) {
+            ret storage_error(problem.STORAGE_FAILED,
+                "durable document has an unrecognized magic");
+        }
+        i = i + 1;
+    }
+    val version: u32 = get_u32(buffer, 8);
+    if (version == 0 || version > SCHEMA_VERSION) {
+        ret storage_error(problem.STORAGE_FAILED,
+            "durable document schema version is not readable");
+    }
+    val stored_kind: DocumentKind = ((buffer[12]::u32 << 8) |
+        buffer[13]::u32)::DocumentKind;
+    if (stored_kind != kind || buffer[14] != 0 || buffer[15] != 0) {
+        ret storage_error(problem.STORAGE_FAILED,
+            "durable document holds a different record kind");
+    }
+    val declared: u64 = get_u64(buffer, 16);
+    if (declared > MAX_DOCUMENT_BYTES::u64 ||
+        declared::usize != total - HEADER_BYTES) {
+        ret storage_error(problem.STORAGE_FAILED,
+            "durable document length does not match its contents");
+    }
+    var digest: [32]u8;
+    if (!sha256(?buffer[HEADER_BYTES], declared::usize, ?digest[0])) {
+        ret storage_error(problem.INVALID_STATE,
+            "durable document digest could not be computed");
+    }
+    i = 0;
+    for (i < 32) {
+        if (digest[i] != buffer[24 + i]) {
+            ret storage_error(problem.STORAGE_FAILED,
+                "durable document payload does not match its digest");
+        }
+        i = i + 1;
+    }
+    @output = Document{kind: stored_kind, version: version,
+        payload: view.view(?buffer[HEADER_BYTES], declared::usize)};
+    ret problem.none();
+}
+
+# a document written by an older schema is readable and reported, so a caller
+# migrates deliberately rather than a reader guessing
+pub fun needs_migration(value: Document) bool {
+    ret value.version < SCHEMA_VERSION;
+}
+
+# copies a validated document to another path. the source is fully verified
+# before anything is written, so a backup can never capture a corrupt document
+# and a restore can never install one.
+pub fun copy_document(from: str, to: str, kind: DocumentKind, buffer: *u8,
+    capacity: usize, scratch: *u8, scratch_capacity: usize) problem.Error {
+    var document: Document;
+    val read: problem.Error = read_document(from, kind, buffer, capacity,
+        ?document);
+    if (problem.failed(read)) { ret read; }
+    ret write_document(to, kind, document.payload, scratch, scratch_capacity);
+}
+
+
+# the store's own declared ceilings. a record that exceeds them is refused
+# rather than truncated, so what is written is always what can be read back.
+pub val MAX_URL_BYTES:        usize = 512;
+pub val MAX_CONTACTS:         usize = 8;
+pub val MAX_CONTACT_BYTES:    usize = 256;
+pub val MAX_KEY_BYTES:        usize = 544;
+pub val MAX_EXPONENT_BYTES:   usize = 8;
+pub val MAX_CHAIN_BYTES:      usize = 16384;
+pub val MAX_IDENTIFIERS:      usize = 8;
+pub val MAX_IDENTIFIER_BYTES: usize = 256;
+pub val MAX_PATH_BYTES:       usize = 4096;
+
+# one decoded account credential living entirely inside the store's context,
+# so every range the manager checks for ownership is one the store owns
+rec AccountSlot {
+    url:             [512]u8;
+    url_len:         usize;
+    orders_url:      [512]u8;
+    orders_url_len:  usize;
+    contact_bytes:   [2048]u8;
+    contact_views:   [8]view.View;
+    contact_len:     usize;
+    key_bytes:       [544]u8;
+    key_len:         usize;
+    exponent_bytes:  [8]u8;
+    exponent_len:    usize;
+    algorithm:       u8;
+    status:          u8;
+    terms:           u8;
+    generation:      u64;
+    present:         bool;
+}
+
+rec CertificateSlot {
+    storage_key:      [512]u8;
+    storage_key_len:  usize;
+    certificate_url:  [512]u8;
+    certificate_url_len: usize;
+    chain_bytes:      [16384]u8;
+    chain_bytes_len:  usize;
+    chain_len:        usize;
+    identifier_bytes: [2048]u8;
+    identifiers:      [8]identifier.Identifier;
+    identifier_len:   usize;
+    not_before_unix:  u64;
+    not_after_unix:   u64;
+    generation:       u64;
+    present:          bool;
+}
+
+# a file-backed store for the two transactional record kinds. one document per
+# storage key holds the committed record, any pending replacement, and the
+# transaction that staged it.
+pub rec Store {
+    anchor:            u8;
+    gate:              storage.Gate;
+    account_path:      str;
+    certificate_path:  str;
+    secret_anchor:     u8;
+    last_token:        u64;
+    txn_token:         u64;
+    txn_generation:    u64;
+    has_transaction:   bool;
+    account_current:   AccountSlot;
+    account_pending:   AccountSlot;
+    certificate_current: CertificateSlot;
+    certificate_pending: CertificateSlot;
+    buffer:            [65536]u8;
+    scratch:           [90112]u8;
+    # a staged record is copied into the slots so it survives a restart, but
+    # the caller's own bytes are adopted for the life of the transaction so
+    # the manager's ownership checks can be answered truthfully
+    account_source:       account.Credentials;
+    account_source_held:  bool;
+    certificate_source:   storage.CertificateRecord;
+    certificate_source_held: bool;
+    ready_flag:        bool;
+    loaded:            bool;
+}
+
+fun store_of(ctx: ptr) *Store { ret ctx::*Store; }
+
+fun certificate_source_overlap(value: storage.CertificateRecord, data: *u8,
+    len: usize) bool {
+    var item_bytes: usize = 0;
+    if (!memory_range.size(value.identifier_len,
+            $size_of(identifier.Identifier), ?item_bytes)) { ret false; }
+    if (memory_range.overlap(data, len, value.storage_key.data,
+            value.storage_key.len) ||
+        memory_range.overlap(data, len, value.certificate_url.data,
+            value.certificate_url.len) ||
+        memory_range.overlap(data, len, value.chain_der.data,
+            value.chain_der.len) ||
+        memory_range.overlap(data, len, value.identifiers::*u8, item_bytes)) {
+        ret true;
+    }
+    var i: usize = 0;
+    for (i < value.identifier_len) {
+        if (memory_range.overlap(data, len, value.identifiers[i].value.data,
+                value.identifiers[i].value.len)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun ready(ctx: ptr) bool {
+    val store: *Store = store_of(ctx);
+    ret store.ready_flag;
+}
+
+# every range this store returns lives inside its own declared context
+pub fun aliases(ctx: ptr, data: *u8, len: usize) bool {
+    val store: *Store = store_of(ctx);
+    if (len == 0) { ret true; }
+    if (!memory_range.valid(data, len)) { ret false; }
+    val start: usize = (?store.anchor)::usize;
+    val finish: usize = start + $size_of(Store);
+    val at: usize = data::usize;
+    if (at >= start && at + len <= finish) { ret true; }
+    if (store.account_source_held &&
+        account.credentials_overlap(store.account_source, data, len)) {
+        ret true;
+    }
+    ret store.certificate_source_held &&
+        certificate_source_overlap(store.certificate_source, data, len);
+}
+
+# the private key itself is never written to disk. the store persists public
+# credential material and one opaque key identity, and the application's
+# secret provider maps that identity back to its key material.
+pub fun owns_secret(ctx: ptr, owner: ptr) bool {
+    val store: *Store = store_of(ctx);
+    ret owner == (?store.secret_anchor)::ptr;
+}
+
+pub fun secret_owner(store: *Store) ptr {
+    ret (?store.secret_anchor)::ptr;
+}
+
+rec Cursor {
+    data:  *u8;
+    cap:   usize;
+    pos:   usize;
+    failed: bool;
+}
+
+fun put_bytes(cursor: *Cursor, data: *u8, len: usize) {
+    if (cursor.failed || len > cursor.cap - cursor.pos ||
+        !memory_range.valid(data, len)) {
+        cursor.failed = true;
+        ret;
+    }
+    var i: usize = 0;
+    for (i < len) {
+        cursor.data[cursor.pos + i] = data[i];
+        i = i + 1;
+    }
+    cursor.pos = cursor.pos + len;
+}
+
+fun put_number(cursor: *Cursor, value: u64) {
+    if (cursor.failed || cursor.cap - cursor.pos < 8) {
+        cursor.failed = true;
+        ret;
+    }
+    put_u64(cursor.data, cursor.pos, value);
+    cursor.pos = cursor.pos + 8;
+}
+
+fun put_block(cursor: *Cursor, data: *u8, len: usize) {
+    put_number(cursor, len::u64);
+    put_bytes(cursor, data, len);
+}
+
+fun take_number(cursor: *Cursor) u64 {
+    if (cursor.failed || cursor.cap - cursor.pos < 8) {
+        cursor.failed = true;
+        ret 0;
+    }
+    val value: u64 = get_u64(cursor.data, cursor.pos);
+    cursor.pos = cursor.pos + 8;
+    ret value;
+}
+
+# copies a length-prefixed block into a fixed destination, refusing anything
+# the store's declared ceiling cannot hold
+fun take_block(cursor: *Cursor, destination: *u8, capacity: usize,
+    len: *usize) {
+    val declared: u64 = take_number(cursor);
+    if (cursor.failed || declared > capacity::u64 ||
+        declared::usize > cursor.cap - cursor.pos) {
+        cursor.failed = true;
+        ret;
+    }
+    var i: usize = 0;
+    for (i < declared::usize) {
+        destination[i] = cursor.data[cursor.pos + i];
+        i = i + 1;
+    }
+    cursor.pos = cursor.pos + declared::usize;
+    @len = declared::usize;
+}
+
+fun account_public_key(slot: *AccountSlot) jose.PublicKey {
+    var key: jose.PublicKey;
+    key.algorithm = slot.algorithm::jose.Algorithm;
+    if (slot.algorithm == jose.PS256) {
+        key.rsa.modulus = contracts.Bytes{data: ?slot.key_bytes[0],
+            len: slot.key_len};
+        key.rsa.exponent = contracts.Bytes{data: ?slot.exponent_bytes[0],
+            len: slot.exponent_len};
+        ret key;
+    }
+    key.value = contracts.Bytes{data: ?slot.key_bytes[0], len: slot.key_len};
+    ret key;
+}
+
+fun slot_credentials(store: *Store, slot: *AccountSlot) account.Credentials {
+    var value: account.Credentials;
+    value.account.url = view.view(?slot.url[0], slot.url_len);
+    value.account.orders_url = view.view(?slot.orders_url[0],
+        slot.orders_url_len);
+    value.account.status = slot.status;
+    value.account.terms_of_service_agreed = slot.terms != 0;
+    value.account.contacts = ?slot.contact_views[0];
+    value.account.contact_len = slot.contact_len;
+    value.signer = jose.signer(account_public_key(slot));
+    value.secret_owner = secret_owner(store);
+    value.generation = slot.generation;
+    ret value;
+}
+
+fun fill_account_slot(slot: *AccountSlot,
+    value: account.Credentials) bool {
+    if (value.account.url.len > MAX_URL_BYTES ||
+        value.account.orders_url.len > MAX_URL_BYTES ||
+        value.account.contact_len > MAX_CONTACTS) { ret false; }
+    var i: usize = 0;
+    for (i < value.account.url.len) {
+        slot.url[i] = value.account.url.data[i];
+        i = i + 1;
+    }
+    slot.url_len = value.account.url.len;
+    i = 0;
+    for (i < value.account.orders_url.len) {
+        slot.orders_url[i] = value.account.orders_url.data[i];
+        i = i + 1;
+    }
+    slot.orders_url_len = value.account.orders_url.len;
+    var used: usize = 0;
+    i = 0;
+    for (i < value.account.contact_len) {
+        val contact: view.View = value.account.contacts[i];
+        if (contact.len > MAX_CONTACT_BYTES ||
+            contact.len > 2048 - used) { ret false; }
+        var j: usize = 0;
+        for (j < contact.len) {
+            slot.contact_bytes[used + j] = contact.data[j];
+            j = j + 1;
+        }
+        slot.contact_views[i] = view.view(?slot.contact_bytes[used],
+            contact.len);
+        used = used + contact.len;
+        i = i + 1;
+    }
+    slot.contact_len = value.account.contact_len;
+    slot.status = value.account.status;
+    slot.terms = 0;
+    if (value.account.terms_of_service_agreed) { slot.terms = 1; }
+    slot.generation = value.generation;
+    slot.algorithm = value.signer.public_key.algorithm::u8;
+    val key: jose.PublicKey = value.signer.public_key;
+    if (slot.algorithm == jose.PS256) {
+        if (key.rsa.modulus.len > MAX_KEY_BYTES ||
+            key.rsa.exponent.len > MAX_EXPONENT_BYTES) { ret false; }
+        i = 0;
+        for (i < key.rsa.modulus.len) {
+            slot.key_bytes[i] = key.rsa.modulus.data[i];
+            i = i + 1;
+        }
+        slot.key_len = key.rsa.modulus.len;
+        i = 0;
+        for (i < key.rsa.exponent.len) {
+            slot.exponent_bytes[i] = key.rsa.exponent.data[i];
+            i = i + 1;
+        }
+        slot.exponent_len = key.rsa.exponent.len;
+    } or {
+        if (key.value.len > MAX_KEY_BYTES) { ret false; }
+        i = 0;
+        for (i < key.value.len) {
+            slot.key_bytes[i] = key.value.data[i];
+            i = i + 1;
+        }
+        slot.key_len = key.value.len;
+        slot.exponent_len = 0;
+    }
+    slot.present = true;
+    ret true;
+}
+
+fun encode_account_slot(cursor: *Cursor, slot: *AccountSlot) {
+    var present: u64 = 0;
+    if (slot.present) { present = 1; }
+    put_number(cursor, present);
+    if (!slot.present) { ret; }
+    put_number(cursor, slot.generation);
+    put_number(cursor, slot.status::u64);
+    put_number(cursor, slot.terms::u64);
+    put_number(cursor, slot.algorithm::u64);
+    put_block(cursor, ?slot.url[0], slot.url_len);
+    put_block(cursor, ?slot.orders_url[0], slot.orders_url_len);
+    put_block(cursor, ?slot.key_bytes[0], slot.key_len);
+    put_block(cursor, ?slot.exponent_bytes[0], slot.exponent_len);
+    put_number(cursor, slot.contact_len::u64);
+    var i: usize = 0;
+    for (i < slot.contact_len) {
+        put_block(cursor, slot.contact_views[i].data,
+            slot.contact_views[i].len);
+        i = i + 1;
+    }
+}
+
+fun decode_account_slot(cursor: *Cursor, slot: *AccountSlot) {
+    slot.present = false;
+    val present: u64 = take_number(cursor);
+    if (cursor.failed || present == 0) { ret; }
+    slot.generation = take_number(cursor);
+    slot.status = take_number(cursor)::u8;
+    slot.terms = take_number(cursor)::u8;
+    slot.algorithm = take_number(cursor)::u8;
+    take_block(cursor, ?slot.url[0], MAX_URL_BYTES, ?slot.url_len);
+    take_block(cursor, ?slot.orders_url[0], MAX_URL_BYTES,
+        ?slot.orders_url_len);
+    take_block(cursor, ?slot.key_bytes[0], MAX_KEY_BYTES, ?slot.key_len);
+    take_block(cursor, ?slot.exponent_bytes[0], MAX_EXPONENT_BYTES,
+        ?slot.exponent_len);
+    val count: u64 = take_number(cursor);
+    if (cursor.failed || count > MAX_CONTACTS::u64) {
+        cursor.failed = true;
+        ret;
+    }
+    var used: usize = 0;
+    var i: usize = 0;
+    for (i < count::usize) {
+        var len: usize = 0;
+        take_block(cursor, ?slot.contact_bytes[used], MAX_CONTACT_BYTES,
+            ?len);
+        if (cursor.failed || len > 2048 - used) {
+            cursor.failed = true;
+            ret;
+        }
+        slot.contact_views[i] = view.view(?slot.contact_bytes[used], len);
+        used = used + len;
+        i = i + 1;
+    }
+    slot.contact_len = count::usize;
+    slot.present = !cursor.failed;
+}
+
+fun encode_certificate_slot(cursor: *Cursor, slot: *CertificateSlot) {
+    var present: u64 = 0;
+    if (slot.present) { present = 1; }
+    put_number(cursor, present);
+    if (!slot.present) { ret; }
+    put_number(cursor, slot.generation);
+    put_number(cursor, slot.chain_len::u64);
+    put_number(cursor, slot.not_before_unix);
+    put_number(cursor, slot.not_after_unix);
+    put_block(cursor, ?slot.storage_key[0], slot.storage_key_len);
+    put_block(cursor, ?slot.certificate_url[0], slot.certificate_url_len);
+    put_block(cursor, ?slot.chain_bytes[0], slot.chain_bytes_len);
+    put_number(cursor, slot.identifier_len::u64);
+    var i: usize = 0;
+    for (i < slot.identifier_len) {
+        put_number(cursor, slot.identifiers[i].kind::u64);
+        put_block(cursor, slot.identifiers[i].value.data,
+            slot.identifiers[i].value.len);
+        i = i + 1;
+    }
+}
+
+fun decode_certificate_slot(cursor: *Cursor, slot: *CertificateSlot) {
+    slot.present = false;
+    val present: u64 = take_number(cursor);
+    if (cursor.failed || present == 0) { ret; }
+    slot.generation = take_number(cursor);
+    slot.chain_len = take_number(cursor)::usize;
+    slot.not_before_unix = take_number(cursor);
+    slot.not_after_unix = take_number(cursor);
+    take_block(cursor, ?slot.storage_key[0], MAX_URL_BYTES,
+        ?slot.storage_key_len);
+    take_block(cursor, ?slot.certificate_url[0], MAX_URL_BYTES,
+        ?slot.certificate_url_len);
+    take_block(cursor, ?slot.chain_bytes[0], MAX_CHAIN_BYTES,
+        ?slot.chain_bytes_len);
+    val count: u64 = take_number(cursor);
+    if (cursor.failed || count > MAX_IDENTIFIERS::u64) {
+        cursor.failed = true;
+        ret;
+    }
+    var used: usize = 0;
+    var i: usize = 0;
+    for (i < count::usize) {
+        slot.identifiers[i].kind = take_number(cursor)::u8;
+        var len: usize = 0;
+        take_block(cursor, ?slot.identifier_bytes[used],
+            MAX_IDENTIFIER_BYTES, ?len);
+        if (cursor.failed || len > 2048 - used) {
+            cursor.failed = true;
+            ret;
+        }
+        slot.identifiers[i].value = view.view(?slot.identifier_bytes[used],
+            len);
+        used = used + len;
+        i = i + 1;
+    }
+    slot.identifier_len = count::usize;
+    slot.present = !cursor.failed;
+}
+
+# the document holds the committed record, any pending replacement, and the
+# transaction that staged it, so a restart can see exactly what was in flight
+fun persist(store: *Store, kind: DocumentKind) bool {
+    var cursor: Cursor = Cursor{data: ?store.buffer[0], cap: 65536, pos: 0,
+        failed: false};
+    put_number(?cursor, store.last_token);
+    var active: u64 = 0;
+    if (store.has_transaction) { active = 1; }
+    put_number(?cursor, active);
+    put_number(?cursor, store.txn_token);
+    put_number(?cursor, store.txn_generation);
+    if (kind == DOC_ACCOUNT) {
+        encode_account_slot(?cursor, ?store.account_current);
+        encode_account_slot(?cursor, ?store.account_pending);
+    } or {
+        encode_certificate_slot(?cursor, ?store.certificate_current);
+        encode_certificate_slot(?cursor, ?store.certificate_pending);
+    }
+    if (cursor.failed) { ret false; }
+    var path: str = store.account_path;
+    if (kind == DOC_CERTIFICATE) { path = store.certificate_path; }
+    ret !problem.failed(write_document(path, kind,
+        view.view(?store.buffer[0], cursor.pos), ?store.scratch[0], 90112));
+}
+
+fun load_kind(store: *Store, kind: DocumentKind) problem.Error {
+    var path: str = store.account_path;
+    if (kind == DOC_CERTIFICATE) { path = store.certificate_path; }
+    if (path == nil) { ret problem.none(); }
+    var document: Document;
+    val read: problem.Error = read_document(path, kind, ?store.buffer[0],
+        65536, ?document);
+    if (problem.failed(read)) {
+        # a document that has never been written is not a failure. one that
+        # exists but does not validate is.
+        if (!fs.exists(path)) { ret problem.none(); }
+        ret read;
+    }
+    var cursor: Cursor = Cursor{data: document.payload.data,
+        cap: document.payload.len, pos: 0, failed: false};
+    val token: u64 = take_number(?cursor);
+    val active: u64 = take_number(?cursor);
+    val txn_token: u64 = take_number(?cursor);
+    val txn_generation: u64 = take_number(?cursor);
+    if (kind == DOC_ACCOUNT) {
+        decode_account_slot(?cursor, ?store.account_current);
+        decode_account_slot(?cursor, ?store.account_pending);
+    } or {
+        decode_certificate_slot(?cursor, ?store.certificate_current);
+        decode_certificate_slot(?cursor, ?store.certificate_pending);
+    }
+    if (cursor.failed || cursor.pos != cursor.cap) {
+        ret storage_error(problem.STORAGE_FAILED,
+            "durable record payload is malformed");
+    }
+    if (token > store.last_token) { store.last_token = token; }
+    if (active != 0) {
+        store.has_transaction = true;
+        store.txn_token = txn_token;
+        store.txn_generation = txn_generation;
+    }
+    ret problem.none();
+}
+
+fun same_bytes(first: *u8, second: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the durable conflict check. the expected generation must match what is
+# committed for this key, so a writer working from a stale read is refused
+# rather than overwriting a newer record.
+fun generation_matches(store: *Store, key: view.View,
+    expected: u64) bool {
+    if (store.account_current.present &&
+        key.len == store.account_current.url_len &&
+        same_bytes(key.data, ?store.account_current.url[0], key.len)) {
+        ret expected == store.account_current.generation;
+    }
+    if (store.certificate_current.present &&
+        key.len == store.certificate_current.storage_key_len &&
+        same_bytes(key.data, ?store.certificate_current.storage_key[0],
+            key.len)) {
+        ret expected == store.certificate_current.generation;
+    }
+    # nothing committed under this key yet, so only a first write is admitted
+    ret expected == 0;
+}
+
+pub fun begin(ctx: ptr, key: view.View, generation: u64) storage.BeginResult {
+    val store: *Store = store_of(ctx);
+    var result: storage.BeginResult;
+    result.status = storage.FAILED;
+    if (store.has_transaction || store.last_token == 0xffffffffffffffff ||
+        !memory_range.valid(key.data, key.len) || key.len == 0) {
+        ret result;
+    }
+    if (!generation_matches(store, key, generation)) {
+        result.status = storage.CONFLICT;
+        ret result;
+    }
+    store.last_token = store.last_token + 1;
+    store.txn_token = store.last_token;
+    store.txn_generation = generation;
+    store.has_transaction = true;
+    # the token is durable before it is handed out, so it stays monotonic
+    # across a restart even if nothing is ever staged against it
+    if (!persist(store, DOC_ACCOUNT) || !persist(store, DOC_CERTIFICATE)) {
+        store.has_transaction = false;
+        ret result;
+    }
+    result.status = storage.SUCCESS;
+    result.transaction = storage.Transaction{owner: ctx,
+        token: store.txn_token, generation: generation};
+    ret result;
+}
+
+fun transaction_current(store: *Store, value: storage.Transaction) bool {
+    ret store.has_transaction && value.token == store.txn_token;
+}
+
+pub fun stage(ctx: ptr, transaction: storage.Transaction,
+    value: account.Credentials) storage.Status {
+    val store: *Store = store_of(ctx);
+    if (!transaction_current(store, transaction)) { ret storage.CONFLICT; }
+    if (!fill_account_slot(?store.account_pending, value)) {
+        ret storage.FAILED;
+    }
+    store.account_source = value;
+    store.account_source_held = true;
+    if (!persist(store, DOC_ACCOUNT)) {
+        store.account_pending.present = false;
+        store.account_source_held = false;
+        ret storage.FAILED;
+    }
+    ret storage.SUCCESS;
+}
+
+pub fun stage_certificate(ctx: ptr, transaction: storage.Transaction,
+    value: storage.CertificateRecord) storage.Status {
+    val store: *Store = store_of(ctx);
+    if (!transaction_current(store, transaction)) { ret storage.CONFLICT; }
+    var slot: *CertificateSlot = ?store.certificate_pending;
+    if (value.storage_key.len > MAX_URL_BYTES ||
+        value.certificate_url.len > MAX_URL_BYTES ||
+        value.chain_der.len > MAX_CHAIN_BYTES ||
+        value.identifier_len > MAX_IDENTIFIERS) { ret storage.FAILED; }
+    var i: usize = 0;
+    for (i < value.storage_key.len) {
+        slot.storage_key[i] = value.storage_key.data[i];
+        i = i + 1;
+    }
+    slot.storage_key_len = value.storage_key.len;
+    i = 0;
+    for (i < value.certificate_url.len) {
+        slot.certificate_url[i] = value.certificate_url.data[i];
+        i = i + 1;
+    }
+    slot.certificate_url_len = value.certificate_url.len;
+    i = 0;
+    for (i < value.chain_der.len) {
+        slot.chain_bytes[i] = value.chain_der.data[i];
+        i = i + 1;
+    }
+    slot.chain_bytes_len = value.chain_der.len;
+    slot.chain_len = value.chain_len;
+    slot.not_before_unix = value.not_before_unix;
+    slot.not_after_unix = value.not_after_unix;
+    slot.generation = value.generation;
+    var used: usize = 0;
+    i = 0;
+    for (i < value.identifier_len) {
+        val entry: identifier.Identifier = value.identifiers[i];
+        if (entry.value.len > MAX_IDENTIFIER_BYTES ||
+            entry.value.len > 2048 - used) { ret storage.FAILED; }
+        var j: usize = 0;
+        for (j < entry.value.len) {
+            slot.identifier_bytes[used + j] = entry.value.data[j];
+            j = j + 1;
+        }
+        slot.identifiers[i] = identifier.Identifier{kind: entry.kind,
+            value: view.view(?slot.identifier_bytes[used], entry.value.len)};
+        used = used + entry.value.len;
+        i = i + 1;
+    }
+    slot.identifier_len = value.identifier_len;
+    slot.present = true;
+    store.certificate_source = value;
+    store.certificate_source_held = true;
+    if (!persist(store, DOC_CERTIFICATE)) {
+        slot.present = false;
+        store.certificate_source_held = false;
+        ret storage.FAILED;
+    }
+    ret storage.SUCCESS;
+}
+
+pub fun commit(ctx: ptr, transaction: storage.Transaction) storage.Status {
+    val store: *Store = store_of(ctx);
+    if (!transaction_current(store, transaction)) { ret storage.CONFLICT; }
+    val account_staged: bool = store.account_pending.present;
+    val certificate_staged: bool = store.certificate_pending.present;
+    if (!account_staged && !certificate_staged) { ret storage.CONFLICT; }
+    if (account_staged) {
+        store.account_current = store.account_pending;
+        # the copied views must point into the committed slot, not the pending
+        # one, so they survive the pending slot being cleared
+        var i: usize = 0;
+        for (i < store.account_current.contact_len) {
+            val at: usize = store.account_pending.contact_views[i].data::usize -
+                (?store.account_pending.contact_bytes[0])::usize;
+            store.account_current.contact_views[i] = view.view(
+                ?store.account_current.contact_bytes[at],
+                store.account_pending.contact_views[i].len);
+            i = i + 1;
+        }
+        store.account_pending.present = false;
+    }
+    if (certificate_staged) {
+        store.certificate_current = store.certificate_pending;
+        var i: usize = 0;
+        for (i < store.certificate_current.identifier_len) {
+            val at: usize =
+                store.certificate_pending.identifiers[i].value.data::usize -
+                (?store.certificate_pending.identifier_bytes[0])::usize;
+            store.certificate_current.identifiers[i].value = view.view(
+                ?store.certificate_current.identifier_bytes[at],
+                store.certificate_pending.identifiers[i].value.len);
+            i = i + 1;
+        }
+        store.certificate_pending.present = false;
+    }
+    store.has_transaction = false;
+    store.account_source_held = false;
+    store.certificate_source_held = false;
+    if (!persist(store, DOC_ACCOUNT) || !persist(store, DOC_CERTIFICATE)) {
+        ret storage.UNKNOWN;
+    }
+    ret storage.SUCCESS;
+}
+
+pub fun abort(ctx: ptr, transaction: storage.Transaction) storage.Status {
+    val store: *Store = store_of(ctx);
+    if (!transaction_current(store, transaction)) { ret storage.CONFLICT; }
+    store.account_pending.present = false;
+    store.certificate_pending.present = false;
+    store.has_transaction = false;
+    store.account_source_held = false;
+    store.certificate_source_held = false;
+    if (!persist(store, DOC_ACCOUNT) || !persist(store, DOC_CERTIFICATE)) {
+        ret storage.UNKNOWN;
+    }
+    ret storage.SUCCESS;
+}
+
+pub fun load(ctx: ptr, url: view.View, output: *storage.Snapshot) storage.Status {
+    val store: *Store = store_of(ctx);
+    var result: storage.Snapshot;
+    result.status = storage.NOT_FOUND;
+    if (store.account_current.present) {
+        result.status = storage.SUCCESS;
+        result.current = slot_credentials(store, ?store.account_current);
+    }
+    result.has_pending = store.account_pending.present;
+    if (result.has_pending) {
+        result.pending = slot_credentials(store, ?store.account_pending);
+        result.transaction = storage.Transaction{owner: ctx,
+            token: store.txn_token, generation: store.txn_generation};
+    }
+    @output = result;
+    ret result.status;
+}
+
+fun slot_certificate(store: *Store,
+    slot: *CertificateSlot) storage.CertificateRecord {
+    ret storage.CertificateRecord{
+        storage_key: view.view(?slot.storage_key[0], slot.storage_key_len),
+        certificate_url: view.view(?slot.certificate_url[0],
+            slot.certificate_url_len),
+        chain_der: view.view(?slot.chain_bytes[0], slot.chain_bytes_len),
+        chain_len: slot.chain_len,
+        private_key_owner: secret_owner(store),
+        identifiers: ?slot.identifiers[0],
+        identifier_len: slot.identifier_len,
+        not_before_unix: slot.not_before_unix,
+        not_after_unix: slot.not_after_unix,
+        generation: slot.generation};
+}
+
+pub fun load_certificate(ctx: ptr, key: view.View,
+    output: *storage.CertificateSnapshot) storage.Status {
+    val store: *Store = store_of(ctx);
+    var result: storage.CertificateSnapshot;
+    result.status = storage.NOT_FOUND;
+    if (store.certificate_current.present) {
+        result.status = storage.SUCCESS;
+        result.current = slot_certificate(store, ?store.certificate_current);
+    }
+    result.has_pending = store.certificate_pending.present;
+    if (result.has_pending) {
+        result.pending = slot_certificate(store, ?store.certificate_pending);
+        result.transaction = storage.Transaction{owner: ctx,
+            token: store.txn_token, generation: store.txn_generation};
+    }
+    @output = result;
+    ret result.status;
+}
+
+pub fun descriptor(store: *Store) storage.Store {
+    ret storage.Store{ctx: store::ptr, context_anchor: ?store.anchor,
+        context_size: $size_of(Store), gate: ?store.gate, ready: ready,
+        aliases: aliases, owns_secret: owns_secret, begin: begin,
+        stage: stage, commit: commit, abort: abort, load: load,
+        stage_certificate: stage_certificate,
+        load_certificate: load_certificate};
+}
+
+# opens the store and reads whatever the last run committed or left pending.
+# a document that exists but does not validate is reported rather than
+# silently treated as absent.
+pub fun open_store(store: *Store, account_path: str,
+    certificate_path: str) problem.Error {
+    if (store == nil || !memory_range.valid(store::*u8, $size_of(Store))) {
+        ret storage_error(problem.INVALID_INPUT, "invalid durable store");
+    }
+    store.account_path = account_path;
+    store.certificate_path = certificate_path;
+    store.last_token = 0;
+    store.txn_token = 0;
+    store.txn_generation = 0;
+    store.has_transaction = false;
+    store.account_source_held = false;
+    store.certificate_source_held = false;
+    store.account_current.present = false;
+    store.account_pending.present = false;
+    store.certificate_current.present = false;
+    store.certificate_pending.present = false;
+    store.ready_flag = true;
+    store.gate.initialized = false;
+    store.gate.callback_owner = 0;
+    val account_loaded: problem.Error = load_kind(store, DOC_ACCOUNT);
+    if (problem.failed(account_loaded)) {
+        store.ready_flag = false;
+        ret account_loaded;
+    }
+    val certificate_loaded: problem.Error = load_kind(store,
+        DOC_CERTIFICATE);
+    if (problem.failed(certificate_loaded)) {
+        store.ready_flag = false;
+        ret certificate_loaded;
+    }
+    store.loaded = true;
+    ret problem.none();
+}
