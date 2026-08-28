@@ -62,6 +62,7 @@ pub rec Limits {
     max_json_depth:          usize;
     max_json_values:         usize;
     max_json_key_bytes:      usize;
+    max_json_key_comparisons: usize;
     max_caa_identities:      usize;
     max_problem_subproblems: usize;
     max_bad_nonce_retries:   usize;
@@ -89,7 +90,7 @@ pub rec WireRequest {
 }
 
 pub rec Client {
-    nonces:      *nonce.Pool;
+    nonces:      nonce.Pool;
     limits:      Limits;
     generation:  u64;
     initialized: bool;
@@ -224,6 +225,155 @@ fun mutable_regions_overlap(first: *u8, first_len: usize, second: *u8,
         memory_range.overlap(first, first_len, second, second_len);
 }
 
+fun view_same(first: view.View, second: view.View) bool {
+    ret first.data == second.data && first.len == second.len;
+}
+
+fun field_limits_same(first: field.Limits, second: field.Limits) bool {
+    ret first.max_count == second.max_count && first.max_bytes == second.max_bytes &&
+        first.max_name_bytes == second.max_name_bytes &&
+        first.max_value_bytes == second.max_value_bytes;
+}
+
+fun limits_same(first: Limits, second: Limits) bool {
+    ret first.max_request_bytes == second.max_request_bytes &&
+        first.max_response_bytes == second.max_response_bytes &&
+        first.max_problem_bytes == second.max_problem_bytes &&
+        first.max_nonce_bytes == second.max_nonce_bytes &&
+        first.max_url_bytes == second.max_url_bytes &&
+        first.max_json_scratch == second.max_json_scratch &&
+        first.max_json_depth == second.max_json_depth &&
+        first.max_json_values == second.max_json_values &&
+        first.max_json_key_bytes == second.max_json_key_bytes &&
+        first.max_json_key_comparisons == second.max_json_key_comparisons &&
+        first.max_caa_identities == second.max_caa_identities &&
+        first.max_problem_subproblems == second.max_problem_subproblems &&
+        first.max_bad_nonce_retries == second.max_bad_nonce_retries &&
+        first.request_timeout_ns == second.request_timeout_ns &&
+        field_limits_same(first.response_fields, second.response_fields);
+}
+
+fun client_same(first: Client, second: *Client) bool {
+    ret second != nil && nonce.same(first.nonces, second.nonces) &&
+        limits_same(first.limits, second.limits) &&
+        first.generation == second.generation &&
+        first.initialized == second.initialized;
+}
+
+fun request_same(first: SignedRequest, second: *SignedRequest) bool {
+    if (second == nil || !view_same(first.spec.url, second.spec.url) ||
+        !view_same(first.spec.payload, second.spec.payload) ||
+        !view_same(first.spec.kid, second.spec.kid) ||
+        first.spec.use_jwk != second.spec.use_jwk ||
+        !view_same(first.wire_body, second.wire_body) ||
+        first.client_owner != second.client_owner ||
+        first.client_generation != second.client_generation ||
+        first.state != second.state || first.attempts != second.attempts ||
+        first.bad_nonce_retries != second.bad_nonce_retries ||
+        first.retry_nonce_len != second.retry_nonce_len ||
+        first.retry_nonce_ready != second.retry_nonce_ready) { ret false; }
+    var i: usize = 0;
+    for (i < 512) {
+        if (first.retry_nonce[i] != second.retry_nonce[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun callback_error(detail: str) problem.Error {
+    ret problem.local_code(problem.NONCE, problem.INVALID_STATE, detail);
+}
+
+fun pool_ready_snapshot(client: *Client, request: *SignedRequest,
+    output: *nonce.Pool) problem.Error {
+    if (client == nil || request == nil || output == nil ||
+        !nonce.descriptor_valid(client.nonces)) {
+        ret callback_error("nonce pool descriptor is invalid");
+    }
+    val snapshot: nonce.Pool = client.nonces;
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val ready: bool = snapshot.ready(snapshot.ctx);
+    if (!client_same(client_before, client) ||
+        !request_same(request_before, request)) {
+        ret callback_error("nonce readiness callback mutated protocol state");
+    }
+    if (!ready) { ret callback_error("nonce pool is not ready"); }
+    @output = snapshot;
+    ret problem.none();
+}
+
+fun pool_take(client: *Client, request: *SignedRequest, output: *u8,
+    capacity: usize) nonce.Taken {
+    var snapshot: nonce.Pool;
+    val ready: problem.Error = pool_ready_snapshot(client, request, ?snapshot);
+    if (problem.failed(ready)) {
+        ret nonce.Taken{error: ready, found: false, value: view.view(nil, 0)};
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val result: nonce.Taken = snapshot.take(snapshot.ctx, output, capacity);
+    if (!client_same(client_before, client) ||
+        !request_same(request_before, request)) {
+        ret nonce.Taken{error: callback_error(
+            "nonce take callback mutated protocol state"),
+            found: false, value: view.view(nil, 0)};
+    }
+    if (problem.failed(result.error)) {
+        if (result.found || result.value.data != nil || result.value.len != 0) {
+            ret nonce.Taken{error: callback_error(
+                "nonce take callback returned inconsistent failure"),
+                found: false, value: view.view(nil, 0)};
+        }
+        ret result;
+    }
+    if (!result.found) {
+        if (result.value.data != nil || result.value.len != 0) {
+            ret nonce.Taken{error: callback_error(
+                "nonce take callback returned inconsistent empty result"),
+                found: false, value: view.view(nil, 0)};
+        }
+        ret result;
+    }
+    if (result.value.data != output || result.value.len == 0 ||
+        result.value.len > capacity || result.value.len > snapshot.max_nonce_bytes ||
+        !nonce.value_valid(result.value, snapshot.max_nonce_bytes)) {
+        ret nonce.Taken{error: callback_error(
+            "nonce take callback violated output ownership"),
+            found: false, value: view.view(nil, 0)};
+    }
+    ret result;
+}
+
+fun pool_put(client: *Client, request: *SignedRequest,
+    value: view.View) problem.Error {
+    var snapshot: nonce.Pool;
+    val ready: problem.Error = pool_ready_snapshot(client, request, ?snapshot);
+    if (problem.failed(ready)) { ret ready; }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val result: problem.Error = snapshot.put(snapshot.ctx, value);
+    if (!client_same(client_before, client) ||
+        !request_same(request_before, request)) {
+        ret callback_error("nonce put callback mutated protocol state");
+    }
+    ret result;
+}
+
+fun pool_clear(client: *Client, request: *SignedRequest) problem.Error {
+    var snapshot: nonce.Pool;
+    val ready: problem.Error = pool_ready_snapshot(client, request, ?snapshot);
+    if (problem.failed(ready)) { ret ready; }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val result: problem.Error = snapshot.clear(snapshot.ctx);
+    if (!client_same(client_before, client) ||
+        !request_same(request_before, request)) {
+        ret callback_error("nonce clear callback mutated protocol state");
+    }
+    ret result;
+}
+
 pub fun limits_default() Limits {
     ret Limits{
         max_request_bytes: 1048576,
@@ -235,6 +385,7 @@ pub fun limits_default() Limits {
         max_json_depth: 16,
         max_json_values: 4096,
         max_json_key_bytes: 128,
+        max_json_key_comparisons: 65536,
         max_caa_identities: 64,
         max_problem_subproblems: 64,
         max_bad_nonce_retries: 3,
@@ -253,7 +404,9 @@ fun limits_valid(configured: Limits) bool {
         configured.max_url_bytes != 0 && configured.max_url_bytes <= 4096 &&
         configured.max_json_scratch != 0 && configured.max_json_depth != 0 &&
         configured.max_json_values != 0 && configured.max_json_key_bytes != 0 &&
-        configured.max_json_key_bytes <= 128 && configured.max_caa_identities != 0 &&
+        configured.max_json_key_bytes <= 128 &&
+        configured.max_json_key_comparisons != 0 &&
+        configured.max_caa_identities != 0 &&
         configured.max_problem_subproblems != 0 &&
         configured.max_bad_nonce_retries != 0 && configured.request_timeout_ns != 0 &&
         configured.response_fields.max_count != 0 &&
@@ -269,13 +422,25 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
         memory_range.overlap(client::*u8, $size_of(Client),
             nonces::*u8, $size_of(nonce.Pool)) ||
         client.initialized || client.generation == 18446744073709551615 ||
-        !nonce.valid(nonces) ||
-        !limits_valid(configured) ||
-        nonces.max_nonce_bytes > configured.max_nonce_bytes) {
+        !limits_valid(configured)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid acme client configuration");
     }
-    client.nonces = nonces;
+    val snapshot: nonce.Pool = @nonces;
+    if (!nonce.descriptor_valid(snapshot) ||
+        snapshot.max_nonce_bytes > configured.max_nonce_bytes ||
+        memory_range.overlap(client::*u8, $size_of(Client),
+            snapshot.ctx::*u8, 1)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid acme nonce pool configuration");
+    }
+    val before: Client = @client;
+    val ready: bool = snapshot.ready(snapshot.ctx);
+    if (!client_same(before, client) || !ready) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "acme nonce pool is not ready or mutated client state");
+    }
+    client.nonces = snapshot;
     client.limits = configured;
     client.generation = client.generation + 1;
     client.initialized = true;
@@ -285,7 +450,7 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
 pub fun release(client: *Client) bool {
     if (client == nil || !memory_range.valid(client::*u8, $size_of(Client)) ||
         !client.initialized) { ret false; }
-    client.nonces = nil;
+    client.nonces = nonce.Pool{};
     client.limits = Limits{};
     client.initialized = false;
     ret true;
@@ -296,7 +461,8 @@ fun json_limits(configured: Limits, maximum: usize) json.Limits {
     if (max_bytes > configured.max_response_bytes) { max_bytes = configured.max_response_bytes; }
     ret json.Limits{max_bytes: max_bytes, max_depth: configured.max_json_depth,
         max_values: configured.max_json_values,
-        max_key_bytes: configured.max_json_key_bytes};
+        max_key_bytes: configured.max_json_key_bytes,
+        max_key_comparisons: configured.max_json_key_comparisons};
 }
 
 fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
@@ -885,14 +1051,14 @@ fun replay_nonce(response: Response, configured: Limits,
 }
 
 fun store_response_nonce(client: *Client, response: Response,
-    stored: *bool) problem.Error {
+    request: *SignedRequest, stored: *bool) problem.Error {
     var value: view.View;
     val parsed: problem.Error = replay_nonce(response, client.limits,
         ?value);
     if (problem.failed(parsed)) { ret parsed; }
     @stored = false;
     if (value.len != 0) {
-        val put: problem.Error = client.nonces.put(client.nonces.ctx, value);
+        val put: problem.Error = pool_put(client, request, value);
         if (problem.failed(put)) {
             if (put.code == problem.DUPLICATE_NONCE ||
                 put.code == problem.NONCE_STORAGE_FULL) {
@@ -975,11 +1141,9 @@ pub fun begin_signed(client: *Client, request: *SignedRequest,
     if (client == nil || request == nil ||
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
-        !memory_range.valid(client.nonces::*u8, $size_of(nonce.Pool)) ||
+        !nonce.descriptor_valid(client.nonces) ||
         memory_range.overlap(request::*u8, $size_of(SignedRequest),
             client::*u8, $size_of(Client)) ||
-        memory_range.overlap(request::*u8, $size_of(SignedRequest),
-            client.nonces::*u8, $size_of(nonce.Pool)) ||
         memory_range.overlap(request::*u8, $size_of(SignedRequest),
             spec.url.data, spec.url.len) ||
         memory_range.overlap(request::*u8, $size_of(SignedRequest),
@@ -1040,7 +1204,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
     }
     if (!memory_range.valid(work.data, work.capacity) ||
         !memory_range.valid(bounded_output.data, bounded_output.capacity) ||
-        !memory_range.valid(client.nonces::*u8, $size_of(nonce.Pool)) ||
+        !nonce.descriptor_valid(client.nonces) ||
         memory_range.overlap(work.data, work.capacity,
             bounded_output.data, bounded_output.capacity) ||
         memory_range.overlap(work.data, work.capacity, client::*u8,
@@ -1054,16 +1218,10 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
         ret jose.Operation{error: problem.local_code(problem.PROTOCOL,
             problem.INVALID_INPUT, "signed request buffers overlap state"), written: 0};
     }
-    if (memory_range.overlap(work.data, work.capacity, client.nonces::*u8,
-            $size_of(nonce.Pool)) ||
-        memory_range.overlap(bounded_output.data, bounded_output.capacity,
-            client.nonces::*u8, $size_of(nonce.Pool)) ||
-        memory_range.overlap(request::*u8, $size_of(SignedRequest),
-            client.nonces::*u8, $size_of(nonce.Pool)) ||
-        jose.signing_inputs_overlap(signer, private_key,
+    if (jose.signing_inputs_overlap(signer, private_key,
             request::*u8, $size_of(SignedRequest)) ||
         jose.signing_inputs_overlap(signer, private_key,
-            client.nonces::*u8, $size_of(nonce.Pool))) {
+            client::*u8, $size_of(Client))) {
         ret jose.Operation{error: problem.local_code(problem.PROTOCOL,
             problem.INVALID_INPUT, "signing inputs alias protocol state"), written: 0};
     }
@@ -1079,7 +1237,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
             i = i + 1;
         }
     } or {
-        val taken: nonce.Taken = client.nonces.take(client.nonces.ctx,
+        val taken: nonce.Taken = pool_take(client, request,
             ?nonce_bytes[0], client.limits.max_nonce_bytes);
         if (problem.failed(taken.error)) {
             ret jose.Operation{error: taken.error, written: 0};
@@ -1187,25 +1345,21 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
         wipe_retry_nonce(request);
         ret Decision{action: ACTION_FAILED, cause: shaped};
     }
-    if (!memory_range.valid(client.nonces::*u8, $size_of(nonce.Pool)) ||
+    if (!nonce.descriptor_valid(client.nonces) ||
         response_overlaps(response, request::*u8, $size_of(SignedRequest)) ||
-        response_overlaps(response, client::*u8, $size_of(Client)) ||
-        response_overlaps(response, client.nonces::*u8,
-            $size_of(nonce.Pool))) {
+        response_overlaps(response, client::*u8, $size_of(Client))) {
         val error: problem.Error = problem.local_code(problem.PROTOCOL,
             problem.INVALID_INPUT, "response aliases signed request state");
         ret Decision{action: ACTION_FAILED, cause: error};
     }
     if (response.status >= 200 && response.status < 300) {
-        request.wire_body = view.view(nil, 0);
         var stored: bool = false;
         val nonce_status: problem.Error = store_response_nonce(client, response,
-            ?stored);
+            request, ?stored);
         if (problem.failed(nonce_status)) {
-            request.state = REQUEST_FAILED;
-            wipe_retry_nonce(request);
             ret Decision{action: ACTION_FAILED, cause: nonce_status};
         }
+        request.wire_body = view.view(nil, 0);
         request.state = REQUEST_COMPLETE;
         wipe_retry_nonce(request);
         ret Decision{action: ACTION_COMPLETE, cause: problem.none()};
@@ -1229,26 +1383,15 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
             problem.INVALID_INPUT, "problem buffers alias protocol state");
         ret Decision{action: ACTION_FAILED, cause: error};
     }
-    if (memory_range.overlap(scratch, scratch_capacity,
-            client.nonces::*u8, $size_of(nonce.Pool)) ||
-        memory_range.overlap(storage.data, storage.capacity,
-            client.nonces::*u8, $size_of(nonce.Pool)) ||
-        memory_range.overlap(storage.subproblems::*u8, subproblem_bytes,
-            client.nonces::*u8, $size_of(nonce.Pool))) {
-        val error: problem.Error = problem.local_code(problem.PROTOCOL,
-            problem.INVALID_INPUT, "problem buffers alias nonce state");
-        ret Decision{action: ACTION_FAILED, cause: error};
-    }
     val cause: problem.Error = parse_problem(response, client.limits, scratch,
         scratch_capacity, storage);
-    request.wire_body = view.view(nil, 0);
     if (cause.code == problem.BAD_NONCE) {
-        wipe_retry_nonce(request);
-        val cleared: problem.Error = client.nonces.clear(client.nonces.ctx);
+        val cleared: problem.Error = pool_clear(client, request);
         if (problem.failed(cleared)) {
-            request.state = REQUEST_FAILED;
             ret Decision{action: ACTION_FAILED, cause: cleared};
         }
+        request.wire_body = view.view(nil, 0);
+        wipe_retry_nonce(request);
         if (request.bad_nonce_retries >= client.limits.max_bad_nonce_retries) {
             request.state = REQUEST_FAILED;
             var limited: problem.Error = cause;
@@ -1276,12 +1419,13 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
     }
     var stored: bool = false;
     val nonce_status: problem.Error = store_response_nonce(client, response,
-        ?stored);
-    request.state = REQUEST_FAILED;
-    wipe_retry_nonce(request);
+        request, ?stored);
     if (problem.failed(nonce_status)) {
         ret Decision{action: ACTION_FAILED, cause: nonce_status};
     }
+    request.wire_body = view.view(nil, 0);
+    request.state = REQUEST_FAILED;
+    wipe_retry_nonce(request);
     ret Decision{action: ACTION_FAILED, cause: cause};
 }
 
@@ -1303,11 +1447,9 @@ pub fun accept_nonce_response(client: *Client, request: *SignedRequest,
         wipe_retry_nonce(request);
         ret shaped;
     }
-    if (!memory_range.valid(client.nonces::*u8, $size_of(nonce.Pool)) ||
+    if (!nonce.descriptor_valid(client.nonces) ||
         response_overlaps(response, request::*u8, $size_of(SignedRequest)) ||
-        response_overlaps(response, client::*u8, $size_of(Client)) ||
-        response_overlaps(response, client.nonces::*u8,
-            $size_of(nonce.Pool))) {
+        response_overlaps(response, client::*u8, $size_of(Client))) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "nonce response aliases signed request state");
     }

@@ -5,6 +5,7 @@ use http.core.field;
 use http.core.method;
 use http.core.status;
 use std.runtime;
+use J: std.data.json;
 use std.encoding.base64;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -112,6 +113,72 @@ fun awaiting(protocol: *client.Client, request: *client.SignedRequest) {
     request.client_generation = protocol.generation;
     request.wire_body = view.view("prepared", 8);
     request.state = client.REQUEST_AWAITING;
+}
+
+val HOSTILE_NORMAL:        u8 = 0;
+val HOSTILE_OVERSIZED:     u8 = 1;
+val HOSTILE_FOREIGN:       u8 = 2;
+val HOSTILE_TAKE_REQUEST:  u8 = 3;
+val HOSTILE_TAKE_CLIENT:   u8 = 4;
+val HOSTILE_PUT_REQUEST:   u8 = 5;
+val HOSTILE_CLEAR_REQUEST: u8 = 6;
+
+rec HostilePool {
+    mode:     u8;
+    protocol: *client.Client;
+    request:  *client.SignedRequest;
+}
+
+fun hostile_ready(ctx: ptr) bool {
+    ret ctx::*HostilePool != nil;
+}
+
+fun hostile_take(ctx: ptr, output: *u8, capacity: usize) nonce.Taken {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    if (hostile.mode == HOSTILE_TAKE_REQUEST && hostile.request != nil) {
+        hostile.request.state = client.REQUEST_EMPTY;
+    }
+    if (hostile.mode == HOSTILE_TAKE_CLIENT && hostile.protocol != nil) {
+        hostile.protocol.nonces.take = nil;
+    }
+    if (hostile.mode == HOSTILE_OVERSIZED) {
+        ret nonce.Taken{error: problem.none(), found: true,
+            value: view.view(output, capacity + 1)};
+    }
+    if (hostile.mode == HOSTILE_FOREIGN) {
+        ret nonce.Taken{error: problem.none(), found: true,
+            value: view.view("foreign_nonce", 13)};
+    }
+    if (output == nil || capacity < 12) {
+        ret nonce.Taken{error: problem.local_code(problem.LIMIT,
+            problem.OUTPUT_TOO_SMALL, "hostile test output is small"),
+            found: false, value: view.view(nil, 0)};
+    }
+    copy(output, "custom_nonce", 12);
+    ret nonce.Taken{error: problem.none(), found: true,
+        value: view.view(output, 12)};
+}
+
+fun hostile_put(ctx: ptr, value: view.View) problem.Error {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    if (hostile.mode == HOSTILE_PUT_REQUEST && hostile.request != nil) {
+        hostile.request.state = client.REQUEST_EMPTY;
+    }
+    ret problem.none();
+}
+
+fun hostile_clear(ctx: ptr) problem.Error {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    if (hostile.mode == HOSTILE_CLEAR_REQUEST && hostile.request != nil) {
+        hostile.request.state = client.REQUEST_EMPTY;
+    }
+    ret problem.none();
+}
+
+fun hostile_pool(context: *HostilePool) nonce.Pool {
+    ret nonce.Pool{ctx: context::ptr, take: hostile_take, put: hostile_put,
+        clear: hostile_clear, ready: hostile_ready,
+        max_nonce_bytes: 64, capacity: 4};
 }
 
 test "jose: rfc 7638 rsa jwk and sha-256 thumbprint are exact" {
@@ -288,7 +355,8 @@ test "jose and json: hostile aliases and overflowing views fail before mutation"
 
     var json_bytes: [2]u8 = [2]u8{'{', '}'};
     val json_limits: json.Limits = json.Limits{max_bytes: 64,
-        max_depth: 4, max_values: 8, max_key_bytes: 16};
+        max_depth: 4, max_values: 8, max_key_bytes: 16,
+        max_key_comparisons: 32};
     val json_alias: json.Document = json.parse(
         view.view(?json_bytes[0], 2), ?json_bytes[0], 2, json_limits);
     if (json_alias.valid || json_alias.error.code != problem.INVALID_INPUT ||
@@ -297,6 +365,68 @@ test "jose and json: hostile aliases and overflowing views fail before mutation"
         ?work[0], 2048, json_limits);
     if (json_overflow.valid ||
         json_overflow.error.code != problem.INVALID_INPUT) { ret 9; }
+    ret 0;
+}
+
+test "json: numeric grammar, key lookup, and duplicate work fail closed" {
+    var scratch: [8192]u8;
+    val configured: json.Limits = json.Limits{max_bytes: 256,
+        max_depth: 4, max_values: 16, max_key_bytes: 16,
+        max_key_comparisons: 32};
+    val leading: *u8 = "{\"n\":01}";
+    val positive_overflow: *u8 = "{\"n\":9223372036854775808}";
+    val negative_overflow: *u8 = "{\"n\":-9223372036854775808}";
+    val leading_result: json.Document = json.parse(
+        view.view(leading, length(leading)), ?scratch[0], 8192, configured);
+    val positive_result: json.Document = json.parse(
+        view.view(positive_overflow, length(positive_overflow)),
+        ?scratch[0], 8192, configured);
+    val negative_result: json.Document = json.parse(
+        view.view(negative_overflow, length(negative_overflow)),
+        ?scratch[0], 8192, configured);
+    if (leading_result.valid || leading_result.error.code != problem.MALFORMED_JSON ||
+        positive_result.valid || positive_result.error.kind != problem.LIMIT ||
+        negative_result.valid || negative_result.error.kind != problem.LIMIT) {
+        ret 1;
+    }
+    val valid_text: *u8 = "{\"n\":9223372036854775807,\"f\":1.5e+2}";
+    val valid: json.Document = json.parse(view.view(valid_text,
+        length(valid_text)), ?scratch[0], 8192, configured);
+    var root: J.Value = valid.root;
+    val number: *J.Value = json.find(?root, "n");
+    if (!valid.valid || number == nil || json.find(nil, "n") != nil ||
+        json.find(number, "n") != nil || json.find(?root, nil) != nil) { ret 2; }
+
+    var hostile: [32768]u8;
+    var pos: usize = 0;
+    hostile[pos] = '{';
+    pos = pos + 1;
+    val digits: *u8 = "0123456789abcdef";
+    var i: usize = 0;
+    for (i < 4095) {
+        if (i != 0) {
+            hostile[pos] = ',';
+            pos = pos + 1;
+        }
+        hostile[pos] = '"';
+        hostile[pos + 1] = digits[(i >> 8) & 15];
+        hostile[pos + 2] = digits[(i >> 4) & 15];
+        hostile[pos + 3] = digits[i & 15];
+        hostile[pos + 4] = '"';
+        hostile[pos + 5] = ':';
+        hostile[pos + 6] = '0';
+        pos = pos + 7;
+        i = i + 1;
+    }
+    hostile[pos] = '}';
+    pos = pos + 1;
+    var large_scratch: [2097152]u8;
+    val bounded: json.Document = json.parse(view.view(?hostile[0], pos),
+        ?large_scratch[0], 2097152, json.Limits{max_bytes: 32768,
+            max_depth: 2, max_values: 4096, max_key_bytes: 3,
+            max_key_comparisons: 64});
+    if (bounded.valid || bounded.error.kind != problem.LIMIT ||
+        bounded.error.code != problem.MALFORMED_JSON) { ret 3; }
     ret 0;
 }
 
@@ -1176,6 +1306,135 @@ test "client: invalid and excess response nonces are ignored" {
     if (multiple.action != client.ACTION_COMPLETE ||
         request.state != client.REQUEST_COMPLETE ||
         pool.take(pool.ctx, ?output[0], 64).found) { ret 9; }
+    ret 0;
+}
+
+test "client: nonce callbacks preserve immutable descriptors and exact state" {
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 1; }
+    val spec: client.SignedSpec = client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31),
+        use_jwk: false};
+    var work: [2048]u8;
+    var output: [512]u8;
+
+    var context: HostilePool;
+    var supplied: nonce.Pool = hostile_pool(?context);
+    var protocol: client.Client;
+    var request: client.SignedRequest;
+    if (problem.failed(client.init(?protocol, ?supplied,
+            client.limits_default()))) { ret 2; }
+    supplied.take = nil;
+    supplied.ready = nil;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec))) { ret 3; }
+    val first: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(first.error) || request.state != client.REQUEST_AWAITING ||
+        protocol.nonces.take::usize == 0 || protocol.nonces.ready::usize == 0) {
+        ret 4;
+    }
+
+    var item: [1]field.Field;
+    var fields: field.Fields = field.init(?item[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("response_nonce", 14), sensitive: false}) !=
+        field.ADD_OK) { ret 5; }
+    context.mode = HOSTILE_PUT_REQUEST;
+    context.request = ?request;
+    val wire_before: view.View = request.wire_body;
+    val put_mutation: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.OK, ?fields, view.view(nil, 0)), nil, 0,
+        client.ProblemStorage{data: nil, capacity: 0,
+            subproblems: nil, subproblem_capacity: 0});
+    if (put_mutation.action != client.ACTION_FAILED ||
+        put_mutation.cause.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_EMPTY ||
+        request.wire_body.data != wire_before.data ||
+        request.wire_body.len != wire_before.len) { ret 6; }
+
+    context.mode = HOSTILE_OVERSIZED;
+    context.request = nil;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec))) { ret 7; }
+    fill(?output[0], 0xa5, 512);
+    val oversized: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (oversized.error.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_READY || !filled(?output[0], 0xa5, 512)) {
+        ret 8;
+    }
+    context.mode = HOSTILE_FOREIGN;
+    val foreign: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (foreign.error.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_READY || !filled(?output[0], 0xa5, 512)) {
+        ret 9;
+    }
+    context.mode = HOSTILE_TAKE_REQUEST;
+    context.request = ?request;
+    val request_mutation: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (request_mutation.error.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_EMPTY || !filled(?output[0], 0xa5, 512)) {
+        ret 10;
+    }
+
+    context.mode = HOSTILE_NORMAL;
+    context.request = nil;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec)) ||
+        problem.failed(client.prepare_signed(?protocol, ?request,
+            jose.signer(public_key), private_key, jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error)) { ret 11; }
+    context.mode = HOSTILE_CLEAR_REQUEST;
+    context.request = ?request;
+    val bad_nonce: *u8 =
+        "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"detail\":\"retry\"}";
+    var scratch: [4096]u8;
+    var storage: [256]u8;
+    val clear_mutation: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.BAD_REQUEST, ?fields,
+            view.view(bad_nonce, length(bad_nonce))), ?scratch[0], 4096,
+        client.ProblemStorage{data: ?storage[0], capacity: 256,
+            subproblems: nil, subproblem_capacity: 0});
+    if (clear_mutation.action != client.ACTION_FAILED ||
+        clear_mutation.cause.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_EMPTY || request.wire_body.data != ?output[0]) {
+        ret 12;
+    }
+
+    var client_context: HostilePool;
+    var client_pool: nonce.Pool = hostile_pool(?client_context);
+    var mutated_client: client.Client;
+    var client_request: client.SignedRequest;
+    if (problem.failed(client.init(?mutated_client, ?client_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?mutated_client, ?client_request, spec))) {
+        ret 13;
+    }
+    client_context.mode = HOSTILE_TAKE_CLIENT;
+    client_context.protocol = ?mutated_client;
+    val client_mutation: jose.Operation = client.prepare_signed(?mutated_client,
+        ?client_request, jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (client_mutation.error.code != problem.INVALID_STATE ||
+        mutated_client.nonces.take::usize != 0 ||
+        client_request.state != client.REQUEST_READY) { ret 14; }
     ret 0;
 }
 
