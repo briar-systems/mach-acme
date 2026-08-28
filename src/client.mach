@@ -967,6 +967,48 @@ fun https_value(value: *J.Value, maximum: usize) bool {
     ret !R.is_err[usize, str](result) && https_bytes(?decoded[0], len);
 }
 
+# rfc 8555 section 9.7.6 states terms and website as plain uris. they are
+# informational and never dereferenced by the protocol layer, so they are
+# bounded printable ascii with a scheme rather than forced https. a
+# conforming authority may serve terms from a data: or http: uri.
+fun metadata_uri_bytes(data: *u8, len: usize) bool {
+    if (data == nil || len < 3 || len > 4096) { ret false; }
+    if (!scheme_byte(data[0], data[0]) ||
+        !((data[0] >= 'A' && data[0] <= 'Z') ||
+        (data[0] >= 'a' && data[0] <= 'z'))) { ret false; }
+    var colon: usize = 0;
+    var i: usize = 1;
+    for (i < len && colon == 0) {
+        val byte: u8 = data[i];
+        if (byte == ':') { colon = i; }
+        or (!((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+            (byte >= '0' && byte <= '9') || byte == '+' || byte == '-' ||
+            byte == '.')) { ret false; }
+        i = i + 1;
+    }
+    if (colon == 0 || colon + 1 == len) { ret false; }
+    i = colon + 1;
+    for (i < len) {
+        val byte: u8 = data[i];
+        if (byte <= ' ' || byte > 126) { ret false; }
+        if (byte == '%') {
+            if (i + 2 >= len || !hex(data[i + 1]) || !hex(data[i + 2])) {
+                ret false;
+            }
+            i = i + 3;
+        } or { i = i + 1; }
+    }
+    ret true;
+}
+
+fun metadata_uri_value(value: *J.Value, maximum: usize) bool {
+    var len: usize = 0;
+    if (!decoded_len(value, maximum, ?len)) { ret false; }
+    var decoded: [4096]u8;
+    val result: R.Result[usize, str] = J.value_string_decode(value, ?decoded[0], 4096);
+    ret !R.is_err[usize, str](result) && metadata_uri_bytes(?decoded[0], len);
+}
+
 fun add_size(total: *usize, value: *J.Value, maximum: usize) bool {
     if (value == nil) { ret true; }
     var len: usize = 0;
@@ -1077,8 +1119,10 @@ pub fun parse_directory(response: Response, configured: Limits, scratch: *u8,
         website = json.find(meta, "website");
         caa = json.find(meta, "caaIdentities");
         val external: *J.Value = json.find(meta, "externalAccountRequired");
-        if ((terms != nil && !https_value(terms, configured.max_url_bytes)) ||
-            (website != nil && !https_value(website, configured.max_url_bytes)) ||
+        if ((terms != nil &&
+                !metadata_uri_value(terms, configured.max_url_bytes)) ||
+            (website != nil &&
+                !metadata_uri_value(website, configured.max_url_bytes)) ||
             (external != nil && external.kind != J.BOOL) ||
             (caa != nil && caa.kind != J.ARRAY)) {
             ret directory_error("directory meta field has the wrong type");
