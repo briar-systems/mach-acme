@@ -1,14 +1,324 @@
-# account key rollover contract
+# transactional account key rollover
 
-use R: std.types.result;
+use crypto.contracts;
+use crypto.hash;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
 use std.types.view;
 use acme.account;
+use acme.client;
 use acme.jose;
+use acme.memory_range;
+use acme.problem;
+use acme.storage;
 
-pub def RolloverFun: fun(ptr, account.Credentials, jose.Signer) R.Result[account.Credentials, view.View];
+pub def Outcome: u8;
 
-pub rec Operation {
-    ctx:      ptr;
-    rollover: RolloverFun;
+pub val ACCEPTED: Outcome = 1;
+pub val REJECTED: Outcome = 2;
+pub val AMBIGUOUS: Outcome = 3;
+
+pub rec Prepared {
+    error:       problem.Error;
+    replacement: storage.Write;
+    nested_jws:  view.View;
+    account_url: view.View;
+    key_change_url: view.View;
+    generation:  u64;
+    account_digest: [32]u8;
+    key_change_digest: [32]u8;
+    nested_digest: [32]u8;
+    old_thumbprint: [43]u8;
 }
 
+rec Writer {
+    data: *u8;
+    cap:  usize;
+    pos:  usize;
+}
+
+fun bytes(writer: *Writer, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len) || len > writer.cap - writer.pos) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        writer.data[writer.pos + i] = data[i];
+        i = i + 1;
+    }
+    writer.pos = writer.pos + len;
+    ret true;
+}
+
+fun byte(writer: *Writer, value: u8) bool {
+    if (writer.pos >= writer.cap) { ret false; }
+    writer.data[writer.pos] = value;
+    writer.pos = writer.pos + 1;
+    ret true;
+}
+
+fun json_string(writer: *Writer, value: view.View) bool {
+    if (!memory_range.valid(value.data, value.len) || !byte(writer, '"')) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val current: u8 = value.data[i];
+        if (current > 127) { ret false; }
+        if (current == '"' || current == '\\') {
+            if (!byte(writer, '\\') || !byte(writer, current)) { ret false; }
+        } or (current == '\x08') {
+            if (!bytes(writer, "\\b", 2)) { ret false; }
+        } or (current == '\x0c') {
+            if (!bytes(writer, "\\f", 2)) { ret false; }
+        } or (current == '\n') {
+            if (!bytes(writer, "\\n", 2)) { ret false; }
+        } or (current == '\r') {
+            if (!bytes(writer, "\\r", 2)) { ret false; }
+        } or (current == '\t') {
+            if (!bytes(writer, "\\t", 2)) { ret false; }
+        } or (current < ' ') {
+            val hex: *u8 = "0123456789abcdef";
+            if (!bytes(writer, "\\u00", 4) ||
+                !byte(writer, hex[(current >> 4)::usize]) ||
+                !byte(writer, hex[(current & 15)::usize])) { ret false; }
+        } or {
+            if (!byte(writer, current)) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret byte(writer, '"');
+}
+
+fun failed(error: problem.Error) Prepared {
+    var result: Prepared;
+    result.error = error;
+    ret result;
+}
+
+fun digest(value: view.View, output: *u8) bool {
+    if (!memory_range.valid(value.data, value.len) ||
+        !memory_range.valid(output, 32)) { ret false; }
+    var context: hash.Sha256 = hash.empty_sha256();
+    if (hash.init_sha256(?context) != contracts.OK ||
+        hash.update_sha256(?context, contracts.Bytes{data: value.data,
+            len: value.len}) != contracts.OK) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    val result: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: output, capacity: 32});
+    ret result.error == contracts.OK && result.written == 32;
+}
+
+fun digest_same(value: view.View, expected: *u8) bool {
+    var actual: [32]u8;
+    if (!digest(value, ?actual[0])) { ret false; }
+    var i: usize = 0;
+    for (i < 32) {
+        if (actual[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# prepare persists the candidate before publishing a wire payload
+pub fun prepare(manager: *storage.Manager, current: account.Credentials,
+    replacement: account.Credentials, private_key: jose.PrivateKey,
+    entropy: jose.Entropy, key_change_url: view.View,
+    work: contracts.Buffer, output: contracts.Buffer) Prepared {
+    if (!account.credentials_valid(current) ||
+        !account.credentials_valid(replacement) ||
+        current.account.status != account.VALID ||
+        replacement.account.status != account.VALID ||
+        private_key.secret_owner != replacement.secret_owner ||
+        !client.url_valid(key_change_url, 4096) || work.data == nil ||
+        output.data == nil || !memory_range.valid(work.data, work.capacity) ||
+        !memory_range.valid(output.data, output.capacity) ||
+        memory_range.overlap(work.data, work.capacity, output.data,
+            output.capacity) ||
+        account.credentials_overlap(current, work.data, work.capacity) ||
+        account.credentials_overlap(current, output.data, output.capacity) ||
+        account.credentials_overlap(replacement, work.data, work.capacity) ||
+        account.credentials_overlap(replacement, output.data, output.capacity) ||
+        memory_range.overlap(work.data, work.capacity, key_change_url.data,
+            key_change_url.len) ||
+        memory_range.overlap(output.data, output.capacity, key_change_url.data,
+            key_change_url.len)) {
+        ret failed(problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid key rollover input"));
+    }
+    var account_digest: [32]u8;
+    var key_change_digest: [32]u8;
+    var old_thumbprint: [43]u8;
+    var new_thumbprint: [43]u8;
+    val thumbprint: jose.Operation = jose.key_thumbprint(
+        current.signer.public_key,
+        contracts.Buffer{data: ?old_thumbprint[0], capacity: 43});
+    val replacement_thumbprint: jose.Operation = jose.key_thumbprint(
+        replacement.signer.public_key,
+        contracts.Buffer{data: ?new_thumbprint[0], capacity: 43});
+    if (!digest(current.account.url, ?account_digest[0]) ||
+        !digest(key_change_url, ?key_change_digest[0]) ||
+        problem.failed(thumbprint.error) || thumbprint.written != 43 ||
+        problem.failed(replacement_thumbprint.error) ||
+        replacement_thumbprint.written != 43) {
+        ret failed(problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid key rollover identity"));
+    }
+    val transaction: storage.Write = storage.begin_replace(manager,
+        current, replacement);
+    if (problem.failed(transaction.error)) { ret failed(transaction.error); }
+    var old_jwk: [1536]u8;
+    val encoded_key: jose.Operation = jose.key_encode_jwk(
+        current.signer.public_key,
+        contracts.Buffer{data: ?old_jwk[0], capacity: 1536});
+    if (problem.failed(encoded_key.error)) {
+        val aborted: problem.Error = storage.abort_write(manager, transaction);
+        if (problem.failed(aborted)) { ret failed(aborted); }
+        ret failed(encoded_key.error);
+    }
+    var payload: [8192]u8;
+    var writer: Writer = Writer{data: ?payload[0], cap: 8192, pos: 0};
+    if (!bytes(?writer, "{\"account\":", 11) ||
+        !json_string(?writer, current.account.url) ||
+        !bytes(?writer, ",\"oldKey\":", 10) ||
+        !bytes(?writer, ?old_jwk[0], encoded_key.written) ||
+        !byte(?writer, '}')) {
+        val aborted: problem.Error = storage.abort_write(manager, transaction);
+        if (problem.failed(aborted)) { ret failed(aborted); }
+        ret failed(problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "key rollover payload is too large"));
+    }
+    var nested: [16384]u8;
+    val encoded: jose.Operation = jose.encode_jws(replacement.signer,
+        private_key, entropy, jose.Protected{nonce: view.view(nil, 0),
+            url: key_change_url, kid: view.view(nil, 0), use_jwk: true,
+            include_nonce: false}, view.view(?payload[0], writer.pos), work,
+        contracts.Buffer{data: ?nested[0], capacity: 16384});
+    if (problem.failed(encoded.error)) {
+        val aborted: problem.Error = storage.abort_write(manager, transaction);
+        if (problem.failed(aborted)) { ret failed(aborted); }
+        ret failed(encoded.error);
+    }
+    if (!digest_same(current.account.url, ?account_digest[0]) ||
+        !digest_same(key_change_url, ?key_change_digest[0]) ||
+        !thumbprint_same(current.signer.public_key, ?old_thumbprint[0]) ||
+        !thumbprint_same(replacement.signer.public_key,
+            ?new_thumbprint[0]) ||
+        output.capacity < encoded.written) {
+        val aborted: problem.Error = storage.abort_write(manager, transaction);
+        if (problem.failed(aborted)) { ret failed(aborted); }
+        if (output.capacity < encoded.written) {
+            ret failed(problem.local_code(problem.LIMIT,
+                problem.OUTPUT_TOO_SMALL, "key rollover output is too small"));
+        }
+        ret failed(problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "key rollover identity changed during signing"));
+    }
+    var nested_digest: [32]u8;
+    if (!digest(view.view(?nested[0], encoded.written), ?nested_digest[0])) {
+        val aborted: problem.Error = storage.abort_write(manager, transaction);
+        if (problem.failed(aborted)) { ret failed(aborted); }
+        ret failed(problem.local_code(problem.STATE, problem.INVALID_STATE,
+            "key rollover payload binding failed"));
+    }
+    var i: usize = 0;
+    for (i < encoded.written) {
+        output.data[i] = nested[i];
+        i = i + 1;
+    }
+    var result: Prepared = Prepared{error: problem.none(),
+        replacement: transaction,
+        nested_jws: view.view(output.data, encoded.written),
+        account_url: current.account.url, key_change_url: key_change_url,
+        generation: current.generation};
+    i = 0;
+    for (i < 32) {
+        result.account_digest[i] = account_digest[i];
+        result.key_change_digest[i] = key_change_digest[i];
+        result.nested_digest[i] = nested_digest[i];
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 43) {
+        result.old_thumbprint[i] = old_thumbprint[i];
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub fun begin_outer(protocol: *client.Client, request: *client.SignedRequest,
+    current: account.Credentials, key_change_url: view.View,
+    prepared: Prepared) problem.Error {
+    if (problem.failed(prepared.error) || !prepared.replacement.prepared ||
+        prepared.nested_jws.len == 0 || current.generation != prepared.generation ||
+        current.account.url.len != prepared.account_url.len ||
+        key_change_url.len != prepared.key_change_url.len ||
+        !memory_range.valid(prepared.account_url.data,
+            prepared.account_url.len) ||
+        !memory_range.valid(current.account.url.data, current.account.url.len) ||
+        !memory_range.valid(prepared.key_change_url.data,
+            prepared.key_change_url.len) ||
+        !memory_range.valid(key_change_url.data, key_change_url.len) ||
+        !digest_same(prepared.account_url, ?prepared.account_digest[0]) ||
+        !digest_same(current.account.url, ?prepared.account_digest[0]) ||
+        !digest_same(prepared.key_change_url,
+            ?prepared.key_change_digest[0]) ||
+        !digest_same(key_change_url, ?prepared.key_change_digest[0]) ||
+        !digest_same(prepared.nested_jws, ?prepared.nested_digest[0]) ||
+        !same_bytes(current.account.url.data, prepared.account_url.data,
+            current.account.url.len) ||
+        !same_bytes(key_change_url.data, prepared.key_change_url.data,
+            key_change_url.len) ||
+        !thumbprint_same(current.signer.public_key,
+            ?prepared.old_thumbprint[0])) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "key rollover is not prepared");
+    }
+    ret client.begin_signed(protocol, request, client.SignedSpec{
+        url: key_change_url, payload: prepared.nested_jws,
+        kid: current.account.url, use_jwk: false});
+}
+
+fun thumbprint_same(key: jose.PublicKey, expected: *u8) bool {
+    var actual: [43]u8;
+    val encoded: jose.Operation = jose.key_thumbprint(key,
+        contracts.Buffer{data: ?actual[0], capacity: 43});
+    if (problem.failed(encoded.error) || encoded.written != 43) { ret false; }
+    ret same_bytes(?actual[0], expected, 43);
+}
+
+fun same_bytes(first: *u8, second: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# ambiguous wire outcomes retain the durable pending candidate for recovery
+pub fun finish(manager: *storage.Manager, prepared: Prepared,
+    outcome: Outcome) problem.Error {
+    if (problem.failed(prepared.error) || !prepared.replacement.prepared) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "key rollover is not prepared");
+    }
+    if (outcome == ACCEPTED) {
+        ret storage.commit_write(manager, prepared.replacement);
+    }
+    if (outcome == REJECTED) {
+        ret storage.abort_write(manager, prepared.replacement);
+    }
+    if (outcome == AMBIGUOUS) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_STATE,
+            "key rollover requires account recovery");
+    }
+    ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+        "invalid key rollover outcome");
+}
+
+pub fun resolve(manager: *storage.Manager, pending: storage.Write,
+    server_uses_replacement: bool) problem.Error {
+    if (server_uses_replacement) { ret storage.commit_write(manager, pending); }
+    ret storage.abort_write(manager, pending);
+}

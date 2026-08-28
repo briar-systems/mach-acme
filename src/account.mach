@@ -1,19 +1,44 @@
-# account lifecycle model
+# bounded account lifecycle requests
 
+use crypto.contracts;
+use http.core.field;
+use http.core.status;
+use J: std.data.json;
+use R: std.types.result;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
 use std.types.view;
+use acme.client;
+use acme.external_account;
 use acme.jose;
+use acme.json;
+use acme.memory_range;
+use acme.problem;
 
 pub val VALID:       u8 = 1;
 pub val DEACTIVATED: u8 = 2;
 pub val REVOKED:     u8 = 3;
+
+pub val MAX_CONTACTS: usize = 64;
+pub val MAX_CONTACT_BYTES: usize = 4096;
+
+pub def Action: u8;
+
+pub val CREATE:         Action = 1;
+pub val LOOKUP:         Action = 2;
+pub val UPDATE_CONTACT: Action = 3;
+pub val AGREE_TERMS:    Action = 4;
+pub val DEACTIVATE:     Action = 5;
 
 pub rec Request {
     contacts:              *view.View;
     contact_len:           usize;
     terms_of_service_agreed: bool;
     only_return_existing:  bool;
+    external_account_binding: view.View;
 }
 
 pub rec Account {
@@ -28,4 +53,615 @@ pub rec Account {
 pub rec Credentials {
     account: Account;
     signer:  jose.Signer;
+    secret_owner: ptr;
+    generation: u64;
+}
+
+pub rec Limits {
+    max_response_bytes: usize;
+    max_json_scratch: usize;
+    max_json_depth: usize;
+    max_json_values: usize;
+    max_json_key_bytes: usize;
+    max_json_key_comparisons: usize;
+    max_url_bytes: usize;
+    max_contacts: usize;
+    max_contact_bytes: usize;
+    response_fields: field.Limits;
+}
+
+pub rec Storage {
+    data: *u8;
+    capacity: usize;
+    contacts: *view.View;
+    contact_capacity: usize;
+}
+
+pub fun credentials_valid(value: Credentials) bool {
+    if (!jose.valid(value.signer) || value.secret_owner == nil ||
+        value.generation == 0 ||
+        (value.account.status != VALID && value.account.status != DEACTIVATED &&
+            value.account.status != REVOKED) ||
+        !client.url_valid(value.account.url, 4096) ||
+        !client.url_valid(value.account.orders_url, 4096)) { ret false; }
+    var contact_bytes: usize = 0;
+    if (value.account.contact_len > MAX_CONTACTS ||
+        !memory_range.size(value.account.contact_len, $size_of(view.View),
+            ?contact_bytes) || !memory_range.valid(value.account.contacts::*u8,
+            contact_bytes)) { ret false; }
+    var i: usize = 0;
+    for (i < value.account.contact_len) {
+        if (!contact_valid(value.account.contacts[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun credentials_overlap(value: Credentials, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    var contact_bytes: usize = 0;
+    if (value.account.contact_len > MAX_CONTACTS ||
+        !memory_range.size(value.account.contact_len, $size_of(view.View),
+            ?contact_bytes)) { ret true; }
+    if (memory_range.overlap(data, len, value.account.url.data,
+            value.account.url.len) ||
+        memory_range.overlap(data, len, value.account.orders_url.data,
+            value.account.orders_url.len) ||
+        memory_range.overlap(data, len, value.account.contacts::*u8,
+            contact_bytes) ||
+        memory_range.overlap(data, len, value.secret_owner::*u8, 1) ||
+        jose.public_key_overlaps(value.signer.public_key, data, len)) { ret true; }
+    var i: usize = 0;
+    for (i < value.account.contact_len) {
+        if (memory_range.overlap(data, len, value.account.contacts[i].data,
+                value.account.contacts[i].len)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun view_equal(first: view.View, second: view.View) bool {
+    if (first.len != second.len || !memory_range.valid(first.data, first.len) ||
+        !memory_range.valid(second.data, second.len)) { ret false; }
+    var i: usize = 0;
+    for (i < first.len) {
+        if (first.data[i] != second.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun same(first: Account, second: Account) bool {
+    if (first.status != second.status ||
+        first.terms_of_service_agreed != second.terms_of_service_agreed ||
+        first.contact_len != second.contact_len ||
+        first.contact_len > MAX_CONTACTS ||
+        !view_equal(first.url, second.url) ||
+        !view_equal(first.orders_url, second.orders_url)) { ret false; }
+    var first_bytes: usize = 0;
+    var second_bytes: usize = 0;
+    if (!memory_range.size(first.contact_len, $size_of(view.View),
+            ?first_bytes) ||
+        !memory_range.size(second.contact_len, $size_of(view.View),
+            ?second_bytes) ||
+        !memory_range.valid(first.contacts::*u8, first_bytes) ||
+        !memory_range.valid(second.contacts::*u8, second_bytes)) { ret false; }
+    var i: usize = 0;
+    for (i < first.contact_len) {
+        if (!view_equal(first.contacts[i], second.contacts[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub rec Operation {
+    error:   problem.Error;
+    written: usize;
+    action:  Action;
+}
+
+rec Writer {
+    data: *u8;
+    cap:  usize;
+    pos:  usize;
+}
+
+fun failed(code: problem.Code, detail: *u8) Operation {
+    ret Operation{error: problem.local_code(problem.PROTOCOL, code, detail),
+        written: 0, action: 0};
+}
+
+fun byte(writer: *Writer, value: u8) bool {
+    if (writer.pos >= writer.cap) { ret false; }
+    writer.data[writer.pos] = value;
+    writer.pos = writer.pos + 1;
+    ret true;
+}
+
+fun bytes(writer: *Writer, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len) || len > writer.cap - writer.pos) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        writer.data[writer.pos + i] = data[i];
+        i = i + 1;
+    }
+    writer.pos = writer.pos + len;
+    ret true;
+}
+
+fun json_string(writer: *Writer, value: view.View) bool {
+    if (!memory_range.valid(value.data, value.len) || !byte(writer, '"')) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val current: u8 = value.data[i];
+        if (current > 127) { ret false; }
+        if (current == '"' || current == '\\') {
+            if (!byte(writer, '\\') || !byte(writer, current)) { ret false; }
+        } or (current == '\x08') {
+            if (!bytes(writer, "\\b", 2)) { ret false; }
+        } or (current == '\x0c') {
+            if (!bytes(writer, "\\f", 2)) { ret false; }
+        } or (current == '\n') {
+            if (!bytes(writer, "\\n", 2)) { ret false; }
+        } or (current == '\r') {
+            if (!bytes(writer, "\\r", 2)) { ret false; }
+        } or (current == '\t') {
+            if (!bytes(writer, "\\t", 2)) { ret false; }
+        } or (current < ' ') {
+            val hex: *u8 = "0123456789abcdef";
+            if (!bytes(writer, "\\u00", 4) ||
+                !byte(writer, hex[(current >> 4)::usize]) ||
+                !byte(writer, hex[(current & 15)::usize])) { ret false; }
+        } or {
+            if (!byte(writer, current)) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret byte(writer, '"');
+}
+
+fun contact_valid(value: view.View) bool {
+    if (!memory_range.valid(value.data, value.len) || value.len < 3 ||
+        value.len > MAX_CONTACT_BYTES ||
+        !((value.data[0] >= 'A' && value.data[0] <= 'Z') ||
+        (value.data[0] >= 'a' && value.data[0] <= 'z'))) { ret false; }
+    var colon: bool = false;
+    var i: usize = 1;
+    for (i < value.len) {
+        val current: u8 = value.data[i];
+        if (current > 127 || current <= ' ') { ret false; }
+        if (!colon && current == ':') { colon = true; }
+        or (!colon && !((current >= 'A' && current <= 'Z') ||
+            (current >= 'a' && current <= 'z') ||
+            (current >= '0' && current <= '9') || current == '+' ||
+            current == '-' || current == '.')) { ret false; }
+        i = i + 1;
+    }
+    ret colon;
+}
+
+fun inputs_valid(action: Action, request: Request, output: contracts.Buffer) bool {
+    if (output.data == nil || !memory_range.valid(output.data, output.capacity)) {
+        ret false;
+    }
+    var contact_bytes: usize = 0;
+    if (request.contact_len > MAX_CONTACTS ||
+        !memory_range.size(request.contact_len, $size_of(view.View),
+            ?contact_bytes) ||
+        !memory_range.valid(request.contacts::*u8, contact_bytes) ||
+        !memory_range.valid(request.external_account_binding.data,
+            request.external_account_binding.len) ||
+        memory_range.overlap(output.data, output.capacity,
+            request.contacts::*u8, contact_bytes) ||
+        memory_range.overlap(output.data, output.capacity,
+            request.external_account_binding.data,
+            request.external_account_binding.len)) { ret false; }
+    if ((action == CREATE && request.only_return_existing) ||
+        (action == LOOKUP && (!request.only_return_existing ||
+            request.contact_len != 0 || request.terms_of_service_agreed ||
+            request.external_account_binding.len != 0)) ||
+        (action == UPDATE_CONTACT && (request.only_return_existing ||
+            request.terms_of_service_agreed ||
+            request.external_account_binding.len != 0)) ||
+        ((action == AGREE_TERMS || action == DEACTIVATE) &&
+            (request.contact_len != 0 || request.only_return_existing ||
+            request.external_account_binding.len != 0)) ||
+        (action == AGREE_TERMS && !request.terms_of_service_agreed) ||
+        (action == DEACTIVATE && request.terms_of_service_agreed) ||
+        (action != CREATE && action != LOOKUP && action != UPDATE_CONTACT &&
+            action != AGREE_TERMS && action != DEACTIVATE)) { ret false; }
+    var i: usize = 0;
+    for (i < request.contact_len) {
+        if (!contact_valid(request.contacts[i]) ||
+            memory_range.overlap(output.data, output.capacity,
+                request.contacts[i].data, request.contacts[i].len)) { ret false; }
+        i = i + 1;
+    }
+    if (request.external_account_binding.len != 0 &&
+        !external_account.encoded_valid(request.external_account_binding)) {
+        ret false;
+    }
+    ret true;
+}
+
+fun contacts(writer: *Writer, request: Request) bool {
+    if (!bytes(writer, "\"contact\":[", 11)) { ret false; }
+    var i: usize = 0;
+    for (i < request.contact_len) {
+        if ((i != 0 && !byte(writer, ',')) ||
+            !json_string(writer, request.contacts[i])) { ret false; }
+        i = i + 1;
+    }
+    ret byte(writer, ']');
+}
+
+pub fun encode(action: Action, request: Request,
+    output: contracts.Buffer) Operation {
+    if (!inputs_valid(action, request, output)) {
+        ret failed(problem.INVALID_INPUT, "invalid account request");
+    }
+    var encoded: [8192]u8;
+    var writer: Writer = Writer{data: ?encoded[0], cap: 8192, pos: 0};
+    if (!byte(?writer, '{')) {
+        ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
+    }
+    if (action == LOOKUP) {
+        if (!bytes(?writer, "\"onlyReturnExisting\":true", 25)) {
+            ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
+        }
+    } or (action == UPDATE_CONTACT) {
+        if (!contacts(?writer, request)) {
+            ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
+        }
+    } or (action == AGREE_TERMS) {
+        if (!bytes(?writer, "\"termsOfServiceAgreed\":true", 27)) {
+            ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
+        }
+    } or (action == DEACTIVATE) {
+        if (!bytes(?writer, "\"status\":\"deactivated\"", 22)) {
+            ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
+        }
+    } or {
+        var member: bool = false;
+        if (request.contact_len != 0) {
+            if (!contacts(?writer, request)) {
+                ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
+            }
+            member = true;
+        }
+        if (request.external_account_binding.len != 0) {
+            if ((member && !byte(?writer, ',')) ||
+                !bytes(?writer, "\"externalAccountBinding\":", 25) ||
+                !bytes(?writer, request.external_account_binding.data,
+                    request.external_account_binding.len)) {
+                ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
+            }
+            member = true;
+        }
+        if (request.terms_of_service_agreed) {
+            if ((member && !byte(?writer, ',')) ||
+                !bytes(?writer, "\"termsOfServiceAgreed\":true", 27)) {
+                ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
+            }
+        }
+    }
+    if (!byte(?writer, '}')) {
+        ret failed(problem.OUTPUT_TOO_SMALL, "account request is too large");
+    }
+    if (output.capacity < writer.pos) {
+        ret failed(problem.OUTPUT_TOO_SMALL, "account request output is too small");
+    }
+    var i: usize = 0;
+    for (i < writer.pos) {
+        output.data[i] = encoded[i];
+        i = i + 1;
+    }
+    ret Operation{error: problem.none(), written: writer.pos, action: action};
+}
+
+pub fun begin(protocol: *client.Client, state: *client.SignedRequest,
+    action: Action, endpoint: view.View, account_url: view.View,
+    payload: view.View, encoded: Operation) problem.Error {
+    val initial: bool = action == CREATE || action == LOOKUP;
+    if (problem.failed(encoded.error) || encoded.action != action ||
+        encoded.written != payload.len ||
+        (action != CREATE && action != LOOKUP && action != UPDATE_CONTACT &&
+            action != AGREE_TERMS && action != DEACTIVATE) ||
+        (initial && account_url.len != 0) || (!initial &&
+            (account_url.len == 0 || !view_equal(endpoint, account_url)))) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "account request has invalid key identity");
+    }
+    ret client.begin_signed(protocol, state, client.SignedSpec{url: endpoint,
+        payload: payload, kid: account_url, use_jwk: initial});
+}
+
+fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
+    if (value == nil || value.kind != J.STRING || output == nil) { ret false; }
+    val result: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
+    if (R.is_err[usize, str](result)) { ret false; }
+    val len: usize = R.unwrap_ok[usize, str](result);
+    if (len > maximum) { ret false; }
+    @output = len;
+    ret true;
+}
+
+fun value_equals(value: *J.Value, expected: *u8) bool {
+    var decoded: [32]u8;
+    var len: usize = 0;
+    if (!decoded_len(value, 31, ?len)) { ret false; }
+    val result: R.Result[usize, str] = J.value_string_decode(value,
+        ?decoded[0], 32);
+    if (R.is_err[usize, str](result)) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (expected[i] == 0 || decoded[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret expected[len] == 0;
+}
+
+fun response_overlaps(response: client.Response, data: *u8, len: usize) bool {
+    if (memory_range.overlap(data, len, response.body.data, response.body.len) ||
+        memory_range.overlap(data, len, response.fields::*u8,
+            $size_of(field.Fields))) { ret true; }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(response.fields.capacity, $size_of(field.Field),
+            ?item_bytes) || memory_range.overlap(data, len,
+            response.fields.items::*u8, item_bytes)) { ret true; }
+    var i: usize = 0;
+    for (i < response.fields.len) {
+        if (memory_range.overlap(data, len, response.fields.items[i].name.data,
+                response.fields.items[i].name.len) ||
+            memory_range.overlap(data, len, response.fields.items[i].value.data,
+                response.fields.items[i].value.len)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun fields_valid(fields: *field.Fields) bool {
+    if (fields == nil ||
+        !memory_range.valid(fields::*u8, $size_of(field.Fields)) ||
+        fields.len > fields.capacity) { ret false; }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(fields.capacity, $size_of(field.Field),
+            ?item_bytes) ||
+        !memory_range.valid(fields.items::*u8, item_bytes)) { ret false; }
+    var i: usize = 0;
+    for (i < fields.len) {
+        if (!memory_range.valid(fields.items[i].name.data,
+                fields.items[i].name.len) ||
+            !memory_range.valid(fields.items[i].value.data,
+                fields.items[i].value.len)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun copy_string(value: *J.Value, storage: Storage, cursor: *usize,
+    output: *view.View) bool {
+    var len: usize = 0;
+    if (!decoded_len(value, storage.capacity - @cursor, ?len)) { ret false; }
+    val result: R.Result[usize, str] = J.value_string_decode(value,
+        ?storage.data[@cursor], storage.capacity - @cursor);
+    if (R.is_err[usize, str](result) ||
+        R.unwrap_ok[usize, str](result) != len) { ret false; }
+    @output = view.view(?storage.data[@cursor], len);
+    @cursor = @cursor + len;
+    ret true;
+}
+
+fun copy_view(value: view.View, storage: Storage, cursor: *usize,
+    output: *view.View) bool {
+    if (!memory_range.valid(value.data, value.len) ||
+        value.len > storage.capacity - @cursor) { ret false; }
+    val start: usize = @cursor;
+    var i: usize = 0;
+    for (i < value.len) {
+        storage.data[start + i] = value.data[i];
+        i = i + 1;
+    }
+    @cursor = @cursor + value.len;
+    @output = view.view(?storage.data[start], value.len);
+    ret true;
+}
+
+fun location(response: client.Response) *field.Field {
+    var found: *field.Field = nil;
+    var i: usize = 0;
+    for (i < response.fields.len) {
+        if (field.name_equal(response.fields.items[i].name,
+                view.view(field.LOCATION, 8))) {
+            if (found != nil) { ret nil; }
+            found = ?response.fields.items[i];
+        }
+        i = i + 1;
+    }
+    ret found;
+}
+
+pub fun parse(action: Action, response: client.Response, account_url: view.View,
+    configured: Limits, scratch: *u8, scratch_capacity: usize,
+    storage: Storage, output: *Account) problem.Error {
+    val initial: bool = action == CREATE || action == LOOKUP;
+    if (output == nil || response.fields == nil ||
+        !memory_range.valid(output::*u8, $size_of(Account)) ||
+        !status.is_final(response.status) ||
+        (action != CREATE && action != LOOKUP && action != UPDATE_CONTACT &&
+            action != AGREE_TERMS && action != DEACTIVATE) ||
+        (response.status != status.OK &&
+            !(action == CREATE && response.status == status.CREATED)) ||
+        response.body.data == nil || response.body.len == 0 ||
+        !memory_range.valid(response.body.data, response.body.len) ||
+        response.body.len > configured.max_response_bytes ||
+        configured.max_url_bytes == 0 || configured.max_url_bytes > 4096 ||
+        configured.max_contact_bytes == 0 ||
+        configured.max_contact_bytes > MAX_CONTACT_BYTES ||
+        configured.max_contacts > MAX_CONTACTS ||
+        configured.max_json_depth == 0 || configured.max_json_values == 0 ||
+        configured.max_json_key_bytes == 0 ||
+        configured.max_json_key_comparisons == 0 ||
+        (!initial && !client.url_valid(account_url,
+            configured.max_url_bytes)) ||
+        (initial && account_url.len != 0) ||
+        scratch == nil || scratch_capacity == 0 ||
+        configured.max_json_scratch == 0 ||
+        !memory_range.valid(scratch, scratch_capacity) || storage.data == nil ||
+        !memory_range.valid(storage.data, storage.capacity) ||
+        !fields_valid(response.fields) ||
+        !field.validate(response.fields, configured.response_fields, false)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid account response");
+    }
+    var usable_scratch: usize = scratch_capacity;
+    if (usable_scratch > configured.max_json_scratch) {
+        usable_scratch = configured.max_json_scratch;
+    }
+    var contact_bytes: usize = 0;
+    var account_location: *field.Field = nil;
+    if (initial) {
+        account_location = location(response);
+        if (account_location == nil || !client.url_valid(account_location.value,
+                configured.max_url_bytes)) {
+            ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+                "account creation location is invalid");
+        }
+    }
+    if (!memory_range.size(storage.contact_capacity, $size_of(view.View),
+            ?contact_bytes) ||
+        !memory_range.valid(storage.contacts::*u8, contact_bytes) ||
+        memory_range.overlap(scratch, usable_scratch, storage.data,
+            storage.capacity) ||
+        memory_range.overlap(scratch, usable_scratch, storage.contacts::*u8,
+            contact_bytes) ||
+        memory_range.overlap(scratch, usable_scratch, output::*u8,
+            $size_of(Account)) ||
+        memory_range.overlap(storage.data, storage.capacity,
+            storage.contacts::*u8, contact_bytes) ||
+        memory_range.overlap(storage.data, storage.capacity, output::*u8,
+            $size_of(Account)) ||
+        memory_range.overlap(storage.contacts::*u8, contact_bytes,
+            output::*u8, $size_of(Account)) ||
+        memory_range.overlap(account_url.data, account_url.len, scratch,
+            usable_scratch) ||
+        memory_range.overlap(account_url.data, account_url.len, storage.data,
+            storage.capacity) ||
+        memory_range.overlap(account_url.data, account_url.len,
+            storage.contacts::*u8, contact_bytes) ||
+        memory_range.overlap(account_url.data, account_url.len, output::*u8,
+            $size_of(Account)) || response_overlaps(response, account_url.data,
+        account_url.len) || response_overlaps(response, scratch,
+            usable_scratch) || response_overlaps(response, storage.data,
+            storage.capacity) || response_overlaps(response,
+            storage.contacts::*u8, contact_bytes) || response_overlaps(response,
+            output::*u8, $size_of(Account))) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "account response storage overlaps an input");
+    }
+    val document: json.Document = json.parse(response.body, scratch,
+        usable_scratch, json.Limits{max_bytes: configured.max_response_bytes,
+            max_depth: configured.max_json_depth,
+            max_values: configured.max_json_values,
+            max_key_bytes: configured.max_json_key_bytes,
+            max_key_comparisons: configured.max_json_key_comparisons});
+    if (!document.valid) { ret document.error; }
+    var root: J.Value = document.root;
+    if (root.kind != J.OBJECT) {
+        ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
+            "account response is not an object");
+    }
+    val state: *J.Value = json.find(?root, "status");
+    val contact: *J.Value = json.find(?root, "contact");
+    val orders: *J.Value = json.find(?root, "orders");
+    val agreed: *J.Value = json.find(?root, "termsOfServiceAgreed");
+    var account_state: u8 = 0;
+    if (value_equals(state, "valid")) { account_state = VALID; }
+    or (value_equals(state, "deactivated")) { account_state = DEACTIVATED; }
+    or (value_equals(state, "revoked")) { account_state = REVOKED; }
+    if (account_state == 0 || orders == nil ||
+        (contact != nil && contact.kind != J.ARRAY) ||
+        (agreed != nil && agreed.kind != J.BOOL)) {
+        ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
+            "account response has invalid fields");
+    }
+    var contact_len: usize = 0;
+    if (contact != nil) { contact_len = J.value_count(contact); }
+    if (contact_len > configured.max_contacts ||
+        contact_len > storage.contact_capacity) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "account contact storage is too small");
+    }
+    var orders_len: usize = 0;
+    if (!decoded_len(orders, configured.max_url_bytes, ?orders_len)) {
+        ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
+            "account orders url is invalid");
+    }
+    var decoded_url: [4096]u8;
+    val decoded_orders: R.Result[usize, str] = J.value_string_decode(orders,
+        ?decoded_url[0], 4096);
+    if (R.is_err[usize, str](decoded_orders) ||
+        !client.url_valid(view.view(?decoded_url[0], orders_len),
+            configured.max_url_bytes)) {
+        ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
+            "account orders url is invalid");
+    }
+    var required: usize = orders_len;
+    if (account_location != nil) {
+        required = required + account_location.value.len;
+    }
+    var i: usize = 0;
+    for (i < contact_len) {
+        var len: usize = 0;
+        if (!decoded_len(J.value_get(contact, i), configured.max_contact_bytes,
+                ?len) || len > 0xffffffffffffffff - required) {
+            ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
+                "account contact is invalid");
+        }
+        var decoded_contact: [4096]u8;
+        val decoded: R.Result[usize, str] = J.value_string_decode(
+            J.value_get(contact, i), ?decoded_contact[0], 4096);
+        if (R.is_err[usize, str](decoded) ||
+            !contact_valid(view.view(?decoded_contact[0], len))) {
+            ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
+                "account contact is invalid");
+        }
+        required = required + len;
+        i = i + 1;
+    }
+    if (required > storage.capacity) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "account text storage is too small");
+    }
+    var result: Account;
+    result.status = account_state;
+    result.contacts = storage.contacts;
+    result.contact_len = contact_len;
+    if (agreed != nil) { result.terms_of_service_agreed = J.value_bool(agreed); }
+    var cursor: usize = 0;
+    if (account_location != nil) {
+        if (!copy_view(account_location.value, storage, ?cursor,
+                ?result.url)) {
+            ret problem.local_code(problem.STATE, problem.INVALID_STATE,
+                "validated account location copy failed");
+        }
+    } or {
+        result.url = account_url;
+    }
+    if (!copy_string(orders, storage, ?cursor, ?result.orders_url) ||
+        !client.url_valid(result.orders_url, configured.max_url_bytes)) {
+        ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
+            "account orders url is invalid");
+    }
+    i = 0;
+    for (i < contact_len) {
+        if (!copy_string(J.value_get(contact, i), storage, ?cursor,
+                ?storage.contacts[i]) || !contact_valid(storage.contacts[i])) {
+            ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
+                "account contact is invalid");
+        }
+        i = i + 1;
+    }
+    @output = result;
+    ret problem.none();
 }

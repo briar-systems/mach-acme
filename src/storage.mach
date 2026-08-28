@@ -1,44 +1,668 @@
-# transactional durable state boundary
+# transactional durable account credential storage
 
-use A: std.allocator;
-use R: std.types.result;
+use crypto.contracts;
+use crypto.hash;
+use std.system.os;
+use std.sync.atomic;
 use std.types.bool.bool;
-use std.types.string.str;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
 use std.types.view;
 use acme.account;
-use acme.certificate;
+use acme.client;
+use acme.jose;
+use acme.memory_range;
+use acme.problem;
+
+pub def Status: u8;
+
+pub val SUCCESS: Status = 1;
+pub val NOT_FOUND: Status = 2;
+pub val CONFLICT: Status = 3;
+pub val FAILED: Status = 4;
+pub val UNKNOWN: Status = 5;
 
 pub rec Transaction {
-    ctx: ptr;
+    owner:      ptr;
+    token:      u64;
+    generation: u64;
 }
 
-pub rec AccountLoad {
-    found: bool;
-    value: account.Credentials;
+pub rec BeginResult {
+    status:      Status;
+    transaction: Transaction;
 }
 
-pub rec CertificateLoad {
-    found: bool;
-    value: certificate.Issued;
+pub rec Snapshot {
+    status:      Status;
+    current:     account.Credentials;
+    pending:     account.Credentials;
+    transaction: Transaction;
+    has_pending: bool;
 }
 
-pub def BeginFun: fun(ptr) R.Result[Transaction, str];
-pub def PutAccountFun: fun(ptr, Transaction, view.View, account.Credentials) R.Result[bool, str];
-pub def PutCertificateFun: fun(ptr, Transaction, certificate.Issued) R.Result[bool, str];
-pub def DeleteCertificateFun: fun(ptr, Transaction, view.View) R.Result[bool, str];
-pub def CommitFun: fun(ptr, Transaction) R.Result[bool, str];
-pub def AbortFun: fun(ptr, Transaction) R.Result[bool, str];
-pub def LoadAccountFun: fun(ptr, view.View, *A.Allocator) R.Result[AccountLoad, str];
-pub def LoadCertificateFun: fun(ptr, view.View, *A.Allocator, *CertificateLoad) R.Result[bool, str];
+pub rec Write {
+    error:       problem.Error;
+    transaction: Transaction;
+    prepared:    bool;
+}
+
+pub def ReadyFun: fun(ptr) bool;
+pub def AliasesFun: fun(ptr, *u8, usize) bool;
+pub def OwnsSecretFun: fun(ptr, ptr) bool;
+pub def BeginFun: fun(ptr, view.View, u64) BeginResult;
+pub def StageFun: fun(ptr, Transaction, account.Credentials) Status;
+pub def FinishFun: fun(ptr, Transaction) Status;
+pub def LoadFun: fun(ptr, view.View, *Snapshot) Status;
 
 pub rec Store {
-    ctx:                ptr;
-    begin:              BeginFun;
-    put_account:        PutAccountFun;
-    put_certificate:    PutCertificateFun;
-    delete_certificate: DeleteCertificateFun;
-    commit:             CommitFun;
-    abort:              AbortFun;
-    load_account:       LoadAccountFun;
-    load_certificate:   LoadCertificateFun;
+    ctx:         ptr;
+    ready:       ReadyFun;
+    aliases:     AliasesFun;
+    owns_secret: OwnsSecretFun;
+    begin:       BeginFun;
+    stage:       StageFun;
+    commit:      FinishFun;
+    abort:       FinishFun;
+    load:        LoadFun;
+}
+
+pub rec Manager {
+    store:          Store;
+    callback_owner: i64;
+    initialized:    bool;
+}
+
+fun store_shape(value: Store) bool {
+    ret value.ctx != nil && value.ready:^ != nil && value.aliases:^ != nil &&
+        value.owns_secret:^ != nil && value.begin:^ != nil &&
+        value.stage:^ != nil && value.commit:^ != nil &&
+        value.abort:^ != nil && value.load:^ != nil;
+}
+
+fun store_same(first: Store, second: Store) bool {
+    ret first.ctx == second.ctx && first.ready:^ == second.ready:^ &&
+        first.aliases:^ == second.aliases:^ &&
+        first.owns_secret:^ == second.owns_secret:^ &&
+        first.begin:^ == second.begin:^ && first.stage:^ == second.stage:^ &&
+        first.commit:^ == second.commit:^ && first.abort:^ == second.abort:^ &&
+        first.load:^ == second.load:^;
+}
+
+fun status_valid(value: Status) bool {
+    ret value == SUCCESS || value == NOT_FOUND || value == CONFLICT ||
+        value == FAILED || value == UNKNOWN;
+}
+
+fun transaction_valid(value: Transaction, store: Store,
+    generation: u64) bool {
+    ret value.owner == store.ctx && value.token != 0 &&
+        value.generation == generation;
+}
+
+fun transaction_empty(value: Transaction) bool {
+    ret value.owner == nil && value.token == 0 && value.generation == 0;
+}
+
+fun digest_update(context: *hash.Sha256, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret false; }
+    ret hash.update_sha256(context,
+        contracts.Bytes{data: data, len: len}) == contracts.OK;
+}
+
+fun credentials_digest(value: account.Credentials, output: *u8) bool {
+    if (!account.credentials_valid(value) ||
+        !memory_range.valid(output, 32)) { ret false; }
+    var context: hash.Sha256 = hash.empty_sha256();
+    if (hash.init_sha256(?context) != contracts.OK) { ret false; }
+    var generation: u64 = value.generation;
+    var algorithm: u8 = value.signer.algorithm;
+    var account_status: u8 = value.account.status;
+    var agreed: bool = value.account.terms_of_service_agreed;
+    var contact_len: usize = value.account.contact_len;
+    var url_len: usize = value.account.url.len;
+    var orders_len: usize = value.account.orders_url.len;
+    var owner: ptr = value.secret_owner;
+    var max_jwk: usize = value.signer.max_jwk_bytes;
+    var max_thumb: usize = value.signer.max_thumb_bytes;
+    var max_signature: usize = value.signer.max_signature_bytes;
+    if (!digest_update(?context, value.account.url.data, value.account.url.len) ||
+        !digest_update(?context, (?url_len)::*u8, $size_of(usize)) ||
+        !digest_update(?context, value.account.orders_url.data,
+            value.account.orders_url.len) ||
+        !digest_update(?context, (?orders_len)::*u8, $size_of(usize)) ||
+        !digest_update(?context, (?generation)::*u8, $size_of(u64)) ||
+        !digest_update(?context, (?algorithm)::*u8, $size_of(u8)) ||
+        !digest_update(?context, (?account_status)::*u8, $size_of(u8)) ||
+        !digest_update(?context, (?agreed)::*u8, $size_of(bool)) ||
+        !digest_update(?context, (?contact_len)::*u8, $size_of(usize)) ||
+        !digest_update(?context, (?owner)::*u8, $size_of(ptr)) ||
+        !digest_update(?context, (?max_jwk)::*u8, $size_of(usize)) ||
+        !digest_update(?context, (?max_thumb)::*u8, $size_of(usize)) ||
+        !digest_update(?context, (?max_signature)::*u8, $size_of(usize))) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < value.account.contact_len) {
+        var item_len: usize = value.account.contacts[i].len;
+        if (!digest_update(?context, value.account.contacts[i].data,
+                value.account.contacts[i].len) ||
+            !digest_update(?context, (?item_len)::*u8, $size_of(usize))) {
+            hash.destroy_sha256(?context);
+            ret false;
+        }
+        i = i + 1;
+    }
+    val key: jose.PublicKey = value.signer.public_key;
+    var value_len: usize = key.value.len;
+    var modulus_len: usize = key.rsa.modulus.len;
+    var exponent_len: usize = key.rsa.exponent.len;
+    if (key.algorithm == jose.ES256 || key.algorithm == jose.EDDSA) {
+        if (!digest_update(?context, key.value.data, key.value.len) ||
+            !digest_update(?context, (?value_len)::*u8, $size_of(usize))) {
+            hash.destroy_sha256(?context);
+            ret false;
+        }
+    } or {
+        if (!digest_update(?context, key.rsa.modulus.data, key.rsa.modulus.len) ||
+            !digest_update(?context, (?modulus_len)::*u8, $size_of(usize)) ||
+            !digest_update(?context, key.rsa.exponent.data, key.rsa.exponent.len) ||
+            !digest_update(?context, (?exponent_len)::*u8, $size_of(usize))) {
+            hash.destroy_sha256(?context);
+            ret false;
+        }
+    }
+    val result: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: output, capacity: 32});
+    ret result.error == contracts.OK && result.written == 32;
+}
+
+fun digest_same(value: account.Credentials, expected: *u8) bool {
+    var actual: [32]u8;
+    if (!credentials_digest(value, ?actual[0])) { ret false; }
+    var i: usize = 0;
+    for (i < 32) {
+        if (actual[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun view_digest(value: view.View, output: *u8) bool {
+    if (!memory_range.valid(value.data, value.len) ||
+        !memory_range.valid(output, 32)) { ret false; }
+    var context: hash.Sha256 = hash.empty_sha256();
+    if (hash.init_sha256(?context) != contracts.OK ||
+        hash.update_sha256(?context, contracts.Bytes{data: value.data,
+            len: value.len}) != contracts.OK) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    val result: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: output, capacity: 32});
+    ret result.error == contracts.OK && result.written == 32;
+}
+
+fun view_digest_same(value: view.View, expected: *u8) bool {
+    var actual: [32]u8;
+    if (!view_digest(value, ?actual[0])) { ret false; }
+    var i: usize = 0;
+    for (i < 32) {
+        if (actual[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun manager_ready(manager: *Manager) bool {
+    ret manager != nil &&
+        memory_range.valid(manager::*u8, $size_of(Manager)) &&
+        manager.initialized && store_shape(manager.store);
+}
+
+fun manager_intact(manager: *Manager, before: Store) bool {
+    ret manager != nil && manager.initialized &&
+        store_same(before, manager.store) &&
+        atomic.load(?manager.callback_owner) == os.thread_current_id();
+}
+
+fun enter(manager: *Manager) bool {
+    if (!manager_ready(manager)) { ret false; }
+    val owner: i64 = os.thread_current_id();
+    if (owner <= 0) { ret false; }
+    for (true) {
+        var expected: i64 = atomic.load(?manager.callback_owner);
+        if (expected == owner) { ret false; }
+        if (expected == 0 && atomic.cas(?manager.callback_owner,
+                ?expected, owner)) { ret true; }
+        if (expected != 0) {
+            os.thread_wait(?manager.callback_owner, expected);
+        }
+    }
+}
+
+fun leave(manager: *Manager) {
+    atomic.store(?manager.callback_owner, 0);
+    os.thread_wake(?manager.callback_owner);
+}
+
+fun storage_error(detail: *u8) problem.Error {
+    ret problem.local_code(problem.STORAGE, problem.INVALID_STATE, detail);
+}
+
+fun same_bytes(first: *u8, second: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun credentials_owned(store: Store, value: account.Credentials) bool {
+    if (!store.aliases(store.ctx, value.account.url.data,
+            value.account.url.len) ||
+        !store.aliases(store.ctx, value.account.orders_url.data,
+            value.account.orders_url.len) ||
+        !store.owns_secret(store.ctx, value.secret_owner)) { ret false; }
+    var contact_bytes: usize = 0;
+    if (!memory_range.size(value.account.contact_len, $size_of(view.View),
+            ?contact_bytes) ||
+        (contact_bytes != 0 && !store.aliases(store.ctx,
+            value.account.contacts::*u8, contact_bytes))) { ret false; }
+    var i: usize = 0;
+    for (i < value.account.contact_len) {
+        if (!store.aliases(store.ctx, value.account.contacts[i].data,
+                value.account.contacts[i].len)) { ret false; }
+        i = i + 1;
+    }
+    val key: jose.PublicKey = value.signer.public_key;
+    if (key.algorithm == jose.ES256 || key.algorithm == jose.EDDSA) {
+        ret store.aliases(store.ctx, key.value.data, key.value.len);
+    }
+    ret store.aliases(store.ctx, key.rsa.modulus.data, key.rsa.modulus.len) &&
+        store.aliases(store.ctx, key.rsa.exponent.data, key.rsa.exponent.len);
+}
+
+pub fun init_manager(manager: *Manager, value: Store) problem.Error {
+    if (manager == nil || !memory_range.valid(manager::*u8, $size_of(Manager)) ||
+        manager.initialized || !store_shape(value) ||
+        memory_range.overlap(manager::*u8, $size_of(Manager),
+            value.ctx::*u8, 1)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid account store");
+    }
+    manager.store = value;
+    manager.callback_owner = 0;
+    manager.initialized = true;
+    if (!enter(manager)) {
+        manager.initialized = false;
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid account store");
+    }
+    val before: Store = manager.store;
+    var ready: bool = before.ready(before.ctx);
+    var intact: bool = manager_intact(manager, before);
+    var aliased: bool = true;
+    if (ready && intact) {
+        aliased = before.aliases(before.ctx, manager::*u8,
+            $size_of(Manager));
+    }
+    intact = intact && manager_intact(manager, before);
+    leave(manager);
+    if (aliased || !ready || !intact) {
+        var empty: Store;
+        manager.store = empty;
+        manager.initialized = false;
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid account store");
+    }
+    ret problem.none();
+}
+
+pub fun recover(manager: *Manager, account_url: view.View,
+    output: *Snapshot) problem.Error {
+    if (!manager_ready(manager) || output == nil ||
+        !memory_range.valid(output::*u8, $size_of(Snapshot)) ||
+        !memory_range.valid(account_url.data, account_url.len) ||
+        !client.url_valid(account_url, 4096) ||
+        memory_range.overlap(output::*u8, $size_of(Snapshot),
+            account_url.data, account_url.len)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid account recovery request");
+    }
+    var url_digest: [32]u8;
+    if (!view_digest(account_url, ?url_digest[0])) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid account recovery url");
+    }
+    if (!enter(manager)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "account store callback is reentrant");
+    }
+    val before: Store = manager.store;
+    var provider_ready_before: bool = before.ready(before.ctx);
+    var intact_before: bool = manager_intact(manager, before);
+    var output_owned: bool = true;
+    if (provider_ready_before && intact_before) {
+        output_owned = before.aliases(before.ctx, output::*u8,
+            $size_of(Snapshot));
+    }
+    intact_before = intact_before && manager_intact(manager, before);
+    if (output_owned || !provider_ready_before || !intact_before ||
+        !view_digest_same(account_url, ?url_digest[0])) {
+        leave(manager);
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid account recovery storage");
+    }
+    var candidate: Snapshot;
+    val status: Status = before.load(before.ctx, account_url,
+        ?candidate);
+    var valid_result: bool = status_valid(status) && candidate.status == status;
+    if (valid_result && status == NOT_FOUND) {
+        valid_result = (!candidate.has_pending &&
+            transaction_empty(candidate.transaction)) ||
+            (candidate.has_pending &&
+                account.credentials_valid(candidate.pending) &&
+                candidate.pending.generation == 1 &&
+                candidate.pending.account.url.len == account_url.len &&
+                same_bytes(candidate.pending.account.url.data,
+                    account_url.data, account_url.len) &&
+                transaction_valid(candidate.transaction, before, 0) &&
+                !account.credentials_overlap(candidate.pending,
+                    (?candidate)::*u8, $size_of(Snapshot)) &&
+                !account.credentials_overlap(candidate.pending, output::*u8,
+                    $size_of(Snapshot)));
+        var pending_digest: [32]u8;
+        if (valid_result && candidate.has_pending) {
+            valid_result = credentials_digest(candidate.pending,
+                    ?pending_digest[0]) &&
+                credentials_owned(before, candidate.pending) &&
+                digest_same(candidate.pending, ?pending_digest[0]);
+        }
+    } or (valid_result && status == SUCCESS) {
+        valid_result = account.credentials_valid(candidate.current) &&
+            candidate.current.account.url.len == account_url.len &&
+            same_bytes(candidate.current.account.url.data, account_url.data,
+                account_url.len) &&
+            (!candidate.has_pending &&
+                transaction_empty(candidate.transaction) ||
+            candidate.has_pending && account.credentials_valid(candidate.pending) &&
+                candidate.current.generation != 0xffffffffffffffff &&
+                candidate.pending.generation == candidate.current.generation + 1 &&
+                account.same(candidate.current.account,
+                    candidate.pending.account) &&
+                transaction_valid(candidate.transaction, before,
+                    candidate.current.generation)) &&
+            !account.credentials_overlap(candidate.current,
+                (?candidate)::*u8, $size_of(Snapshot)) &&
+            !account.credentials_overlap(candidate.current, output::*u8,
+                $size_of(Snapshot)) &&
+            (!candidate.has_pending ||
+                !account.credentials_overlap(candidate.pending,
+                    (?candidate)::*u8, $size_of(Snapshot)) &&
+                !account.credentials_overlap(candidate.pending, output::*u8,
+                    $size_of(Snapshot)));
+        var current_digest: [32]u8;
+        var pending_digest: [32]u8;
+        if (valid_result) {
+            valid_result = credentials_digest(candidate.current,
+                    ?current_digest[0]) &&
+                (!candidate.has_pending || credentials_digest(candidate.pending,
+                    ?pending_digest[0]));
+        }
+        if (valid_result) {
+            valid_result = credentials_owned(before, candidate.current) &&
+                (!candidate.has_pending ||
+                    credentials_owned(before, candidate.pending)) &&
+                digest_same(candidate.current, ?current_digest[0]) &&
+                (!candidate.has_pending || digest_same(candidate.pending,
+                    ?pending_digest[0]));
+        }
+    } or {
+        valid_result = false;
+    }
+    var intact: bool = manager_intact(manager, before);
+    var provider_ready: bool = false;
+    if (intact) { provider_ready = before.ready(before.ctx); }
+    intact = intact && manager_intact(manager, before) && provider_ready &&
+        view_digest_same(account_url, ?url_digest[0]);
+    leave(manager);
+    if (!intact || !valid_result) {
+        ret storage_error("account store returned an invalid recovery result");
+    }
+    if (status == NOT_FOUND) {
+        if (candidate.has_pending) { @output = candidate; }
+        or {
+            var missing: Snapshot;
+            missing.status = NOT_FOUND;
+            @output = missing;
+        }
+        ret problem.none();
+    }
+    @output = candidate;
+    ret problem.none();
+}
+
+pub fun begin_replace(manager: *Manager, current: account.Credentials,
+    replacement: account.Credentials) Write {
+    var failed_result: Write;
+    failed_result.error = problem.local_code(problem.STORAGE,
+        problem.INVALID_INPUT, "invalid credential replacement");
+    if (!manager_ready(manager) || !enter(manager)) { ret failed_result; }
+    val before: Store = manager.store;
+    var provider_ready_before: bool = before.ready(before.ctx);
+    provider_ready_before = provider_ready_before &&
+        manager_intact(manager, before);
+    if (!provider_ready_before || !account.credentials_valid(current) ||
+        !account.credentials_valid(replacement) ||
+        current.generation == 0xffffffffffffffff ||
+        replacement.generation != current.generation + 1 ||
+        !account.same(current.account, replacement.account) ||
+        current.account.url.len != replacement.account.url.len ||
+        !same_bytes(current.account.url.data, replacement.account.url.data,
+            current.account.url.len)) {
+        leave(manager);
+        ret failed_result;
+    }
+    var current_digest: [32]u8;
+    var replacement_digest: [32]u8;
+    if (!credentials_digest(current, ?current_digest[0]) ||
+        !credentials_digest(replacement, ?replacement_digest[0])) {
+        leave(manager);
+        ret failed_result;
+    }
+    val current_secret_owned: bool = before.owns_secret(before.ctx,
+        current.secret_owner);
+    val replacement_secret_owned: bool = before.owns_secret(before.ctx,
+        replacement.secret_owner);
+    if (!manager_intact(manager, before) || !current_secret_owned ||
+        !credentials_owned(before, current) ||
+        !manager_intact(manager, before) ||
+        !digest_same(current, ?current_digest[0]) ||
+        !digest_same(replacement, ?replacement_digest[0])) {
+        leave(manager);
+        failed_result.error = storage_error(
+            "credential ownership callbacks changed their inputs");
+        ret failed_result;
+    }
+    val begun: BeginResult = before.begin(before.ctx,
+        current.account.url, current.generation);
+    var valid: bool = manager_intact(manager, before) &&
+        before.ready(before.ctx) && manager_intact(manager, before) &&
+        digest_same(current,
+            ?current_digest[0]) && digest_same(replacement,
+            ?replacement_digest[0]) && current_secret_owned ==
+            before.owns_secret(before.ctx, current.secret_owner) &&
+            replacement_secret_owned == before.owns_secret(before.ctx,
+                replacement.secret_owner) && manager_intact(manager, before) &&
+            status_valid(begun.status);
+    if (!valid || begun.status != SUCCESS ||
+        !transaction_valid(begun.transaction, manager.store,
+            current.generation)) {
+        leave(manager);
+        failed_result.error = storage_error("credential transaction could not begin");
+        ret failed_result;
+    }
+    val staged: Status = before.stage(before.ctx,
+        begun.transaction, replacement);
+    valid = manager_intact(manager, before) &&
+        before.ready(before.ctx) && manager_intact(manager, before) &&
+        credentials_owned(before, current) &&
+        credentials_owned(before, replacement) &&
+        manager_intact(manager, before) &&
+        digest_same(current,
+            ?current_digest[0]) && digest_same(replacement,
+            ?replacement_digest[0]) && status_valid(staged);
+    if (!valid || staged != SUCCESS) {
+        var cleanup_safe: bool = manager_intact(manager, before);
+        if (cleanup_safe) {
+            cleanup_safe = before.ready(before.ctx) &&
+                manager_intact(manager, before);
+        }
+        var aborted: Status = UNKNOWN;
+        var abort_valid: bool = false;
+        if (cleanup_safe) {
+            aborted = before.abort(before.ctx, begun.transaction);
+            abort_valid = manager_intact(manager, before) &&
+                before.ready(before.ctx) && manager_intact(manager, before) &&
+                status_valid(aborted);
+        }
+        leave(manager);
+        failed_result.transaction = begun.transaction;
+        if (!valid || !abort_valid || aborted == UNKNOWN) {
+            failed_result.error = storage_error(
+                "credential preparation outcome is unknown");
+        } or {
+            failed_result.error = storage_error("credential replacement was rejected");
+        }
+        ret failed_result;
+    }
+    leave(manager);
+    ret Write{error: problem.none(), transaction: begun.transaction,
+        prepared: true};
+}
+
+# initial credentials use expected generation zero, metadata updates retain it
+pub fun begin_save(manager: *Manager, expected_generation: u64,
+    candidate: account.Credentials) Write {
+    var failed_result: Write;
+    failed_result.error = problem.local_code(problem.STORAGE,
+        problem.INVALID_INPUT, "invalid account credential save");
+    if (!manager_ready(manager) || !enter(manager)) { ret failed_result; }
+    val before: Store = manager.store;
+    if (!before.ready(before.ctx) || !manager_intact(manager, before) ||
+        !account.credentials_valid(candidate) ||
+        (expected_generation == 0 && candidate.generation != 1) ||
+        (expected_generation != 0 &&
+            candidate.generation != expected_generation)) {
+        leave(manager);
+        ret failed_result;
+    }
+    var candidate_digest: [32]u8;
+    if (!credentials_digest(candidate, ?candidate_digest[0])) {
+        leave(manager);
+        ret failed_result;
+    }
+    val begun: BeginResult = before.begin(before.ctx, candidate.account.url,
+        expected_generation);
+    var valid: bool = manager_intact(manager, before) &&
+        before.ready(before.ctx) && manager_intact(manager, before) &&
+        digest_same(candidate, ?candidate_digest[0]) &&
+        status_valid(begun.status);
+    if (!valid || begun.status != SUCCESS ||
+        !transaction_valid(begun.transaction, before, expected_generation)) {
+        leave(manager);
+        failed_result.error = storage_error(
+            "account credential transaction could not begin");
+        ret failed_result;
+    }
+    val staged: Status = before.stage(before.ctx, begun.transaction, candidate);
+    valid = manager_intact(manager, before) &&
+        before.ready(before.ctx) && manager_intact(manager, before) &&
+        credentials_owned(before, candidate) &&
+        manager_intact(manager, before) &&
+        digest_same(candidate, ?candidate_digest[0]) && status_valid(staged);
+    if (!valid || staged != SUCCESS) {
+        var cleanup_safe: bool = manager_intact(manager, before);
+        if (cleanup_safe) {
+            cleanup_safe = before.ready(before.ctx) &&
+                manager_intact(manager, before);
+        }
+        var aborted: Status = UNKNOWN;
+        var abort_valid: bool = false;
+        if (cleanup_safe) {
+            aborted = before.abort(before.ctx, begun.transaction);
+            abort_valid = manager_intact(manager, before) &&
+                before.ready(before.ctx) && manager_intact(manager, before) &&
+                status_valid(aborted);
+        }
+        leave(manager);
+        failed_result.transaction = begun.transaction;
+        if (!abort_valid || aborted == UNKNOWN) {
+            failed_result.error = storage_error(
+                "account credential save outcome is unknown");
+        } or {
+            failed_result.error = storage_error(
+                "account credential save was rejected");
+        }
+        ret failed_result;
+    }
+    leave(manager);
+    ret Write{error: problem.none(), transaction: begun.transaction,
+        prepared: true};
+}
+
+pub fun commit_write(manager: *Manager, replacement: Write) problem.Error {
+    if (!manager_ready(manager) || problem.failed(replacement.error) ||
+        !replacement.prepared || !transaction_valid(replacement.transaction,
+            manager.store, replacement.transaction.generation) ||
+        !enter(manager)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid prepared credential replacement");
+    }
+    val before: Store = manager.store;
+    if (!before.ready(before.ctx) || !manager_intact(manager, before)) {
+        leave(manager);
+        ret storage_error("account store is not ready to commit");
+    }
+    val status: Status = before.commit(before.ctx,
+        replacement.transaction);
+    val valid: bool = manager_intact(manager, before) &&
+        before.ready(before.ctx) && manager_intact(manager, before) &&
+        status_valid(status);
+    leave(manager);
+    if (!valid || status == UNKNOWN) {
+        ret storage_error("credential commit outcome is unknown");
+    }
+    if (status != SUCCESS) { ret storage_error("credential commit failed"); }
+    ret problem.none();
+}
+
+pub fun abort_write(manager: *Manager, replacement: Write) problem.Error {
+    if (!manager_ready(manager) || problem.failed(replacement.error) ||
+        !replacement.prepared || !transaction_valid(replacement.transaction,
+            manager.store, replacement.transaction.generation) ||
+        !enter(manager)) {
+        ret problem.local_code(problem.STORAGE, problem.INVALID_INPUT,
+            "invalid prepared credential replacement");
+    }
+    val before: Store = manager.store;
+    if (!before.ready(before.ctx) || !manager_intact(manager, before)) {
+        leave(manager);
+        ret storage_error("account store is not ready to abort");
+    }
+    val status: Status = before.abort(before.ctx,
+        replacement.transaction);
+    val valid: bool = manager_intact(manager, before) &&
+        before.ready(before.ctx) && manager_intact(manager, before) &&
+        status_valid(status);
+    leave(manager);
+    if (!valid || status == UNKNOWN) {
+        ret storage_error("credential abort outcome is unknown");
+    }
+    if (status != SUCCESS) { ret storage_error("credential abort failed"); }
+    ret problem.none();
 }

@@ -15,11 +15,15 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.view;
 use acme.client;
+use acme.account;
+use acme.external_account;
 use acme.jose;
 use acme.json;
+use acme.key_change;
 use acme.memory_range;
 use acme.nonce;
 use acme.problem;
+use acme.storage;
 
 fun equal(first: *u8, second: *u8, len: usize) bool {
     var i: usize = 0;
@@ -157,6 +161,60 @@ fun es_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
         value: contracts.Bytes{data: public_bytes, len: 65}};
     @private_key = jose.PrivateKey{algorithm: jose.ES256,
         secret_owner: public_bytes::ptr, value: secret};
+    ret true;
+}
+
+fun ed_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
+    private_bytes: *^u8, public_bytes: *u8) {
+    val seed: [32]u8 = [32]u8{
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60,
+        0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+        0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19,
+        0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60};
+    val encoded: [32]u8 = [32]u8{
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+        0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+        0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+        0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a};
+    var i: usize = 0;
+    for (i < 32) {
+        private_bytes[i] = seed[i];
+        public_bytes[i] = encoded[i];
+        i = i + 1;
+    }
+    @public_key = jose.PublicKey{algorithm: jose.EDDSA,
+        value: contracts.Bytes{data: public_bytes, len: 32}};
+    @private_key = jose.PrivateKey{algorithm: jose.EDDSA,
+        secret_owner: public_bytes::ptr,
+        value: contracts.SecretBytes{data: private_bytes, len: 32}};
+}
+
+fun rsa_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
+    modulus: *u8, exponent: *u8, private_bytes: *^u8,
+    decode_work: *u8) bool {
+    val modulus_text: *u8 = "p_teNxO8by2eprJiu3ngRFferEuSKek_LmzyJCkogfOvJaUhm7J_SNN3xzaNNHpDvwsnw1sucOIckxzOySA-fqApVBCRo6R4zQ45x_hThuOcqKLMs4Pv4NngoOq-lbu4To76FfOFwgdrqqKPoOopivLyo-CmvmrcEvT21uBl_MKNeJw_LdqkVE6YyHmnBdESgcGSamwFKwBeF5UAZrr3mDD7HTNFR6OO5HBNokQdOWZ_U_PFoZGhrYp36JhvnNAewm1MDaItjskRlOWaE3mRmcscE855_ttHe_T_St-0LxH5Ik0Urtio0HY58zUT0MiZKVKluFQvlKo9fm_Nor5esQ";
+    val private_text: *u8 = "eTcvHD0dE50cY23fSAUBQpkTfu6uBeKYAr8kMv0AQqF1qvknOaVZGMHt3zxVDVb2As8FXe6gfab1kyCNctT61hKzv_pHHfgMs8cUvTy5LfQIJZYLl7WGcW0Qr6Ai8CmcmlzSEOmbzhC6d5mWpqd3N2P9c3G2mBYyCtdVWh3TeoKHcutpJXAdfkWfc-aLeOuF46OMY-HdBYkL3uG77bgkdXbfgrhzDNMRWxRyUxOD_RRQ6UvzHy0Xb3KnN971VZFWydjrH_Hz-aj5T7Kmfu8h-dDMc_DonPEzhJ4SyO5vITdm_llR2MJJf8NhsXl4lQqKm1deNI2x04m6Kr6nzBaB";
+    if (base64.decode(modulus_text, length(modulus_text), modulus, 256) != 256 ||
+        base64.decode("AQAB", 4, exponent, 3) != 3 ||
+        base64.decode(private_text, length(private_text), ?decode_work[1],
+            255) != 255) { ret false; }
+    decode_work[0] = 0;
+    var i: usize = 0;
+    for (i < 256) {
+        private_bytes[i] = decode_work[i];
+        decode_work[i] = 0;
+        i = i + 1;
+    }
+    val rsa_public: signature.RsaPublicKey = signature.RsaPublicKey{
+        modulus: contracts.Bytes{data: modulus, len: 256},
+        exponent: contracts.Bytes{data: exponent, len: 3}};
+    @public_key = jose.PublicKey{algorithm: jose.PS256, rsa: rsa_public};
+    @private_key = jose.PrivateKey{algorithm: jose.PS256,
+        secret_owner: modulus::ptr,
+        rsa: signature.RsaPrivateKey{modulus: rsa_public.modulus,
+            public_exponent: rsa_public.exponent,
+            private_exponent: contracts.SecretBytes{data: private_bytes,
+                len: 256}}};
     ret true;
 }
 
@@ -1885,10 +1943,11 @@ test "client: callback boundaries serialize concurrent requests" {
     }
     thread.join(?first_thread);
     thread.join(?second_thread);
-    if (atomic.load(?first_result) != 1 || atomic.load(?second_result) != 1 ||
-        first.state != client.REQUEST_COMPLETE ||
-        second.state != client.REQUEST_COMPLETE ||
-        atomic.load(?protocol.callback_owner) != 0) { ret 6; }
+    if (atomic.load(?first_result) != 1) { ret 6; }
+    if (atomic.load(?second_result) != 1) { ret 8; }
+    if (first.state != client.REQUEST_COMPLETE) { ret 9; }
+    if (second.state != client.REQUEST_COMPLETE) { ret 10; }
+    if (atomic.load(?protocol.callback_owner) != 0) { ret 11; }
     var output: [64]u8;
     val newest: nonce.Taken = nonce.take(pool, ?output[0], 64);
     val older: nonce.Taken = nonce.take(pool, ?output[0], 64);
@@ -2005,5 +2064,591 @@ test "nonce: hostile values, duplicates, and small outputs are transactional" {
     if (problem.failed(taken.error) || !taken.found || taken.value.len != 11) { ret 4; }
     val exhausted: nonce.Taken = nonce.take(pool, ?output[0], 16);
     if (problem.failed(exhausted.error) || exhausted.found) { ret 5; }
+    ret 0;
+}
+
+rec AccountStore {
+    current: account.Credentials;
+    pending: account.Credentials;
+    manager: *storage.Manager;
+    token: u64;
+    found: bool;
+    pending_ready: bool;
+    ready: bool;
+    commit_unknown: bool;
+    reenter: bool;
+    reentry_rejected: bool;
+    load_calls: i64;
+    load_active: i64;
+    load_overlap: i64;
+    owned: *u8;
+    owned_len: usize;
+    mutate: *u8;
+}
+
+fun account_store_ready(ctx: ptr) bool {
+    ret (ctx::*AccountStore).ready;
+}
+
+fun account_store_aliases(ctx: ptr, data: *u8, len: usize) bool {
+    val value: *AccountStore = ctx::*AccountStore;
+    ret memory_range.overlap(data, len, value.owned, value.owned_len) ||
+        (value.found && account.credentials_overlap(value.current, data, len)) ||
+        (value.pending_ready &&
+            account.credentials_overlap(value.pending, data, len));
+}
+
+fun account_store_owns_secret(ctx: ptr, owner: ptr) bool {
+    val value: *AccountStore = ctx::*AccountStore;
+    ret (value.found && owner == value.current.secret_owner) ||
+        (value.pending_ready && owner == value.pending.secret_owner);
+}
+
+fun account_store_begin(ctx: ptr, url: view.View,
+    generation: u64) storage.BeginResult {
+    val value: *AccountStore = ctx::*AccountStore;
+    if (value.reenter && value.manager != nil) {
+        var nested: storage.Snapshot;
+        val result: problem.Error = storage.recover(value.manager, url, ?nested);
+        value.reentry_rejected = result.code == problem.INVALID_INPUT &&
+            atomic.load(?value.load_calls) == 0;
+    }
+    if (!value.ready || value.pending_ready ||
+        (generation == 0 && value.found) ||
+        (generation != 0 && (!value.found ||
+            generation != value.current.generation))) {
+        ret storage.BeginResult{status: storage.CONFLICT};
+    }
+    value.token = value.token + 1;
+    ret storage.BeginResult{status: storage.SUCCESS,
+        transaction: storage.Transaction{owner: ctx, token: value.token,
+            generation: generation}};
+}
+
+fun account_store_stage(ctx: ptr, transaction: storage.Transaction,
+    replacement: account.Credentials) storage.Status {
+    val value: *AccountStore = ctx::*AccountStore;
+    if (transaction.owner != ctx || transaction.token != value.token ||
+        (transaction.generation == 0 && value.found) ||
+        (transaction.generation != 0 && (!value.found ||
+            transaction.generation != value.current.generation)) ||
+        value.pending_ready) { ret storage.CONFLICT; }
+    value.pending = replacement;
+    value.pending_ready = true;
+    if (value.mutate != nil) {
+        value.mutate[0] = value.mutate[0] ^ 1;
+    }
+    ret storage.SUCCESS;
+}
+
+fun account_store_commit(ctx: ptr,
+    transaction: storage.Transaction) storage.Status {
+    val value: *AccountStore = ctx::*AccountStore;
+    if (transaction.owner != ctx || transaction.token != value.token ||
+        !value.pending_ready) { ret storage.CONFLICT; }
+    if (value.commit_unknown) { ret storage.UNKNOWN; }
+    value.current = value.pending;
+    value.found = true;
+    value.pending_ready = false;
+    value.token = 0;
+    ret storage.SUCCESS;
+}
+
+fun account_store_abort(ctx: ptr,
+    transaction: storage.Transaction) storage.Status {
+    val value: *AccountStore = ctx::*AccountStore;
+    if (transaction.owner != ctx || transaction.token != value.token ||
+        !value.pending_ready) { ret storage.CONFLICT; }
+    value.pending_ready = false;
+    value.token = 0;
+    ret storage.SUCCESS;
+}
+
+fun account_store_load(ctx: ptr, url: view.View,
+    output: *storage.Snapshot) storage.Status {
+    val value: *AccountStore = ctx::*AccountStore;
+    atomic.fetch_add(?value.load_calls, 1);
+    if (atomic.fetch_add(?value.load_active, 1) != 0) {
+        atomic.store(?value.load_overlap, 1);
+    }
+    var spin: usize = 0;
+    for (spin < 10000) {
+        atomic.load(?value.load_active);
+        spin = spin + 1;
+    }
+    var result: storage.Snapshot;
+    if (!value.found) {
+        result.status = storage.NOT_FOUND;
+        result.has_pending = value.pending_ready;
+        if (value.pending_ready) {
+            result.pending = value.pending;
+            result.transaction = storage.Transaction{owner: ctx,
+                token: value.token, generation: 0};
+        }
+        @output = result;
+    } or {
+        result.status = storage.SUCCESS;
+        result.current = value.current;
+        result.has_pending = value.pending_ready;
+        if (value.pending_ready) {
+            result.pending = value.pending;
+            result.transaction = storage.Transaction{owner: ctx,
+                token: value.token, generation: value.current.generation};
+        }
+        @output = result;
+    }
+    atomic.fetch_sub(?value.load_active, 1);
+    ret result.status;
+}
+
+fun account_store(value: *AccountStore) storage.Store {
+    ret storage.Store{ctx: value::ptr, ready: account_store_ready,
+        aliases: account_store_aliases, owns_secret: account_store_owns_secret,
+        begin: account_store_begin, stage: account_store_stage,
+        commit: account_store_commit, abort: account_store_abort,
+        load: account_store_load};
+}
+
+fun credentials(key: jose.PublicKey, owner: ptr,
+    generation: u64) account.Credentials {
+    ret account.Credentials{account: account.Account{
+        url: view.view("https://example.com/acme/acct/1", 31),
+        status: account.VALID, contacts: nil, contact_len: 0,
+        orders_url: view.view("https://example.com/acme/acct/1/orders", 38),
+        terms_of_service_agreed: true}, signer: jose.signer(key),
+        secret_owner: owner, generation: generation};
+}
+
+rec RecoverContext {
+    manager:  *storage.Manager;
+    url:      view.View;
+    snapshot: *storage.Snapshot;
+    result:   *i64;
+}
+
+fun recover_worker(arg: *u8) {
+    val context: *RecoverContext = arg::*RecoverContext;
+    if (!problem.failed(storage.recover(context.manager, context.url,
+            context.snapshot))) {
+        atomic.store(context.result, 1);
+    } or { atomic.store(context.result, -1); }
+}
+
+test "account: lifecycle payloads are exact and reject aliases" {
+    var contacts: [2]view.View = [2]view.View{
+        view.view("mailto:one@example.com", 22),
+        view.view("mailto:two@example.com", 22)};
+    var output: [512]u8;
+    val binding: *u8 = "{\"protected\":\"aa\",\"payload\":\"aa\",\"signature\":\"aa\"}";
+    val create: account.Operation = account.encode(account.CREATE,
+        account.Request{contacts: ?contacts[0], contact_len: 2,
+            terms_of_service_agreed: true, only_return_existing: false,
+            external_account_binding: view.view(binding, length(binding))},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    val expected: *u8 = "{\"contact\":[\"mailto:one@example.com\",\"mailto:two@example.com\"],\"externalAccountBinding\":{\"protected\":\"aa\",\"payload\":\"aa\",\"signature\":\"aa\"},\"termsOfServiceAgreed\":true}";
+    if (problem.failed(create.error)) { ret 10; }
+    if (create.written != length(expected)) { ret 11; }
+    if (!equal(?output[0], expected, create.written)) { ret 12; }
+    val lookup: account.Operation = account.encode(account.LOOKUP,
+        account.Request{contacts: nil, contact_len: 0,
+            terms_of_service_agreed: false, only_return_existing: true,
+            external_account_binding: view.view(nil, 0)},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(lookup.error)) { ret 30 + lookup.error.code::i32; }
+    if (lookup.written != 27) { ret 21; }
+    if (!equal(?output[0], "{\"onlyReturnExisting\":true}", 27)) { ret 22; }
+    var slots: [1]nonce.Slot;
+    var nonce_bytes: [64]u8;
+    var nonce_memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?nonce_memory, ?slots[0], 1,
+            ?nonce_bytes[0], 64, 64))) { ret 23; }
+    var pool: nonce.Pool = nonce.pool(?nonce_memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool,
+            client.limits_default()))) { ret 24; }
+    var lookup_state: client.SignedRequest;
+    if (problem.failed(account.begin(?protocol, ?lookup_state, account.LOOKUP,
+            view.view("https://example.com/acme/new-account", 36),
+            view.view(nil, 0), view.view(?output[0], lookup.written), lookup)) ||
+        !lookup_state.spec.use_jwk) { ret 25; }
+    val empty_contacts: account.Operation = account.encode(account.UPDATE_CONTACT,
+        account.Request{contacts: nil, contact_len: 0,
+            terms_of_service_agreed: false, only_return_existing: false,
+            external_account_binding: view.view(nil, 0)},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(empty_contacts.error) || empty_contacts.written != 14 ||
+        !equal(?output[0], "{\"contact\":[]}", 14)) { ret 3; }
+    var update_state: client.SignedRequest;
+    if (problem.failed(account.begin(?protocol, ?update_state,
+            account.UPDATE_CONTACT,
+            view.view("https://example.com/acme/acct/1", 31),
+            view.view("https://example.com/acme/acct/1", 31),
+            view.view(?output[0], empty_contacts.written), empty_contacts)) ||
+        update_state.spec.use_jwk) { ret 4; }
+    val terms: account.Operation = account.encode(account.AGREE_TERMS,
+        account.Request{contacts: nil, contact_len: 0,
+            terms_of_service_agreed: true, only_return_existing: false,
+            external_account_binding: view.view(nil, 0)},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(terms.error) || terms.written != 29 ||
+        !equal(?output[0], "{\"termsOfServiceAgreed\":true}", 29)) { ret 5; }
+    val deactivate: account.Operation = account.encode(account.DEACTIVATE,
+        account.Request{contacts: nil, contact_len: 0,
+            terms_of_service_agreed: false, only_return_existing: false,
+            external_account_binding: view.view(nil, 0)},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(deactivate.error) || deactivate.written != 24 ||
+        !equal(?output[0], "{\"status\":\"deactivated\"}", 24)) { ret 6; }
+    fill(?output[0], 0xa5, 512);
+    val invalid_binding: *u8 =
+        "{\"protected\":\"a\",\"payload\":\"aa\",\"signature\":\"aa\"}";
+    if (account.encode(account.CREATE, account.Request{contacts: nil,
+            contact_len: 0, terms_of_service_agreed: false,
+            only_return_existing: false, external_account_binding:
+                view.view(invalid_binding, length(invalid_binding))},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
+            problem.INVALID_INPUT || !filled(?output[0], 0xa5, 512)) { ret 7; }
+    val aliased: account.Operation = account.encode(account.UPDATE_CONTACT,
+        account.Request{contacts: (?output[0])::*view.View, contact_len: 1,
+            terms_of_service_agreed: false, only_return_existing: false,
+            external_account_binding: view.view(nil, 0)},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (aliased.error.code != problem.INVALID_INPUT ||
+        !filled(?output[0], 0xa5, 512)) { ret 8; }
+    ret 0;
+}
+
+test "account: response decoding is bounded and transactional" {
+    val body: *u8 = "{\"status\":\"valid\",\"contact\":[\"mailto:one@example.com\"],\"orders\":\"https://example.com/acme/acct/1/orders\",\"termsOfServiceAgreed\":true}";
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var scratch: [8192]u8;
+    var text: [256]u8;
+    var contacts: [2]view.View;
+    var result: account.Account;
+    val limits: account.Limits = account.Limits{max_response_bytes: 2048,
+        max_json_scratch: 8192, max_json_depth: 4, max_json_values: 32,
+        max_json_key_bytes: 64, max_json_key_comparisons: 64,
+        max_url_bytes: 256, max_contacts: 2, max_contact_bytes: 64,
+        response_fields: field.limits(0, 0, 0, 0)};
+    val parsed: problem.Error = account.parse(account.UPDATE_CONTACT,
+        response(status.OK, ?fields,
+        view.view(body, length(body))),
+        view.view("https://example.com/acme/acct/1", 31), limits,
+        ?scratch[0], 8192, account.Storage{data: ?text[0], capacity: 256,
+            contacts: ?contacts[0], contact_capacity: 2}, ?result);
+    if (problem.failed(parsed) || result.status != account.VALID ||
+        result.contact_len != 1 || result.orders_url.len != 38 ||
+        !result.terms_of_service_agreed) { ret 1; }
+    fill(?text[0], 0x6b, 256);
+    val invalid: *u8 = "{\"status\":\"valid\",\"contact\":[\"not-a-uri\"],\"orders\":\"https://example.com/orders\"}";
+    if (account.parse(account.UPDATE_CONTACT, response(status.OK, ?fields,
+            view.view(invalid, length(invalid))),
+            view.view("https://example.com/acme/acct/1", 31), limits,
+            ?scratch[0], 8192, account.Storage{data: ?text[0], capacity: 256,
+                contacts: ?contacts[0], contact_capacity: 2}, ?result).code !=
+            problem.MALFORMED_JSON || !filled(?text[0], 0x6b, 256)) { ret 2; }
+    var location_item: [1]field.Field;
+    var created_fields: field.Fields = field.init(?location_item[0], 1,
+        field.limits(1, 128, 16, 96));
+    if (field.append(?created_fields, field.Field{
+            name: view.view("Location", 8),
+            value: view.view("https://example.com/acme/acct/2", 31),
+            sensitive: false}) != field.ADD_OK) { ret 3; }
+    var created_limits: account.Limits = limits;
+    created_limits.response_fields = field.limits(1, 128, 16, 96);
+    if (problem.failed(account.parse(account.CREATE,
+            response(status.CREATED, ?created_fields,
+            view.view(body, length(body))), view.view(nil, 0), created_limits,
+            ?scratch[0], 8192, account.Storage{data: ?text[0], capacity: 256,
+                contacts: ?contacts[0], contact_capacity: 2}, ?result)) ||
+        result.url.len != 31 ||
+        !equal(result.url.data, "https://example.com/acme/acct/2", 31) ||
+        result.url.data != ?text[0]) { ret 4; }
+    if (problem.failed(account.parse(account.LOOKUP,
+            response(status.OK, ?created_fields, view.view(body, length(body))),
+            view.view(nil, 0), created_limits, ?scratch[0], 8192,
+            account.Storage{data: ?text[0], capacity: 256,
+                contacts: ?contacts[0], contact_capacity: 2}, ?result)) ||
+        result.url.len != 31 || result.url.data != ?text[0]) { ret 5; }
+    ret 0;
+}
+
+test "external account: configured mac algorithms and ownership are exact" {
+    val public_bytes: [32]u8 = [32]u8{
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+        0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+        0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+        0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a};
+    val key: jose.PublicKey = jose.PublicKey{algorithm: jose.EDDSA,
+        value: contracts.Bytes{data: (?public_bytes[0]):~*u8, len: 32}};
+    var secret: [16]^u8;
+    var i: usize = 0;
+    for (i < 16) { secret[i] = i::u8; i = i + 1; }
+    var work: [4096]u8;
+    var output: [1024]u8;
+    val binding: external_account.Binding = external_account.Binding{
+        algorithm: external_account.HS256, key_id: view.view("kid-1", 5),
+        mac_key: contracts.SecretBytes{data: ?secret[0], len: 16},
+        secret_owner: ((?public_bytes[0]):~*u8)::ptr};
+    val encoded: external_account.Operation = external_account.encode(binding,
+        key, view.view("https://example.com/acme/new-account", 36),
+        contracts.Buffer{data: ?work[0], capacity: 4096},
+        contracts.Buffer{data: ?output[0], capacity: 1024});
+    val hs256_expected: *u8 = "{\"protected\":\"eyJhbGciOiJIUzI1NiIsImtpZCI6ImtpZC0xIiwidXJsIjoiaHR0cHM6Ly9leGFtcGxlLmNvbS9hY21lL25ldy1hY2NvdW50In0\",\"payload\":\"eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6IjExcVlBWUt4Q3JmVlNfN1R5V1FIT2c3aGN2UGFwaU1scndJYWFQY0hVUm8ifQ\",\"signature\":\"sTN2AnSwQmuEYv2yoCFD6xV3EkRSD3yezg-UOOS1S3Y\"}";
+    if (problem.failed(encoded.error) || encoded.written != 292 ||
+        !equal(?output[0], hs256_expected, 292)) { ret 1; }
+    var hs384: external_account.Binding = binding;
+    hs384.algorithm = external_account.HS384;
+    val longer: external_account.Operation = external_account.encode(hs384,
+        key, view.view("https://example.com/acme/new-account", 36),
+        contracts.Buffer{data: ?work[0], capacity: 4096},
+        contracts.Buffer{data: ?output[0], capacity: 1024});
+    val hs384_expected: *u8 = "{\"protected\":\"eyJhbGciOiJIUzM4NCIsImtpZCI6ImtpZC0xIiwidXJsIjoiaHR0cHM6Ly9leGFtcGxlLmNvbS9hY21lL25ldy1hY2NvdW50In0\",\"payload\":\"eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6IjExcVlBWUt4Q3JmVlNfN1R5V1FIT2c3aGN2UGFwaU1scndJYWFQY0hVUm8ifQ\",\"signature\":\"FA1oLuxR8H5C4R22A3rq-LFx8Z-6lqk7c8n0wlDLS4q3O42Z0dMLs505blnQRsd_\"}";
+    if (problem.failed(longer.error) || longer.written != 313 ||
+        !equal(?output[0], hs384_expected, 313)) {
+        ret 2;
+    }
+    var invalid: external_account.Binding = binding;
+    invalid.secret_owner = nil;
+    fill(?output[0], 0xa5, 1024);
+    if (external_account.encode(invalid, key,
+            view.view("https://example.com/acme/new-account", 36),
+            contracts.Buffer{data: ?work[0], capacity: 4096},
+            contracts.Buffer{data: ?output[0], capacity: 1024}).error.code !=
+            problem.INVALID_INPUT || !filled(?output[0], 0xa5, 1024)) { ret 3; }
+    if (external_account.encode(binding, key,
+            view.view("https://example.com/acme/new-account", 36),
+            contracts.Buffer{data: ?work[0], capacity: 512},
+            contracts.Buffer{data: ?output[0], capacity: 1024}).error.code !=
+            problem.OUTPUT_TOO_SMALL || !filled(?output[0], 0xa5, 1024)) { ret 4; }
+    ret 0;
+}
+
+test "storage: replacement is durable across unknown commit and reentrancy" {
+    var old_secret: [32]^u8;
+    var old_public: [65]u8;
+    var old_key: jose.PublicKey;
+    var old_private: jose.PrivateKey;
+    var new_secret: [32]^u8;
+    var new_public: [65]u8;
+    var new_key: jose.PublicKey;
+    var new_private: jose.PrivateKey;
+    if (!es_keys(?old_key, ?old_private, ?old_secret[0], ?old_public[0]) ||
+        !es_keys(?new_key, ?new_private, ?new_secret[0], ?new_public[0])) { ret 1; }
+    new_secret[0] = 0xc8;
+    if (p256.derive_public(contracts.SecretBytes{data: ?new_secret[0], len: 32},
+            contracts.Buffer{data: ?new_public[0], capacity: 65}).error !=
+            contracts.OK) { ret 2; }
+    new_key.value = contracts.Bytes{data: ?new_public[0], len: 65};
+    var initial_provider: AccountStore;
+    initial_provider.ready = true;
+    initial_provider.commit_unknown = true;
+    var initial_manager: storage.Manager;
+    if (problem.failed(storage.init_manager(?initial_manager,
+            account_store(?initial_provider)))) { ret 20; }
+    val initial: account.Credentials = credentials(old_key,
+        old_private.secret_owner, 1);
+    val initial_save: storage.Write = storage.begin_save(?initial_manager,
+        0, initial);
+    if (problem.failed(initial_save.error) ||
+        storage.commit_write(?initial_manager, initial_save).code !=
+            problem.INVALID_STATE) { ret 21; }
+    var initial_recovery: storage.Snapshot;
+    initial_recovery.status = 99;
+    if (storage.recover(?initial_manager,
+            view.view("https://example.com/acme/acct/2", 31),
+            ?initial_recovery).code != problem.INVALID_STATE ||
+        initial_recovery.status != 99) { ret 25; }
+    if (problem.failed(storage.recover(?initial_manager, initial.account.url,
+            ?initial_recovery)) || initial_recovery.status != storage.NOT_FOUND ||
+        !initial_recovery.has_pending ||
+        initial_recovery.pending.generation != 1) { ret 22; }
+    initial_provider.commit_unknown = false;
+    if (problem.failed(storage.commit_write(?initial_manager, initial_save)) ||
+        !initial_provider.found) { ret 23; }
+    var deactivated: account.Credentials = initial;
+    deactivated.account.status = account.DEACTIVATED;
+    val metadata_save: storage.Write = storage.begin_save(?initial_manager,
+        1, deactivated);
+    if (problem.failed(metadata_save.error) ||
+        problem.failed(storage.commit_write(?initial_manager, metadata_save)) ||
+        initial_provider.current.account.status != account.DEACTIVATED ||
+        initial_provider.current.generation != 1) { ret 24; }
+    var provider: AccountStore;
+    provider.current = credentials(old_key, old_private.secret_owner, 1);
+    provider.found = true;
+    provider.ready = true;
+    provider.reenter = true;
+    provider.commit_unknown = true;
+    var manager: storage.Manager;
+    provider.owned = (?manager)::*u8;
+    provider.owned_len = $size_of(storage.Manager);
+    if (storage.init_manager(?manager, account_store(?provider)).code !=
+            problem.INVALID_INPUT) { ret 3; }
+    provider.owned = nil;
+    provider.owned_len = 0;
+    if (problem.failed(storage.init_manager(?manager,
+            account_store(?provider)))) { ret 4; }
+    provider.manager = ?manager;
+    val next: account.Credentials = credentials(new_key,
+        new_private.secret_owner, 2);
+    provider.mutate = ?new_public[0];
+    val mutated: storage.Write = storage.begin_replace(?manager,
+        provider.current, next);
+    if (!problem.failed(mutated.error) || provider.pending_ready) { ret 5; }
+    provider.mutate = nil;
+    if (p256.derive_public(contracts.SecretBytes{data: ?new_secret[0], len: 32},
+            contracts.Buffer{data: ?new_public[0], capacity: 65}).error !=
+            contracts.OK) { ret 6; }
+    val replacement: storage.Write = storage.begin_replace(?manager,
+        provider.current, next);
+    if (problem.failed(replacement.error) || !replacement.prepared ||
+        !provider.reentry_rejected ||
+        atomic.load(?provider.load_calls) != 0) { ret 7; }
+    if (storage.commit_write(?manager, replacement).code !=
+            problem.INVALID_STATE) { ret 8; }
+    var recovered: storage.Snapshot;
+    recovered.status = 99;
+    provider.owned = (?recovered)::*u8;
+    provider.owned_len = $size_of(storage.Snapshot);
+    if (storage.recover(?manager, provider.current.account.url,
+            ?recovered).code != problem.INVALID_INPUT ||
+        recovered.status != 99) { ret 9; }
+    provider.owned = nil;
+    provider.owned_len = 0;
+    if (problem.failed(storage.recover(?manager, provider.current.account.url,
+            ?recovered)) || !recovered.has_pending ||
+        recovered.pending.generation != 2) { ret 10; }
+    provider.commit_unknown = false;
+    if (problem.failed(storage.commit_write(?manager, replacement)) ||
+        provider.current.generation != 2 || provider.pending_ready) { ret 11; }
+    var first_snapshot: storage.Snapshot;
+    var second_snapshot: storage.Snapshot;
+    var first_result: i64 = 0;
+    var second_result: i64 = 0;
+    var first_context: RecoverContext = RecoverContext{manager: ?manager,
+        url: provider.current.account.url, snapshot: ?first_snapshot,
+        result: ?first_result};
+    var second_context: RecoverContext = RecoverContext{manager: ?manager,
+        url: provider.current.account.url, snapshot: ?second_snapshot,
+        result: ?second_result};
+    var first_thread: thread.Thread;
+    var second_thread: thread.Thread;
+    thread.spawn_with(recover_worker, (?first_context)::*u8, ?first_thread);
+    if (first_thread.tid < 0) { ret 12; }
+    thread.spawn_with(recover_worker, (?second_context)::*u8, ?second_thread);
+    if (second_thread.tid < 0) {
+        thread.join(?first_thread);
+        ret 13;
+    }
+    thread.join(?first_thread);
+    thread.join(?second_thread);
+    if (atomic.load(?first_result) != 1 || atomic.load(?second_result) != 1 ||
+        atomic.load(?provider.load_overlap) != 0 ||
+        atomic.load(?provider.load_active) != 0 ||
+        atomic.load(?manager.callback_owner) != 0) { ret 14; }
+    ret 0;
+}
+
+test "key change: interruption retains a recoverable nested rollover" {
+    var old_secret: [32]^u8;
+    var old_public: [65]u8;
+    var old_key: jose.PublicKey;
+    var old_private: jose.PrivateKey;
+    var new_secret: [32]^u8;
+    var new_public: [65]u8;
+    var new_key: jose.PublicKey;
+    var new_private: jose.PrivateKey;
+    if (!es_keys(?old_key, ?old_private, ?old_secret[0], ?old_public[0]) ||
+        !es_keys(?new_key, ?new_private, ?new_secret[0], ?new_public[0])) { ret 1; }
+    new_secret[0] = 0xc8;
+    if (p256.derive_public(contracts.SecretBytes{data: ?new_secret[0], len: 32},
+            contracts.Buffer{data: ?new_public[0], capacity: 65}).error !=
+            contracts.OK) { ret 2; }
+    new_key.value = contracts.Bytes{data: ?new_public[0], len: 65};
+    new_private.value = contracts.SecretBytes{data: ?new_secret[0], len: 32};
+    var provider: AccountStore;
+    provider.current = credentials(old_key, old_private.secret_owner, 1);
+    provider.found = true;
+    provider.ready = true;
+    var manager: storage.Manager;
+    if (problem.failed(storage.init_manager(?manager,
+            account_store(?provider)))) { ret 3; }
+    val next: account.Credentials = credentials(new_key,
+        new_private.secret_owner, 2);
+    var work: [4096]u8;
+    var output: [2048]u8;
+    val prepared: key_change.Prepared = key_change.prepare(?manager,
+        provider.current, next, new_private, jose.no_entropy(),
+        view.view("https://example.com/acme/key-change", 35),
+        contracts.Buffer{data: ?work[0], capacity: 4096},
+        contracts.Buffer{data: ?output[0], capacity: 2048});
+    if (problem.failed(prepared.error) || prepared.nested_jws.len == 0 ||
+        !provider.pending_ready) { ret 4; }
+    var slots: [1]nonce.Slot;
+    var nonce_bytes: [64]u8;
+    var nonce_memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?nonce_memory, ?slots[0], 1,
+            ?nonce_bytes[0], 64, 64))) { ret 5; }
+    var pool: nonce.Pool = nonce.pool(?nonce_memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool,
+            client.limits_default()))) { ret 6; }
+    var request: client.SignedRequest;
+    output[0] = output[0] ^ 1;
+    if (key_change.begin_outer(?protocol, ?request, provider.current,
+            view.view("https://example.com/acme/key-change", 35), prepared).code !=
+            problem.INVALID_INPUT) { ret 14; }
+    output[0] = output[0] ^ 1;
+    if (problem.failed(key_change.begin_outer(?protocol, ?request,
+            provider.current,
+            view.view("https://example.com/acme/key-change", 35), prepared)) ||
+        request.spec.use_jwk || request.spec.payload.data != ?output[0] ||
+        request.spec.kid.len != 31) { ret 7; }
+    if (key_change.finish(?manager, prepared, key_change.AMBIGUOUS).code !=
+            problem.INVALID_STATE || !provider.pending_ready) { ret 8; }
+    var recovered: storage.Snapshot;
+    if (problem.failed(storage.recover(?manager, provider.current.account.url,
+            ?recovered)) || !recovered.has_pending) { ret 9; }
+    if (problem.failed(key_change.resolve(?manager, prepared.replacement,
+            true)) || provider.current.generation != 2) { ret 10; }
+
+    var ed_secret: [32]^u8;
+    var ed_public: [32]u8;
+    var ed_key: jose.PublicKey;
+    var ed_private: jose.PrivateKey;
+    ed_keys(?ed_key, ?ed_private, ?ed_secret[0], ?ed_public[0]);
+    val ed_next: account.Credentials = credentials(ed_key,
+        ed_private.secret_owner, 3);
+    val ed_prepared: key_change.Prepared = key_change.prepare(?manager,
+        provider.current, ed_next, ed_private, jose.no_entropy(),
+        view.view("https://example.com/acme/key-change", 35),
+        contracts.Buffer{data: ?work[0], capacity: 4096},
+        contracts.Buffer{data: ?output[0], capacity: 2048});
+    if (problem.failed(ed_prepared.error) ||
+        problem.failed(key_change.finish(?manager, ed_prepared,
+            key_change.REJECTED)) || provider.pending_ready) { ret 11; }
+
+    var rsa_secret: [256]^u8;
+    var rsa_public: [256]u8;
+    var rsa_exponent: [3]u8;
+    var rsa_decode: [256]u8;
+    var rsa_key: jose.PublicKey;
+    var rsa_private: jose.PrivateKey;
+    if (!rsa_keys(?rsa_key, ?rsa_private, ?rsa_public[0],
+            ?rsa_exponent[0], ?rsa_secret[0], ?rsa_decode[0])) { ret 12; }
+    val rsa_next: account.Credentials = credentials(rsa_key,
+        rsa_private.secret_owner, 3);
+    val rsa_prepared: key_change.Prepared = key_change.prepare(?manager,
+        provider.current, rsa_next, rsa_private,
+        jose.entropy_provider(nil, deterministic_entropy,
+            entropy_aliases_nothing, entropy_aliases_no_secret,
+            entropy_still_valid),
+        view.view("https://example.com/acme/key-change", 35),
+        contracts.Buffer{data: ?work[0], capacity: 4096},
+        contracts.Buffer{data: ?output[0], capacity: 2048});
+    if (problem.failed(rsa_prepared.error) ||
+        problem.failed(key_change.finish(?manager, rsa_prepared,
+            key_change.REJECTED)) || provider.pending_ready) { ret 13; }
     ret 0;
 }

@@ -931,6 +931,10 @@ fun https_bytes(data: *u8, len: usize) bool {
     ret query_at == len || component(data, query_at + 1, len, true, true);
 }
 
+pub fun url_valid(value: view.View, maximum: usize) bool {
+    ret value.len <= maximum && https_bytes(value.data, value.len);
+}
+
 fun https_value(value: *J.Value, maximum: usize) bool {
     var len: usize = 0;
     if (!decoded_len(value, maximum, ?len) || len < 9) { ret false; }

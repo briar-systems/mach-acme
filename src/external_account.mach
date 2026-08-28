@@ -1,18 +1,292 @@
-# external account binding contract
+# bounded external account binding
 
-use R: std.types.result;
 use std.types.size.usize;
 use std.types.view;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use crypto.contracts;
+use crypto.hmac;
+use acme.client;
+use acme.jose;
+use acme.memory_range;
+use acme.problem;
+
+pub def Algorithm: u8;
+
+pub val HS256: Algorithm = 1;
+pub val HS384: Algorithm = 2;
+
+pub val MAX_PROTECTED_BYTES: usize = 8192;
+pub val MAX_JWK_BYTES: usize = jose.MAX_JWK_BYTES;
+pub val MAX_TAG_BYTES: usize = hmac.SHA384_TAG_SIZE;
 
 pub rec Binding {
+    algorithm: Algorithm;
     key_id:  view.View;
     mac_key: contracts.SecretBytes;
+    secret_owner: ptr;
 }
 
-pub def EncodeFun: fun(ptr, Binding, view.View, *u8, usize) R.Result[usize, view.View];
+pub rec Operation {
+    error:   problem.Error;
+    written: usize;
+}
 
-pub rec Encoder {
-    ctx:    ptr;
-    encode: EncodeFun;
+rec Writer {
+    data: *u8;
+    cap:  usize;
+    pos:  usize;
+}
+
+fun failed(kind: problem.Kind, code: problem.Code, detail: *u8) Operation {
+    ret Operation{error: problem.local_code(kind, code, detail), written: 0};
+}
+
+fun byte(writer: *Writer, value: u8) bool {
+    if (writer.pos >= writer.cap) { ret false; }
+    writer.data[writer.pos] = value;
+    writer.pos = writer.pos + 1;
+    ret true;
+}
+
+fun bytes(writer: *Writer, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len) || len > writer.cap - writer.pos) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        writer.data[writer.pos + i] = data[i];
+        i = i + 1;
+    }
+    writer.pos = writer.pos + len;
+    ret true;
+}
+
+fun json_string(writer: *Writer, value: view.View) bool {
+    if (!memory_range.valid(value.data, value.len) || !byte(writer, '"')) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val current: u8 = value.data[i];
+        if (current > 127) { ret false; }
+        if (current == '"' || current == '\\') {
+            if (!byte(writer, '\\') || !byte(writer, current)) { ret false; }
+        } or (current == '\x08') {
+            if (!bytes(writer, "\\b", 2)) { ret false; }
+        } or (current == '\x0c') {
+            if (!bytes(writer, "\\f", 2)) { ret false; }
+        } or (current == '\n') {
+            if (!bytes(writer, "\\n", 2)) { ret false; }
+        } or (current == '\r') {
+            if (!bytes(writer, "\\r", 2)) { ret false; }
+        } or (current == '\t') {
+            if (!bytes(writer, "\\t", 2)) { ret false; }
+        } or (current < ' ') {
+            val hex: *u8 = "0123456789abcdef";
+            if (!bytes(writer, "\\u00", 4) ||
+                !byte(writer, hex[(current >> 4)::usize]) ||
+                !byte(writer, hex[(current & 15)::usize])) { ret false; }
+        } or {
+            if (!byte(writer, current)) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret byte(writer, '"');
+}
+
+fun base64_len(len: usize) usize {
+    if (len > 0xbfffffffffffffff) { ret 0; }
+    var result: usize = (len / 3) * 4;
+    if (len % 3 == 1) { result = result + 2; }
+    or (len % 3 == 2) { result = result + 3; }
+    ret result;
+}
+
+fun base64(writer: *Writer, data: *u8, len: usize) bool {
+    val encoded: usize = base64_len(len);
+    if (!memory_range.valid(data, len) || encoded > writer.cap - writer.pos) { ret false; }
+    val table: *u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    var i: usize = 0;
+    for (i + 2 < len) {
+        val first: u8 = data[i];
+        val second: u8 = data[i + 1];
+        val third: u8 = data[i + 2];
+        writer.data[writer.pos] = table[(first >> 2)::usize];
+        writer.data[writer.pos + 1] = table[(((first & 3) << 4) | (second >> 4))::usize];
+        writer.data[writer.pos + 2] = table[(((second & 15) << 2) | (third >> 6))::usize];
+        writer.data[writer.pos + 3] = table[(third & 63)::usize];
+        writer.pos = writer.pos + 4;
+        i = i + 3;
+    }
+    if (len - i == 1) {
+        val first: u8 = data[i];
+        writer.data[writer.pos] = table[(first >> 2)::usize];
+        writer.data[writer.pos + 1] = table[((first & 3) << 4)::usize];
+        writer.pos = writer.pos + 2;
+    } or (len - i == 2) {
+        val first: u8 = data[i];
+        val second: u8 = data[i + 1];
+        writer.data[writer.pos] = table[(first >> 2)::usize];
+        writer.data[writer.pos + 1] = table[(((first & 3) << 4) | (second >> 4))::usize];
+        writer.data[writer.pos + 2] = table[((second & 15) << 2)::usize];
+        writer.pos = writer.pos + 3;
+    }
+    ret true;
+}
+
+fun binding_valid(value: Binding) bool {
+    ret (value.algorithm == HS256 || value.algorithm == HS384) &&
+        value.secret_owner != nil && value.mac_key.data != nil &&
+        value.mac_key.len != 0 && memory_range.valid(value.key_id.data,
+            value.key_id.len) && value.key_id.len != 0 &&
+        value.key_id.len <= 1024;
+}
+
+fun literal_at(value: view.View, position: usize, literal: *u8,
+    len: usize) bool {
+    if (position > value.len || len > value.len - position) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (value.data[position + i] != literal[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun encoded_field(value: view.View, position: *usize,
+    delimiter: *u8, delimiter_len: usize) bool {
+    val start: usize = @position;
+    var i: usize = start;
+    for (i < value.len) {
+        val current: u8 = value.data[i];
+        if (current == '"') {
+            val encoded_len: usize = i - start;
+            if (i == start || encoded_len % 4 == 1 ||
+                !literal_at(value, i, delimiter, delimiter_len)) {
+                ret false;
+            }
+            @position = i + delimiter_len;
+            ret true;
+        }
+        if (!((current >= 'A' && current <= 'Z') ||
+            (current >= 'a' && current <= 'z') ||
+            (current >= '0' && current <= '9') || current == '-' ||
+            current == '_')) { ret false; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun encoded_valid(value: view.View) bool {
+    if (!memory_range.valid(value.data, value.len) || value.len < 47 ||
+        !literal_at(value, 0, "{\"protected\":\"", 14)) { ret false; }
+    var position: usize = 14;
+    if (!encoded_field(value, ?position, "\",\"payload\":\"", 13) ||
+        !encoded_field(value, ?position, "\",\"signature\":\"", 15) ||
+        !encoded_field(value, ?position, "\"}", 2)) { ret false; }
+    ret position == value.len;
+}
+
+# work contains the canonical public signing input and tag
+pub fun encode(value: Binding, account_key: jose.PublicKey, url: view.View,
+    work: contracts.Buffer, output: contracts.Buffer) Operation {
+    if (!binding_valid(value) || !client.url_valid(url, 4096) ||
+        work.data == nil || output.data == nil ||
+        !memory_range.valid(work.data, work.capacity) ||
+        !memory_range.valid(output.data, output.capacity)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid external account binding input");
+    }
+    if (memory_range.overlap(work.data, work.capacity, output.data, output.capacity) ||
+        memory_range.overlap(work.data, work.capacity, value.key_id.data,
+            value.key_id.len) ||
+        memory_range.overlap(output.data, output.capacity, value.key_id.data,
+            value.key_id.len) ||
+        memory_range.overlap(work.data, work.capacity, url.data, url.len) ||
+        memory_range.overlap(output.data, output.capacity, url.data, url.len) ||
+        memory_range.overlap(work.data, work.capacity,
+            value.secret_owner::*u8, 1) ||
+        memory_range.overlap(output.data, output.capacity,
+            value.secret_owner::*u8, 1) ||
+        jose.public_key_overlaps(account_key, work.data, work.capacity) ||
+        jose.public_key_overlaps(account_key, output.data, output.capacity)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "external account binding storage aliases an input");
+    }
+    if (work.capacity < MAX_JWK_BYTES) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "external account binding work is too small");
+    }
+    val jwk: jose.Operation = jose.key_encode_jwk(account_key,
+        contracts.Buffer{data: work.data, capacity: MAX_JWK_BYTES});
+    if (problem.failed(jwk.error)) {
+        ret Operation{error: jwk.error, written: 0};
+    }
+    val protected_start: usize = MAX_JWK_BYTES;
+    var protected: Writer = Writer{data: work.data, cap: work.capacity,
+        pos: protected_start};
+    var algorithm: view.View = view.view("HS256", 5);
+    if (value.algorithm == HS384) { algorithm = view.view("HS384", 5); }
+    if (!bytes(?protected, "{\"alg\":", 7) || !json_string(?protected, algorithm) ||
+        !bytes(?protected, ",\"kid\":", 7) || !json_string(?protected, value.key_id) ||
+        !bytes(?protected, ",\"url\":", 7) || !json_string(?protected, url) ||
+        !byte(?protected, '}')) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "external account protected header is too large");
+    }
+    val protected_len: usize = protected.pos - protected_start;
+    if (protected_len > MAX_PROTECTED_BYTES) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "external account protected header is too large");
+    }
+    val signing_start: usize = protected.pos;
+    var signing: Writer = Writer{data: work.data, cap: work.capacity,
+        pos: signing_start};
+    if (!base64(?signing, ?work.data[protected_start], protected_len) ||
+        !byte(?signing, '.') || !base64(?signing, work.data, jwk.written)) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "external account binding work is too small");
+    }
+    val signing_len: usize = signing.pos - signing_start;
+    val tag_start: usize = signing.pos;
+    var authenticated: contracts.Operation;
+    if (value.algorithm == HS256) {
+        authenticated = hmac.sha256(value.mac_key,
+            contracts.Bytes{data: ?work.data[signing_start], len: signing_len},
+            contracts.Buffer{data: ?work.data[tag_start],
+                capacity: work.capacity - tag_start});
+    } or {
+        authenticated = hmac.sha384(value.mac_key,
+            contracts.Bytes{data: ?work.data[signing_start], len: signing_len},
+            contracts.Buffer{data: ?work.data[tag_start],
+                capacity: work.capacity - tag_start});
+    }
+    if (authenticated.error != contracts.OK) {
+        ret failed(problem.SIGNING, problem.SIGNATURE_FAILED,
+            "external account binding failed");
+    }
+    val protected_encoded: usize = base64_len(protected_len);
+    val payload_encoded: usize = base64_len(jwk.written);
+    val tag_encoded: usize = base64_len(authenticated.written);
+    if (protected_encoded > 0xffffffffffffffff - 44 ||
+        payload_encoded > 0xffffffffffffffff - 44 - protected_encoded ||
+        tag_encoded > 0xffffffffffffffff - 44 - protected_encoded - payload_encoded) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "external account binding output size overflows");
+    }
+    val required: usize = 44 + protected_encoded + payload_encoded + tag_encoded;
+    if (output.capacity < required) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "external account binding output is too small");
+    }
+    var result: Writer = Writer{data: output.data, cap: output.capacity, pos: 0};
+    if (!bytes(?result, "{\"protected\":\"", 14) ||
+        !bytes(?result, ?work.data[signing_start], protected_encoded) ||
+        !bytes(?result, "\",\"payload\":\"", 13) ||
+        !bytes(?result, ?work.data[signing_start + protected_encoded + 1],
+            payload_encoded) || !bytes(?result, "\",\"signature\":\"", 15) ||
+        !base64(?result, ?work.data[tag_start], authenticated.written) ||
+        !bytes(?result, "\"}", 2)) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "external account binding preflight disagreed with encoding");
+    }
+    ret Operation{error: problem.none(), written: result.pos};
 }

@@ -412,6 +412,11 @@ fun public_overlaps(key: PublicKey, data: *u8, len: usize) bool {
     ret false;
 }
 
+pub fun public_key_overlaps(key: PublicKey, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    ret public_overlaps(key, data, len);
+}
+
 fun private_overlaps(key: PrivateKey, data: *u8, len: usize) bool {
     if (key.algorithm == ES256 || key.algorithm == EDDSA) { ret false; }
     if (key.algorithm == PS256) {
