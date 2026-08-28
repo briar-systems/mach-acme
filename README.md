@@ -62,6 +62,9 @@ ownership contract.
   certificate download, and revocation with CRL reasons
 - transactional certificate and private-key replacement over the same durable
   gate, tokens, and one-active-transaction rule as account credentials
+- file-backed durable state: versioned, checksummed documents replaced
+  atomically with owner-only permissions, and a store that survives restart,
+  reports corruption, and refuses a stale writer
 
 ## Protocol boundary
 
@@ -254,3 +257,37 @@ one-active-transaction rule, and callback serialization, and differ only in the
 staged payload and its ownership rules. A store declares which record kinds it
 holds; one that declares no certificate callbacks refuses certificate
 transactions rather than half-supporting them.
+
+## Durable files
+
+Every durable record is one self-describing document: a magic, a schema
+version, the record kind, the payload length, and a SHA-256 of the payload.
+`file_store.write_document` replaces a document atomically — the replacement is
+written to a sibling temporary, flushed, closed, renamed, and the parent
+directory is flushed — so a reader sees either the previous committed document
+or the complete new one, and a write that fails leaves the previous one exactly
+as it was. Durable ACME state includes account keys, so files are created
+owner-only and their directories owner-only.
+
+`read_document` validates the magic, the schema version, the record kind, the
+declared length, and the payload digest before publishing any payload. A
+truncated, corrupt, foreign, or future-versioned document is reported, never
+partly believed. `needs_migration` reports a document written by an older
+schema so a caller migrates deliberately.
+
+`file_store.Store` implements the durable store contract for both transactional
+record kinds over one document each. It persists the transaction token before
+handing it out, so the sequence stays monotonic across a restart even if
+nothing is staged against it, and it enforces the expected generation durably,
+so a writer working from a stale read is refused rather than overwriting a
+newer record. A staged record that was never committed is recovered as pending
+with the committed record untouched — which is what an interrupted process
+looks like on the next run.
+
+The private key is never written. The store persists public credential
+material and one opaque key identity, and the application's secret provider
+maps that identity back to its key material.
+
+`file_store.copy_document` is backup and restore: the source is fully validated
+before anything is written, so a backup cannot capture a corrupt document and a
+restore cannot install one.
