@@ -1,21 +1,847 @@
-# caller-owned jose signing buffers
+# bounded canonical jwk, thumbprint, and jws signing
 
-use R: std.types.result;
+use crypto.contracts;
+use crypto.group.p256;
+use crypto.hash;
+use crypto.signature;
+use std.crypto.ct;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
-use std.types.string.str;
 use std.types.view;
+use acme.memory_range;
+use acme.problem;
 
-pub def EncodeJwkFun: fun(ptr, *u8, usize) R.Result[usize, str];
-pub def ThumbprintFun: fun(ptr, *u8, usize) R.Result[usize, str];
-pub def SignFun: fun(ptr, *u8, usize, *u8, usize, *u8, usize) R.Result[usize, str];
+pub def Algorithm: u8;
+
+pub val ES256: Algorithm = 1;
+pub val EDDSA: Algorithm = 2;
+pub val PS256: Algorithm = 3;
+
+pub val MAX_JWK_BYTES: usize = 1536;
+pub val MAX_SIGNATURE_BYTES: usize = 512;
+pub val THUMBPRINT_BYTES: usize = 43;
+
+pub rec Operation {
+    error:   problem.Error;
+    written: usize;
+}
+
+pub def FillEntropyFun: fun(ptr, contracts.SecretBuffer) contracts.Error;
+pub def EntropyAliasesFun: fun(ptr, *u8, usize) bool;
+pub def EntropyAliasesSecretFun: fun(ptr, *^u8, usize) bool;
+pub def EntropyValidateFun: fun(ptr) bool;
+
+pub rec Entropy {
+    ctx:       ptr;
+    fill:      FillEntropyFun;
+    aliases:   EntropyAliasesFun;
+    aliases_secret: EntropyAliasesSecretFun;
+    validation_ctx: ptr;
+    validate:  EntropyValidateFun;
+    available: bool;
+}
+
+pub fun no_entropy() Entropy {
+    ret Entropy{ctx: nil, fill: nil, aliases: nil, aliases_secret: nil,
+        validation_ctx: nil, validate: nil, available: false};
+}
+
+pub fun entropy_provider(ctx: ptr, fill: FillEntropyFun,
+    aliases: EntropyAliasesFun, aliases_secret: EntropyAliasesSecretFun,
+    validate: EntropyValidateFun) Entropy {
+    ret Entropy{ctx: ctx, fill: fill, aliases: aliases,
+        aliases_secret: aliases_secret, validation_ctx: ctx, validate: validate,
+        available: fill:^ != nil && aliases:^ != nil &&
+            aliases_secret:^ != nil && validate:^ != nil};
+}
+
+pub fun entropy_valid(value: Entropy) bool {
+    if (!value.available) {
+        ret value.ctx == nil && value.fill:^ == nil && value.aliases:^ == nil &&
+            value.aliases_secret:^ == nil && value.validation_ctx == nil &&
+            value.validate:^ == nil;
+    }
+    ret value.fill:^ != nil && value.aliases:^ != nil &&
+        value.aliases_secret:^ != nil && value.validate:^ != nil;
+}
+
+pub fun entropy_owns_secret(value: Entropy, data: *^u8, len: usize) bool {
+    if (!entropy_valid(value) || !value.available || data == nil) { ret true; }
+    ret value.aliases_secret(value.ctx, data, len);
+}
+
+pub fun entropy_owns(value: Entropy, data: *u8, len: usize) bool {
+    if (!entropy_valid(value) || !value.available ||
+        !memory_range.valid(data, len)) { ret true; }
+    ret value.aliases(value.ctx, data, len);
+}
+
+pub rec PublicKey {
+    algorithm: Algorithm;
+    value:     contracts.Bytes;
+    rsa:       signature.RsaPublicKey;
+}
+
+pub rec PrivateKey {
+    algorithm: Algorithm;
+    secret_owner: ptr;
+    value:     contracts.SecretBytes;
+    rsa:       signature.RsaPrivateKey;
+}
 
 pub rec Signer {
-    ctx:             ptr;
-    algorithm:       view.View;
-    encode_jwk:      EncodeJwkFun;
-    thumbprint:      ThumbprintFun;
-    sign:            SignFun;
-    max_jwk_bytes:   usize;
-    max_thumb_bytes: usize;
+    public_key:          PublicKey;
+    algorithm:           Algorithm;
+    max_jwk_bytes:       usize;
+    max_thumb_bytes:     usize;
     max_signature_bytes: usize;
+}
+
+pub rec Protected {
+    nonce:         view.View;
+    url:           view.View;
+    kid:           view.View;
+    use_jwk:       bool;
+    include_nonce: bool;
+}
+
+rec Writer {
+    data: *u8;
+    cap:  usize;
+    pos:  usize;
+}
+
+fun failed(kind: problem.Kind, code: problem.Code, detail: *u8) Operation {
+    ret Operation{error: problem.local_code(kind, code, detail), written: 0};
+}
+
+fun crypto_error(error: contracts.Error) problem.Error {
+    if (error == contracts.OK) { ret problem.none(); }
+    if (error == contracts.OUTPUT_TOO_SMALL) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "cryptographic output is too small");
+    }
+    if (error == contracts.INVALID_KEY) {
+        ret problem.local_code(problem.SIGNING, problem.INVALID_KEY,
+            "account key is invalid");
+    }
+    if (error == contracts.UNSUPPORTED) {
+        ret problem.local_code(problem.SIGNING, problem.UNSUPPORTED_ALGORITHM,
+            "account algorithm is unsupported");
+    }
+    if (error == contracts.ENTROPY_UNAVAILABLE) {
+        ret problem.local_code(problem.SIGNING, problem.ENTROPY_UNAVAILABLE,
+            "signing entropy is unavailable");
+    }
+    if (error == contracts.INVALID_STATE) {
+        ret problem.local_code(problem.STATE, problem.INVALID_STATE,
+            "cryptographic state is invalid");
+    }
+    if (error == contracts.INVALID_INPUT) {
+        ret problem.local_code(problem.SIGNING, problem.INVALID_INPUT,
+            "cryptographic input is invalid");
+    }
+    ret problem.local_code(problem.SIGNING, problem.SIGNATURE_FAILED,
+        "account signing failed");
+}
+
+fun write_byte(writer: *Writer, byte: u8) bool {
+    if (writer.pos >= writer.cap) { ret false; }
+    writer.data[writer.pos] = byte;
+    writer.pos = writer.pos + 1;
+    ret true;
+}
+
+fun write_bytes(writer: *Writer, data: *u8, len: usize) bool {
+    if ((len != 0 && data == nil) || len > writer.cap - writer.pos) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        writer.data[writer.pos + i] = data[i];
+        i = i + 1;
+    }
+    writer.pos = writer.pos + len;
+    ret true;
+}
+
+fun literal(writer: *Writer, text: *u8, len: usize) bool {
+    ret write_bytes(writer, text, len);
+}
+
+fun ascii_json_value(value: view.View) bool {
+    if (value.len != 0 && value.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        if (value.data[i] > 127) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun json_string(writer: *Writer, value: view.View) bool {
+    if (!ascii_json_value(value) || !write_byte(writer, '"')) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val byte: u8 = value.data[i];
+        if (byte == '"' || byte == '\\') {
+            if (!write_byte(writer, '\\') || !write_byte(writer, byte)) { ret false; }
+        } or (byte == '\x08') {
+            if (!literal(writer, "\\b", 2)) { ret false; }
+        } or (byte == '\x0c') {
+            if (!literal(writer, "\\f", 2)) { ret false; }
+        } or (byte == '\n') {
+            if (!literal(writer, "\\n", 2)) { ret false; }
+        } or (byte == '\r') {
+            if (!literal(writer, "\\r", 2)) { ret false; }
+        } or (byte == '\t') {
+            if (!literal(writer, "\\t", 2)) { ret false; }
+        } or (byte < ' ') {
+            val hex: *u8 = "0123456789abcdef";
+            if (!literal(writer, "\\u00", 4) ||
+                !write_byte(writer, hex[(byte >> 4)::usize]) ||
+                !write_byte(writer, hex[(byte & 15)::usize])) { ret false; }
+        } or {
+            if (!write_byte(writer, byte)) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret write_byte(writer, '"');
+}
+
+fun base64url_len(len: usize) usize {
+    if (len > 0xbfffffffffffffff) { ret 0; }
+    val blocks: usize = len / 3;
+    val tail: usize = len % 3;
+    var result: usize = blocks * 4;
+    if (tail == 1) { result = result + 2; }
+    or (tail == 2) { result = result + 3; }
+    ret result;
+}
+
+fun base64url_value(value: view.View) bool {
+    if (value.data == nil || value.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val byte: u8 = value.data[i];
+        if (!((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_')) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun base64url(writer: *Writer, input: *u8, len: usize) bool {
+    val encoded: usize = base64url_len(len);
+    if (len == 0 || input == nil || encoded > writer.cap - writer.pos) { ret false; }
+    val table: *u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    var i: usize = 0;
+    for (i + 2 < len) {
+        val first: u8 = input[i];
+        val second: u8 = input[i + 1];
+        val third: u8 = input[i + 2];
+        writer.data[writer.pos] = table[(first >> 2)::usize];
+        writer.data[writer.pos + 1] = table[(((first & 3) << 4) | (second >> 4))::usize];
+        writer.data[writer.pos + 2] = table[(((second & 15) << 2) | (third >> 6))::usize];
+        writer.data[writer.pos + 3] = table[(third & 63)::usize];
+        writer.pos = writer.pos + 4;
+        i = i + 3;
+    }
+    if (len - i == 1) {
+        val first: u8 = input[i];
+        writer.data[writer.pos] = table[(first >> 2)::usize];
+        writer.data[writer.pos + 1] = table[((first & 3) << 4)::usize];
+        writer.pos = writer.pos + 2;
+    } or (len - i == 2) {
+        val first: u8 = input[i];
+        val second: u8 = input[i + 1];
+        writer.data[writer.pos] = table[(first >> 2)::usize];
+        writer.data[writer.pos + 1] = table[(((first & 3) << 4) | (second >> 4))::usize];
+        writer.data[writer.pos + 2] = table[((second & 15) << 2)::usize];
+        writer.pos = writer.pos + 3;
+    }
+    ret true;
+}
+
+fun valid_rsa_public(key: signature.RsaPublicKey) bool {
+    val modulus: contracts.Bytes = key.modulus;
+    val exponent: contracts.Bytes = key.exponent;
+    if (!memory_range.valid(modulus.data, modulus.len) ||
+        modulus.len < signature.RSA_MIN_MODULUS_SIZE ||
+        modulus.len > signature.RSA_MAX_MODULUS_SIZE || modulus.len % 4 != 0 ||
+        modulus.data[0] < 0x80 || (modulus.data[modulus.len - 1] & 1) == 0 ||
+        !memory_range.valid(exponent.data, exponent.len) || exponent.len == 0 ||
+        exponent.len > modulus.len ||
+        (exponent.len > 1 && exponent.data[0] == 0) ||
+        (exponent.data[exponent.len - 1] & 1) == 0) {
+        ret false;
+    }
+    if (exponent.len == 1 && exponent.data[0] < 3) { ret false; }
+    if (exponent.len == modulus.len) {
+        var i: usize = 0;
+        for (i < modulus.len) {
+            if (exponent.data[i] < modulus.data[i]) { ret true; }
+            if (exponent.data[i] > modulus.data[i]) { ret false; }
+            i = i + 1;
+        }
+        ret false;
+    }
+    ret true;
+}
+
+fun valid_rsa_private(key: signature.RsaPrivateKey) bool {
+    ret valid_rsa_public(signature.RsaPublicKey{modulus: key.modulus,
+        exponent: key.public_exponent}) &&
+        key.private_exponent.data != nil &&
+        key.private_exponent.len == key.modulus.len;
+}
+
+fun public_key_valid(key: PublicKey) bool {
+    if (key.algorithm == ES256) {
+        if (!memory_range.valid(key.value.data, key.value.len) ||
+            key.value.len != 65 || key.value.data[0] != 0x04) {
+            ret false;
+        }
+        ret signature.verify_ecdsa_p256_sha256(key.value,
+            contracts.Bytes{data: nil, len: 0},
+            contracts.Bytes{data: nil, len: 0}) == contracts.AUTH_FAILED;
+    }
+    if (key.algorithm == EDDSA) {
+        if (!memory_range.valid(key.value.data, key.value.len) ||
+            key.value.len != 32) { ret false; }
+        var invalid_signature: [64]u8;
+        ret signature.verify_ed25519(key.value,
+            contracts.Bytes{data: nil, len: 0},
+            contracts.Bytes{data: ?invalid_signature[0], len: 64}) == contracts.AUTH_FAILED;
+    }
+    if (key.algorithm == PS256) { ret valid_rsa_public(key.rsa); }
+    ret false;
+}
+
+fun private_key_valid(key: PrivateKey) bool {
+    if (key.secret_owner == nil) { ret false; }
+    if (key.algorithm == ES256) {
+        ret key.value.data != nil &&
+            key.value.len == 32;
+    }
+    if (key.algorithm == EDDSA) {
+        ret key.value.data != nil &&
+            key.value.len == 32;
+    }
+    if (key.algorithm == PS256) { ret valid_rsa_private(key.rsa); }
+    ret false;
+}
+
+fun equal_bytes(first: *u8, second: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun sha256_bytes(data: *u8, len: usize, output: *u8) bool {
+    if (!memory_range.valid(data, len) || output == nil ||
+        !memory_range.valid(output, 32)) { ret false; }
+    var context: hash.Sha256 = hash.empty_sha256();
+    var status: contracts.Error = hash.init_sha256(?context);
+    if (status == contracts.OK) {
+        status = hash.update_sha256(?context,
+            contracts.Bytes{data: data, len: len});
+    }
+    if (status != contracts.OK) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    val result: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: output, capacity: 32});
+    ret result.error == contracts.OK && result.written == 32;
+}
+
+fun sha256_unchanged(data: *u8, len: usize, expected: *u8) bool {
+    var actual: [32]u8;
+    ret sha256_bytes(data, len, ?actual[0]) &&
+        equal_bytes(?actual[0], expected, 32);
+}
+
+pub fun key_pair_valid(public_key: PublicKey, private_key: PrivateKey) bool {
+    if (!public_key_valid(public_key) || !private_key_valid(private_key) ||
+        public_key.algorithm != private_key.algorithm) { ret false; }
+    if (public_key.algorithm == ES256) {
+        var derived: [65]u8;
+        val result: contracts.Operation = p256.derive_public(private_key.value,
+            contracts.Buffer{data: ?derived[0], capacity: 65});
+        ret result.error == contracts.OK &&
+            equal_bytes(?derived[0], public_key.value.data, 65);
+    }
+    if (public_key.algorithm == EDDSA) {
+        var derived: [32]u8;
+        val result: contracts.Operation = signature.derive_ed25519_public(
+            private_key.value, contracts.Buffer{data: ?derived[0], capacity: 32});
+        ret result.error == contracts.OK &&
+            equal_bytes(?derived[0], public_key.value.data, 32);
+    }
+    ret public_key.rsa.modulus.len == private_key.rsa.modulus.len &&
+        public_key.rsa.exponent.len == private_key.rsa.public_exponent.len &&
+        equal_bytes(public_key.rsa.modulus.data, private_key.rsa.modulus.data,
+            public_key.rsa.modulus.len) &&
+        equal_bytes(public_key.rsa.exponent.data, private_key.rsa.public_exponent.data,
+            public_key.rsa.exponent.len);
+}
+
+fun algorithm_name(algorithm: Algorithm) view.View {
+    if (algorithm == ES256) { ret view.view("ES256", 5); }
+    if (algorithm == EDDSA) { ret view.view("EdDSA", 5); }
+    if (algorithm == PS256) { ret view.view("PS256", 5); }
+    ret view.view(nil, 0);
+}
+
+fun public_overlaps(key: PublicKey, data: *u8, len: usize) bool {
+    if (key.algorithm == ES256 || key.algorithm == EDDSA) {
+        ret memory_range.overlap(data, len, key.value.data, key.value.len);
+    }
+    if (key.algorithm == PS256) {
+        ret memory_range.overlap(data, len, key.rsa.modulus.data,
+            key.rsa.modulus.len) ||
+            memory_range.overlap(data, len, key.rsa.exponent.data,
+                key.rsa.exponent.len);
+    }
+    ret false;
+}
+
+pub fun public_key_overlaps(key: PublicKey, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    ret public_overlaps(key, data, len);
+}
+
+fun private_overlaps(key: PrivateKey, data: *u8, len: usize) bool {
+    if (key.algorithm == ES256 || key.algorithm == EDDSA) { ret false; }
+    if (key.algorithm == PS256) {
+        ret memory_range.overlap(data, len, key.rsa.modulus.data,
+            key.rsa.modulus.len) ||
+            memory_range.overlap(data, len, key.rsa.public_exponent.data,
+                key.rsa.public_exponent.len);
+    }
+    ret false;
+}
+
+pub fun signing_inputs_overlap(signer_value: Signer, private_key: PrivateKey,
+    data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    ret public_overlaps(signer_value.public_key, data, len) ||
+        private_overlaps(private_key, data, len);
+}
+
+fun protected_overlaps(value: Protected, data: *u8, len: usize) bool {
+    ret memory_range.overlap(data, len, value.nonce.data, value.nonce.len) ||
+        memory_range.overlap(data, len, value.url.data, value.url.len) ||
+        memory_range.overlap(data, len, value.kid.data, value.kid.len);
+}
+
+fun write_jwk(key: PublicKey, writer: *Writer) problem.Error {
+    if (!public_key_valid(key)) {
+        ret problem.local_code(problem.SIGNING, problem.INVALID_KEY,
+            "account key is invalid");
+    }
+    if (key.algorithm == ES256) {
+        if (!literal(writer, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"", 31) ||
+            !base64url(writer, ?key.value.data[1], 32) ||
+            !literal(writer, "\",\"y\":\"", 7) ||
+            !base64url(writer, ?key.value.data[33], 32) ||
+            !literal(writer, "\"}", 2)) {
+            ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+                "jwk output is too small");
+        }
+        ret problem.none();
+    }
+    if (key.algorithm == EDDSA) {
+        if (!literal(writer, "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"", 34) ||
+            !base64url(writer, key.value.data, 32) ||
+            !literal(writer, "\"}", 2)) {
+            ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+                "jwk output is too small");
+        }
+        ret problem.none();
+    }
+    if (!literal(writer, "{\"e\":\"", 6) ||
+        !base64url(writer, key.rsa.exponent.data, key.rsa.exponent.len) ||
+        !literal(writer, "\",\"kty\":\"RSA\",\"n\":\"", 19) ||
+        !base64url(writer, key.rsa.modulus.data, key.rsa.modulus.len) ||
+        !literal(writer, "\"}", 2)) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "jwk output is too small");
+    }
+    ret problem.none();
+}
+
+pub fun key_encode_jwk(key: PublicKey, output: contracts.Buffer) Operation {
+    if (output.data == nil || !memory_range.valid(output.data, output.capacity) ||
+        public_overlaps(key, output.data, output.capacity)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "jwk output range is invalid or aliases the key");
+    }
+    var encoded: [1536]u8;
+    var writer: Writer = Writer{data: ?encoded[0], cap: MAX_JWK_BYTES, pos: 0};
+    val status: problem.Error = write_jwk(key, ?writer);
+    if (problem.failed(status)) { ret Operation{error: status, written: 0}; }
+    if (output.capacity < writer.pos) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL, "jwk output is too small");
+    }
+    var i: usize = 0;
+    for (i < writer.pos) {
+        output.data[i] = encoded[i];
+        i = i + 1;
+    }
+    ret Operation{error: problem.none(), written: writer.pos};
+}
+
+pub fun key_thumbprint(key: PublicKey, output: contracts.Buffer) Operation {
+    if (output.data == nil || !memory_range.valid(output.data, output.capacity) ||
+        public_overlaps(key, output.data, output.capacity)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "thumbprint output range is invalid or aliases the key");
+    }
+    if (output.capacity < THUMBPRINT_BYTES) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "thumbprint output is too small");
+    }
+    var jwk: [1536]u8;
+    val encoded: Operation = key_encode_jwk(key,
+        contracts.Buffer{data: ?jwk[0], capacity: MAX_JWK_BYTES});
+    if (problem.failed(encoded.error)) { ret encoded; }
+    var context: hash.Sha256 = hash.empty_sha256();
+    var digest: [32]u8;
+    var status: contracts.Error = hash.init_sha256(?context);
+    if (status == contracts.OK) {
+        status = hash.update_sha256(?context,
+            contracts.Bytes{data: ?jwk[0], len: encoded.written});
+    }
+    var hashed: contracts.Operation;
+    if (status == contracts.OK) {
+        hashed = hash.final_sha256(?context,
+            contracts.Buffer{data: ?digest[0], capacity: 32});
+        status = hashed.error;
+    } or {
+        hash.destroy_sha256(?context);
+    }
+    if (status != contracts.OK) {
+        ret Operation{error: crypto_error(status), written: 0};
+    }
+    var writer: Writer = Writer{data: output.data, cap: output.capacity, pos: 0};
+    if (!base64url(?writer, ?digest[0], 32)) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "thumbprint output preflight disagreed with encoding");
+    }
+    ret Operation{error: problem.none(), written: writer.pos};
+}
+
+fun der_integer(raw: *u8, der: *u8, len: usize) bool {
+    if (len == 0 || len > 33) { ret false; }
+    var offset: usize = 0;
+    if (len == 33) {
+        if (der[0] != 0 || (der[1] & 0x80) == 0) { ret false; }
+        offset = 1;
+    } or {
+        if ((der[0] & 0x80) != 0 || (len > 1 && der[0] == 0 && (der[1] & 0x80) == 0)) {
+            ret false;
+        }
+    }
+    val value_len: usize = len - offset;
+    var i: usize = 0;
+    for (i < 32) {
+        raw[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < value_len) {
+        raw[32 - value_len + i] = der[offset + i];
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun ecdsa_raw(output: *u8, der: *u8, len: usize) bool {
+    if (len < 8 || len > 72 || der[0] != 0x30 || der[1]::usize + 2 != len ||
+        der[2] != 0x02) { ret false; }
+    val r_len: usize = der[3]::usize;
+    val s_tag: usize = 4 + r_len;
+    if (s_tag + 2 > len || der[s_tag] != 0x02) { ret false; }
+    val s_len: usize = der[s_tag + 1]::usize;
+    if (s_tag + 2 + s_len != len) { ret false; }
+    ret der_integer(output, ?der[4], r_len) &&
+        der_integer(?output[32], ?der[s_tag + 2], s_len);
+}
+
+pub fun key_sign(key: PrivateKey, entropy: Entropy, message: contracts.Bytes,
+    output: contracts.Buffer) Operation {
+    if (!private_key_valid(key)) {
+        ret failed(problem.SIGNING, problem.INVALID_KEY, "account key is invalid");
+    }
+    if (!memory_range.valid(message.data, message.len) || output.data == nil ||
+        !memory_range.valid(output.data, output.capacity) ||
+        memory_range.overlap(output.data, output.capacity, message.data, message.len) ||
+        private_overlaps(key, output.data, output.capacity)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT, "invalid signing buffer");
+    }
+    if (key.algorithm == ES256) {
+        if (output.capacity < 64) {
+            ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+                "signature output is too small");
+        }
+        var der: [72]u8;
+        val signed: contracts.Operation = signature.sign_ecdsa_p256_sha256(
+            key.value, message, contracts.Buffer{data: ?der[0], capacity: 72});
+        if (signed.error != contracts.OK) {
+            ret Operation{error: crypto_error(signed.error), written: 0};
+        }
+        var raw: [64]u8;
+        if (!ecdsa_raw(?raw[0], ?der[0], signed.written)) {
+            ret failed(problem.SIGNING, problem.SIGNATURE_FAILED,
+                "ecdsa signature encoding is invalid");
+        }
+        var i: usize = 0;
+        for (i < 64) {
+            output.data[i] = raw[i];
+            i = i + 1;
+        }
+        ret Operation{error: problem.none(), written: 64};
+    }
+    if (key.algorithm == EDDSA) {
+        if (output.capacity < signature.ED25519_SIGNATURE_SIZE) {
+            ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+                "signature output is too small");
+        }
+        val signed: contracts.Operation = signature.sign_ed25519(key.value,
+            message, output);
+        ret Operation{error: crypto_error(signed.error), written: signed.written};
+    }
+    if (output.capacity < key.rsa.modulus.len) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "signature output is too small");
+    }
+    var salt: [32]^u8;
+    ct.zeroize(?salt[0], 32);
+    if (!entropy_valid(entropy) || !entropy.available) {
+        ct.zeroize(?salt[0], 32);
+        ret failed(problem.SIGNING, problem.ENTROPY_UNAVAILABLE,
+            "rsa signing entropy is unavailable");
+    }
+    var message_digest: [32]u8;
+    var modulus_digest: [32]u8;
+    var exponent_digest: [32]u8;
+    if (!sha256_bytes(message.data, message.len, ?message_digest[0]) ||
+        !sha256_bytes(key.rsa.modulus.data, key.rsa.modulus.len,
+            ?modulus_digest[0]) ||
+        !sha256_bytes(key.rsa.public_exponent.data,
+            key.rsa.public_exponent.len, ?exponent_digest[0]) ||
+        entropy_owns(entropy, message.data, message.len) ||
+        entropy_owns(entropy, output.data, output.capacity) ||
+        entropy_owns(entropy, key.rsa.modulus.data, key.rsa.modulus.len) ||
+        entropy_owns(entropy, key.rsa.public_exponent.data,
+            key.rsa.public_exponent.len) ||
+        entropy_owns_secret(entropy, key.rsa.private_exponent.data,
+            key.rsa.private_exponent.len) ||
+        entropy_owns_secret(entropy, ?salt[0], 32) ||
+        !sha256_unchanged(message.data, message.len, ?message_digest[0]) ||
+        !sha256_unchanged(key.rsa.modulus.data, key.rsa.modulus.len,
+            ?modulus_digest[0]) ||
+        !sha256_unchanged(key.rsa.public_exponent.data,
+            key.rsa.public_exponent.len, ?exponent_digest[0])) {
+        ct.zeroize(?salt[0], 32);
+        ret failed(problem.SIGNING, problem.INVALID_INPUT,
+            "entropy provider aliases or mutated signing inputs");
+    }
+    val entropy_status: contracts.Error = entropy.fill(entropy.ctx,
+        contracts.SecretBuffer{data: ?salt[0], capacity: 32});
+    val entropy_unchanged: bool = entropy.validate(entropy.validation_ctx);
+    if (!entropy_unchanged || entropy_status != contracts.OK ||
+        !sha256_unchanged(message.data, message.len, ?message_digest[0]) ||
+        !sha256_unchanged(key.rsa.modulus.data, key.rsa.modulus.len,
+            ?modulus_digest[0]) ||
+        !sha256_unchanged(key.rsa.public_exponent.data,
+            key.rsa.public_exponent.len, ?exponent_digest[0])) {
+        ct.zeroize(?salt[0], 32);
+        if (!entropy_unchanged || entropy_status == contracts.OK) {
+            ret failed(problem.SIGNING, problem.INVALID_INPUT,
+                "entropy callback mutated signing inputs");
+        }
+        ret Operation{error: crypto_error(entropy_status), written: 0};
+    }
+    var signature_bytes: [512]u8;
+    val signed: contracts.Operation = signature.sign_rsa_pss_sha256(key.rsa,
+        message, contracts.SecretBytes{data: ?salt[0], len: 32},
+        contracts.Buffer{data: ?signature_bytes[0],
+            capacity: key.rsa.modulus.len});
+    ct.zeroize(?salt[0], 32);
+    if (signed.error != contracts.OK) {
+        ret Operation{error: crypto_error(signed.error), written: 0};
+    }
+    var i: usize = 0;
+    for (i < signed.written) {
+        output.data[i] = signature_bytes[i];
+        i = i + 1;
+    }
+    ret Operation{error: problem.none(), written: signed.written};
+}
+
+pub fun signer(key: PublicKey) Signer {
+    var max_signature: usize = 0;
+    if (key.algorithm == ES256) { max_signature = 64; }
+    or (key.algorithm == EDDSA) { max_signature = 64; }
+    or (key.algorithm == PS256) { max_signature = key.rsa.modulus.len; }
+    ret Signer{public_key: key, algorithm: key.algorithm, max_jwk_bytes: MAX_JWK_BYTES,
+        max_thumb_bytes: THUMBPRINT_BYTES, max_signature_bytes: max_signature};
+}
+
+pub fun valid(value: Signer) bool {
+    ret public_key_valid(value.public_key) &&
+        value.algorithm == value.public_key.algorithm &&
+        (value.algorithm == ES256 || value.algorithm == EDDSA || value.algorithm == PS256) &&
+        value.max_jwk_bytes == MAX_JWK_BYTES &&
+        value.max_thumb_bytes == THUMBPRINT_BYTES &&
+        ((value.algorithm == ES256 && value.max_signature_bytes == 64) ||
+        (value.algorithm == EDDSA && value.max_signature_bytes == 64) ||
+        (value.algorithm == PS256 &&
+            value.max_signature_bytes == value.public_key.rsa.modulus.len)) &&
+        value.max_signature_bytes <= MAX_SIGNATURE_BYTES;
+}
+
+fun write_protected(signer_value: Signer, value: Protected,
+    jwk: view.View, writer: *Writer) bool {
+    val algorithm: view.View = algorithm_name(signer_value.algorithm);
+    if (!literal(writer, "{\"alg\":", 7) || !json_string(writer, algorithm)) { ret false; }
+    if (value.use_jwk) {
+        if (!literal(writer, ",\"jwk\":", 7) || !write_bytes(writer, jwk.data, jwk.len)) {
+            ret false;
+        }
+    } or {
+        if (!literal(writer, ",\"kid\":", 7) || !json_string(writer, value.kid)) {
+            ret false;
+        }
+    }
+    if (value.include_nonce &&
+        (!literal(writer, ",\"nonce\":", 9) || !json_string(writer, value.nonce))) {
+        ret false;
+    }
+    ret literal(writer, ",\"url\":", 7) && json_string(writer, value.url) &&
+        write_byte(writer, '}');
+}
+
+# work owns all temporary public bytes until signing completes
+pub fun encode_jws(signer_value: Signer, private_key: PrivateKey, entropy: Entropy,
+    protected: Protected, payload: view.View, work: contracts.Buffer,
+    output: contracts.Buffer) Operation {
+    if (!valid(signer_value) || !key_pair_valid(signer_value.public_key, private_key) ||
+        work.data == nil || output.data == nil ||
+        !memory_range.valid(work.data, work.capacity) ||
+        !memory_range.valid(output.data, output.capacity) ||
+        !memory_range.valid(payload.data, payload.len) ||
+        !memory_range.valid(protected.nonce.data, protected.nonce.len) ||
+        !memory_range.valid(protected.url.data, protected.url.len) ||
+        !memory_range.valid(protected.kid.data, protected.kid.len) ||
+        payload.len > 0xbfffffffffffffff ||
+        (protected.include_nonce && protected.nonce.len == 0) ||
+        (!protected.include_nonce && protected.nonce.len != 0) ||
+        protected.url.len == 0 ||
+        (protected.use_jwk && protected.kid.len != 0) ||
+        (!protected.use_jwk && protected.kid.len == 0) ||
+        (protected.include_nonce && !base64url_value(protected.nonce)) ||
+        !ascii_json_value(protected.url) ||
+        (!protected.use_jwk && !ascii_json_value(protected.kid))) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT, "invalid jws input");
+    }
+    if (memory_range.overlap(work.data, work.capacity, output.data, output.capacity) ||
+        memory_range.overlap(work.data, work.capacity, payload.data, payload.len) ||
+        memory_range.overlap(output.data, output.capacity, payload.data, payload.len) ||
+        protected_overlaps(protected, work.data, work.capacity) ||
+        protected_overlaps(protected, output.data, output.capacity) ||
+        public_overlaps(signer_value.public_key, work.data, work.capacity) ||
+        public_overlaps(signer_value.public_key, output.data, output.capacity) ||
+        private_overlaps(private_key, work.data, work.capacity) ||
+        private_overlaps(private_key, output.data, output.capacity)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "jws storage overlaps an input or key");
+    }
+    var jwk_len: usize = 0;
+    if (protected.use_jwk) {
+        val jwk: Operation = key_encode_jwk(signer_value.public_key,
+            contracts.Buffer{data: work.data, capacity: work.capacity});
+        if (problem.failed(jwk.error)) { ret jwk; }
+        jwk_len = jwk.written;
+    }
+    var raw: Writer = Writer{data: work.data, cap: work.capacity, pos: jwk_len};
+    if (!write_protected(signer_value, protected,
+        view.view(work.data, jwk_len), ?raw)) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "jws work storage is too small");
+    }
+    val protected_start: usize = jwk_len;
+    val protected_len: usize = raw.pos - protected_start;
+    val signing_start: usize = raw.pos;
+    var signing: Writer = Writer{data: work.data, cap: work.capacity, pos: signing_start};
+    if (!base64url(?signing, ?work.data[protected_start], protected_len) ||
+        !write_byte(?signing, '.') ||
+        (payload.len != 0 && !base64url(?signing, payload.data, payload.len))) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "jws work storage is too small");
+    }
+    val signing_len: usize = signing.pos - signing_start;
+    val signature_start: usize = signing.pos;
+    var nonce_digest: [32]u8;
+    var url_digest: [32]u8;
+    var kid_digest: [32]u8;
+    var payload_digest: [32]u8;
+    if (!sha256_bytes(protected.nonce.data, protected.nonce.len,
+            ?nonce_digest[0]) ||
+        !sha256_bytes(protected.url.data, protected.url.len, ?url_digest[0]) ||
+        !sha256_bytes(protected.kid.data, protected.kid.len, ?kid_digest[0]) ||
+        !sha256_bytes(payload.data, payload.len, ?payload_digest[0])) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "jws input binding failed");
+    }
+    val signed: Operation = key_sign(private_key, entropy,
+        contracts.Bytes{data: ?work.data[signing_start], len: signing_len},
+        contracts.Buffer{data: ?work.data[signature_start],
+            capacity: work.capacity - signature_start});
+    if (problem.failed(signed.error)) { ret signed; }
+    if (!sha256_unchanged(protected.nonce.data, protected.nonce.len,
+            ?nonce_digest[0]) ||
+        !sha256_unchanged(protected.url.data, protected.url.len, ?url_digest[0]) ||
+        !sha256_unchanged(protected.kid.data, protected.kid.len, ?kid_digest[0]) ||
+        !sha256_unchanged(payload.data, payload.len, ?payload_digest[0])) {
+        ret failed(problem.SIGNING, problem.INVALID_INPUT,
+            "jws inputs changed during signing");
+    }
+    val protected_encoded_len: usize = base64url_len(protected_len);
+    val payload_encoded_len: usize = base64url_len(payload.len);
+    val signature_encoded_len: usize = base64url_len(signed.written);
+    if (protected_encoded_len > 0xffffffffffffffff - 44 ||
+        payload_encoded_len > 0xffffffffffffffff - 44 - protected_encoded_len ||
+        signature_encoded_len > 0xffffffffffffffff - 44 - protected_encoded_len -
+            payload_encoded_len) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "jws output size overflows");
+    }
+    val required: usize = 44 + protected_encoded_len + payload_encoded_len +
+        signature_encoded_len;
+    if (output.capacity < required) {
+        ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "jws output is too small");
+    }
+    var result: Writer = Writer{data: output.data, cap: output.capacity, pos: 0};
+    if (!literal(?result, "{\"protected\":\"", 14) ||
+        !write_bytes(?result, ?work.data[signing_start], protected_encoded_len) ||
+        !literal(?result, "\",\"payload\":\"", 13) ||
+        !write_bytes(?result, ?work.data[signing_start + protected_encoded_len + 1],
+            payload_encoded_len) ||
+        !literal(?result, "\",\"signature\":\"", 15) ||
+        !base64url(?result, ?work.data[signature_start], signed.written) ||
+        !literal(?result, "\"}", 2)) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "jws output preflight disagreed with encoding");
+    }
+    ret Operation{error: problem.none(), written: result.pos};
 }
