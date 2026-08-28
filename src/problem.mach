@@ -1,46 +1,134 @@
-# protocol and local failure classification
+# structured local, http, and acme failure classification
 
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
 
 pub def Kind: u8;
 
-pub val PROTOCOL: Kind = 1;
+pub val NONE:      Kind = 0;
+pub val PROTOCOL:  Kind = 1;
 pub val TRANSPORT: Kind = 2;
-pub val SIGNING: Kind = 3;
-pub val STORAGE: Kind = 4;
+pub val SIGNING:   Kind = 3;
+pub val STORAGE:   Kind = 4;
 pub val CHALLENGE: Kind = 5;
-pub val POLICY: Kind = 6;
+pub val POLICY:    Kind = 6;
+pub val HTTP:      Kind = 7;
+pub val NONCE:     Kind = 8;
+pub val LIMIT:     Kind = 9;
+pub val STATE:     Kind = 10;
+
+pub def Code: u8;
+
+pub val OK:                    Code = 0;
+pub val INVALID_INPUT:         Code = 1;
+pub val OUTPUT_TOO_SMALL:      Code = 2;
+pub val MALFORMED_JSON:        Code = 3;
+pub val INVALID_DIRECTORY:     Code = 4;
+pub val HTTP_STATUS:           Code = 5;
+pub val ACME_PROBLEM:          Code = 6;
+pub val BAD_NONCE:             Code = 7;
+pub val MISSING_NONCE:         Code = 8;
+pub val NONCE_STORAGE_FULL:    Code = 9;
+pub val DUPLICATE_NONCE:       Code = 10;
+pub val RETRY_LIMIT:           Code = 11;
+pub val SIGNATURE_FAILED:      Code = 12;
+pub val UNSUPPORTED_ALGORITHM: Code = 13;
+pub val INVALID_KEY:           Code = 14;
+pub val INVALID_STATE:         Code = 15;
+pub val ENTROPY_UNAVAILABLE:   Code = 16;
 
 pub rec Problem {
-    typ:      view.View;
-    title:    view.View;
-    detail:   view.View;
-    status:   u16;
-    instance: view.View;
+    typ:            view.View;
+    title:          view.View;
+    detail:         view.View;
+    status:         u16;
+    instance:       view.View;
+    subproblems:    *Subproblem;
+    subproblem_len: usize;
+}
+
+pub rec ProblemIdentifier {
+    typ:   view.View;
+    value: view.View;
+}
+
+pub rec Subproblem {
+    typ:        view.View;
+    detail:     view.View;
+    identifier: ProblemIdentifier;
+}
+
+pub rec HttpCause {
+    status:              u16;
+    body:                view.View;
+    retry_after_seconds: u64;
 }
 
 pub rec Error {
-    kind:                Kind;
-    problem:             Problem;
-    detail:              str;
-    retry_after_seconds: u64;
-    retryable:           bool;
+    kind:      Kind;
+    code:      Code;
+    problem:   Problem;
+    http:      HttpCause;
+    detail:    str;
+    retryable: bool;
+}
+
+pub fun none() Error {
+    var result: Error;
+    result.kind = NONE;
+    result.code = OK;
+    result.retryable = false;
+    ret result;
+}
+
+pub fun local_code(kind: Kind, code: Code, detail: str) Error {
+    var result: Error = none();
+    result.kind = kind;
+    result.code = code;
+    result.detail = detail;
+    ret result;
 }
 
 pub fun local(kind: Kind, detail: str) Error {
-    var e: Error;
-    e.kind = kind;
-    e.detail = detail;
-    e.retryable = false;
-    ret e;
+    ret local_code(kind, INVALID_INPUT, detail);
 }
 
-test "acme.problem: local failures retain their class" {
-    val e: Error = local(STORAGE, "write failed");
-    if (e.kind != STORAGE || e.retryable) { ret 1; }
+pub fun http(status: u16, body: view.View, retry_after_seconds: u64) Error {
+    var result: Error = local_code(HTTP, HTTP_STATUS, "http response rejected");
+    result.http.status = status;
+    result.http.body = body;
+    result.http.retry_after_seconds = retry_after_seconds;
+    result.retryable = status == 408 || status == 425 || status == 429 || status >= 500;
+    ret result;
+}
+
+pub fun acme(value: Problem, status: u16, body: view.View,
+    retry_after_seconds: u64, bad_nonce: bool) Error {
+    var result: Error = http(status, body, retry_after_seconds);
+    result.kind = PROTOCOL;
+    result.code = ACME_PROBLEM;
+    if (bad_nonce) {
+        result.code = BAD_NONCE;
+        result.retryable = true;
+    }
+    result.problem = value;
+    ret result;
+}
+
+pub fun failed(error: Error) bool {
+    ret error.code != OK;
+}
+
+test "acme.problem: structured causes remain distinct" {
+    val storage: Error = local_code(STORAGE, INVALID_STATE, "write failed");
+    if (storage.kind != STORAGE || storage.code != INVALID_STATE || storage.retryable) { ret 1; }
+    val response: Error = http(503, view.view("busy", 4), 30);
+    if (response.kind != HTTP || response.code != HTTP_STATUS ||
+        response.http.status != 503 || response.http.retry_after_seconds != 30 ||
+        !response.retryable) { ret 2; }
     ret 0;
 }

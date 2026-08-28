@@ -1,6 +1,6 @@
 [project]
-id = "acme"
-version = "0.1.0"
+id = "acme-protocol-test"
+version = "0.0.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -19,6 +19,11 @@ isa = "riscv64"
 os = "linux"
 abi = "lp64d"
 
+[target.windows-x86_64]
+isa = "x86_64"
+os = "windows"
+abi = "win64"
+
 [target.darwin-x86_64]
 isa = "x86_64"
 os = "darwin"
@@ -28,11 +33,6 @@ abi = "sysv64"
 isa = "aarch64"
 os = "darwin"
 abi = "aapcs64"
-
-[target.windows-x86_64]
-isa = "x86_64"
-os = "windows"
-abi = "win64"
 
 [profile.debug]
 opt = 0
@@ -44,22 +44,13 @@ opt = 2
 debug = false
 simd = "scalarize"
 
-[artifact.acme]
+[artifact.acme-protocol-test]
 kind = "static"
-entry = "lib.mach"
-out = "lib/acme"
+entry = "tests.mach"
+out = "lib/acme-protocol-test"
 targets = ["*"]
 link = []
 need = []
 
-[dep.mach-std]
-git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v0.29.0"
-
-[dep.mach-http]
-git = "https://github.com/briar-systems/mach-http"
-ref = "tag/v0.3.0"
-
-[dep.mach-crypto]
-git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.4.0"
+[dep.acme]
+path = "../.."

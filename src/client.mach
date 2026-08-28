@@ -1,61 +1,1976 @@
-# composed acme protocol driver contract
+# bounded transport-independent acme protocol state
 
-use A: std.allocator;
+use J: std.data.json;
 use R: std.types.result;
+use crypto.contracts;
+use crypto.hash;
+use http.core.field;
+use http.core.method;
+use http.core.status;
+use std.net.ip;
+use std.sync.atomic;
+use std.system.os;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
 use std.types.view;
-use http_client: http.client.client;
-use tls.config;
-use acme.account;
-use acme.challenge;
-use acme.certificate;
+use acme.jose;
+use acme.json;
+use acme.memory_range;
 use acme.nonce;
-use acme.order;
 use acme.problem;
-use acme.storage;
+
+pub val DIRECTORY_CONTENT_TYPE: str = "application/json";
+pub val JWS_CONTENT_TYPE:       str = "application/jose+json";
+pub val PROBLEM_CONTENT_TYPE:   str = "application/problem+json";
 
 pub rec Directory {
-    new_nonce_url:   view.View;
-    new_account_url: view.View;
-    new_order_url:   view.View;
-    revoke_cert_url: view.View;
-    key_change_url:  view.View;
-    terms_url:       view.View;
+    new_nonce_url:    view.View;
+    new_account_url:  view.View;
+    new_order_url:    view.View;
+    new_authz_url:    view.View;
+    revoke_cert_url:  view.View;
+    key_change_url:   view.View;
+    renewal_info_url: view.View;
+    terms_url:        view.View;
+    website_url:      view.View;
+    caa_identities:   *view.View;
+    caa_identity_len: usize;
     external_account_required: bool;
 }
 
-pub rec Limits {
-    max_response_bytes: usize;
-    max_problem_bytes:  usize;
-    max_nonce_bytes:    usize;
-    max_poll_attempts:  usize;
-    request_timeout_ns: u64;
+pub rec DirectoryStorage {
+    data:         *u8;
+    capacity:     usize;
+    caa_items:    *view.View;
+    caa_capacity: usize;
 }
 
-pub def DiscoverFun: fun(ptr, view.View, *A.Allocator) R.Result[Directory, problem.Error];
-pub def CreateAccountFun: fun(ptr, Directory, account.Request, *A.Allocator) R.Result[account.Account, problem.Error];
-pub def CreateOrderFun: fun(ptr, Directory, account.Credentials, order.Request, *A.Allocator) R.Result[order.Order, problem.Error];
-pub def CompleteChallengesFun: fun(ptr, account.Credentials, *order.Order, challenge.Providers, *A.Allocator) R.Result[order.Order, problem.Error];
-pub def FinalizeFun: fun(ptr, account.Credentials, order.Order, certificate.CsrProvider, *A.Allocator, *certificate.Issued) R.Result[bool, problem.Error];
-pub def RevokeFun: fun(ptr, account.Credentials, certificate.Issued, u8) R.Result[bool, problem.Error];
+pub rec ProblemStorage {
+    data:                *u8;
+    capacity:            usize;
+    subproblems:         *problem.Subproblem;
+    subproblem_capacity: usize;
+}
 
-pub rec Operations {
-    ctx:                 ptr;
-    discover:            DiscoverFun;
-    create_account:      CreateAccountFun;
-    create_order:        CreateOrderFun;
-    complete_challenges: CompleteChallengesFun;
-    finalize:            FinalizeFun;
-    revoke:              RevokeFun;
+pub rec Limits {
+    max_request_bytes:       usize;
+    max_response_bytes:      usize;
+    max_problem_bytes:       usize;
+    max_nonce_bytes:         usize;
+    max_url_bytes:           usize;
+    max_json_scratch:        usize;
+    max_json_depth:          usize;
+    max_json_values:         usize;
+    max_json_key_bytes:      usize;
+    max_json_key_comparisons: usize;
+    max_caa_identities:      usize;
+    max_problem_subproblems: usize;
+    max_bad_nonce_retries:   usize;
+    request_timeout_ns:      u64;
+    response_fields:         field.Limits;
+}
+
+pub rec Response {
+    status:              status.Status;
+    fields:              *field.Fields;
+    body:                view.View;
+    retry_after_seconds: u64;
+}
+
+pub rec WireRequest {
+    error:              problem.Error;
+    method:             method.Method;
+    url:                view.View;
+    content_type:       view.View;
+    body:               view.View;
+    timeout_ns:         u64;
+    max_response_bytes: usize;
+    response_fields:    field.Limits;
+    replay_safe:        bool;
 }
 
 pub rec Client {
-    http:          *http_client.Client;
-    tls:           *config.ClientConfig;
-    directory_url: view.View;
-    nonces:        *nonce.Pool;
-    storage:       *storage.Store;
-    operations:    Operations;
-    limits:        Limits;
+    nonces:      nonce.Pool;
+    limits:      Limits;
+    generation:  u64;
+    callback_owner: i64;
+    initialized: bool;
+}
+
+pub def RequestState: u8;
+
+pub val REQUEST_EMPTY:         RequestState = 0;
+pub val REQUEST_READY:         RequestState = 1;
+pub val REQUEST_AWAITING:      RequestState = 2;
+pub val REQUEST_RETRY:         RequestState = 3;
+pub val REQUEST_NEEDS_NONCE:   RequestState = 4;
+pub val REQUEST_COMPLETE:      RequestState = 5;
+pub val REQUEST_FAILED:        RequestState = 6;
+
+pub rec SignedSpec {
+    url:     view.View;
+    payload: view.View;
+    kid:     view.View;
+    use_jwk: bool;
+}
+
+pub rec SignedRequest {
+    spec:              SignedSpec;
+    wire_body:         view.View;
+    client_owner:      ptr;
+    client_generation: u64;
+    state:             RequestState;
+    attempts:          usize;
+    bad_nonce_retries: usize;
+    retry_nonce:       [512]u8;
+    retry_nonce_len:   usize;
+    retry_nonce_ready: bool;
+    url_digest:        [32]u8;
+    payload_digest:    [32]u8;
+    kid_digest:        [32]u8;
+}
+
+pub def Action: u8;
+
+pub val ACTION_COMPLETE:      Action = 1;
+pub val ACTION_RETRY_SIGNED:  Action = 2;
+pub val ACTION_ACQUIRE_NONCE: Action = 3;
+pub val ACTION_FAILED:        Action = 4;
+
+pub rec Decision {
+    action: Action;
+    cause:  problem.Error;
+}
+
+rec Cursor {
+    data: *u8;
+    cap:  usize;
+    pos:  usize;
+}
+
+fun wipe_retry_nonce(request: *SignedRequest) {
+    var i: usize = 0;
+    for (i < 512) {
+        request.retry_nonce[i] = 0;
+        i = i + 1;
+    }
+    request.retry_nonce_len = 0;
+    request.retry_nonce_ready = false;
+}
+
+fun reserve_retry_nonce(request: *SignedRequest, value: view.View,
+    maximum: usize) problem.Error {
+    if (request == nil || value.data == nil || value.len == 0 ||
+        value.len > maximum || value.len > 512 ||
+        !memory_range.valid(value.data, value.len) ||
+        !replay_nonce_bytes(value.data, value.len)) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_INPUT,
+            "invalid reserved replay nonce");
+    }
+    var temporary: [512]u8;
+    var i: usize = 0;
+    for (i < value.len) {
+        temporary[i] = value.data[i];
+        i = i + 1;
+    }
+    wipe_retry_nonce(request);
+    i = 0;
+    for (i < value.len) {
+        request.retry_nonce[i] = temporary[i];
+        temporary[i] = 0;
+        i = i + 1;
+    }
+    request.retry_nonce_len = value.len;
+    request.retry_nonce_ready = true;
+    ret problem.none();
+}
+
+fun fields_ranges_valid(fields: *field.Fields) bool {
+    if (fields == nil ||
+        !memory_range.valid(fields::*u8, $size_of(field.Fields)) ||
+        fields.len > fields.capacity) { ret false; }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(fields.capacity, $size_of(field.Field), ?item_bytes) ||
+        !memory_range.valid(fields.items::*u8, item_bytes)) { ret false; }
+    var i: usize = 0;
+    for (i < fields.len) {
+        if (!memory_range.valid(fields.items[i].name.data,
+                fields.items[i].name.len) ||
+            !memory_range.valid(fields.items[i].value.data,
+                fields.items[i].value.len)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun response_overlaps(response: Response, data: *u8, len: usize) bool {
+    if (memory_range.overlap(data, len, response.body.data, response.body.len) ||
+        memory_range.overlap(data, len, response.fields::*u8,
+            $size_of(field.Fields))) { ret true; }
+    var item_bytes: usize = 0;
+    if (!memory_range.size(response.fields.capacity, $size_of(field.Field),
+        ?item_bytes) || memory_range.overlap(data, len,
+            response.fields.items::*u8, item_bytes)) { ret true; }
+    var i: usize = 0;
+    for (i < response.fields.len) {
+        if (memory_range.overlap(data, len, response.fields.items[i].name.data,
+                response.fields.items[i].name.len) ||
+            memory_range.overlap(data, len, response.fields.items[i].value.data,
+                response.fields.items[i].value.len)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun mutable_regions_overlap(first: *u8, first_len: usize, second: *u8,
+    second_len: usize) bool {
+    ret !memory_range.valid(first, first_len) ||
+        !memory_range.valid(second, second_len) ||
+        memory_range.overlap(first, first_len, second, second_len);
+}
+
+fun view_same(first: view.View, second: view.View) bool {
+    ret first.data == second.data && first.len == second.len;
+}
+
+fun bytes_same(first: *u8, second: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun wipe_bytes(data: *u8, len: usize) {
+    var i: usize = 0;
+    for (i < len) {
+        data[i] = 0;
+        i = i + 1;
+    }
+}
+
+fun digest(data: *u8, len: usize, output: *u8) bool {
+    if (output == nil || !memory_range.valid(data, len) ||
+        !memory_range.valid(output, 32)) { ret false; }
+    var context: hash.Sha256 = hash.empty_sha256();
+    var status: contracts.Error = hash.init_sha256(?context);
+    if (status == contracts.OK) {
+        status = hash.update_sha256(?context,
+            contracts.Bytes{data: data, len: len});
+    }
+    if (status != contracts.OK) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    val result: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: output, capacity: 32});
+    ret result.error == contracts.OK && result.written == 32;
+}
+
+fun digest_same(value: view.View, expected: *u8) bool {
+    var actual: [32]u8;
+    ret digest(value.data, value.len, ?actual[0]) &&
+        bytes_same(?actual[0], expected, 32);
+}
+
+fun spec_intact(request: *SignedRequest) bool {
+    ret request != nil && digest_same(request.spec.url, ?request.url_digest[0]) &&
+        digest_same(request.spec.payload, ?request.payload_digest[0]) &&
+        digest_same(request.spec.kid, ?request.kid_digest[0]);
+}
+
+fun terminalize(request: *SignedRequest) {
+    request.wire_body = view.view(nil, 0);
+    request.state = REQUEST_FAILED;
+    wipe_retry_nonce(request);
+}
+
+fun field_limits_same(first: field.Limits, second: field.Limits) bool {
+    ret first.max_count == second.max_count && first.max_bytes == second.max_bytes &&
+        first.max_name_bytes == second.max_name_bytes &&
+        first.max_value_bytes == second.max_value_bytes;
+}
+
+fun limits_same(first: Limits, second: Limits) bool {
+    ret first.max_request_bytes == second.max_request_bytes &&
+        first.max_response_bytes == second.max_response_bytes &&
+        first.max_problem_bytes == second.max_problem_bytes &&
+        first.max_nonce_bytes == second.max_nonce_bytes &&
+        first.max_url_bytes == second.max_url_bytes &&
+        first.max_json_scratch == second.max_json_scratch &&
+        first.max_json_depth == second.max_json_depth &&
+        first.max_json_values == second.max_json_values &&
+        first.max_json_key_bytes == second.max_json_key_bytes &&
+        first.max_json_key_comparisons == second.max_json_key_comparisons &&
+        first.max_caa_identities == second.max_caa_identities &&
+        first.max_problem_subproblems == second.max_problem_subproblems &&
+        first.max_bad_nonce_retries == second.max_bad_nonce_retries &&
+        first.request_timeout_ns == second.request_timeout_ns &&
+        field_limits_same(first.response_fields, second.response_fields);
+}
+
+fun client_same(first: Client, second: *Client) bool {
+    ret second != nil && nonce.same(first.nonces, second.nonces) &&
+        limits_same(first.limits, second.limits) &&
+        first.generation == second.generation &&
+        first.callback_owner == atomic.load(?second.callback_owner) &&
+        first.initialized == second.initialized;
+}
+
+fun callback_begin(client: *Client) bool {
+    if (client == nil) { ret false; }
+    val owner: i64 = os.thread_current_id();
+    if (owner <= 0) { ret false; }
+    for (true) {
+        var expected: i64 = atomic.load(?client.callback_owner);
+        if (expected == owner) { ret false; }
+        if (expected == 0 && atomic.cas(?client.callback_owner,
+                ?expected, owner)) { ret true; }
+        if (expected != 0) {
+            os.thread_wait(?client.callback_owner, expected);
+        }
+    }
+}
+
+fun callback_end(client: *Client, before: Client,
+    request: *SignedRequest, request_before: SignedRequest) bool {
+    val intact: bool = client_same(before, client) &&
+        request_same(request_before, request) && spec_intact(request);
+    atomic.store(?client.callback_owner, 0);
+    os.thread_wake(?client.callback_owner);
+    ret intact;
+}
+
+fun callback_end_client(client: *Client, before: Client) bool {
+    val intact: bool = client_same(before, client);
+    atomic.store(?client.callback_owner, 0);
+    os.thread_wake(?client.callback_owner);
+    ret intact;
+}
+
+fun callback_reentrant(client: *Client) bool {
+    if (client == nil) { ret true; }
+    val owner: i64 = atomic.load(?client.callback_owner);
+    ret owner != 0 && owner == os.thread_current_id();
+}
+
+fun request_same(first: SignedRequest, second: *SignedRequest) bool {
+    if (second == nil || !view_same(first.spec.url, second.spec.url) ||
+        !view_same(first.spec.payload, second.spec.payload) ||
+        !view_same(first.spec.kid, second.spec.kid) ||
+        first.spec.use_jwk != second.spec.use_jwk ||
+        !view_same(first.wire_body, second.wire_body) ||
+        first.client_owner != second.client_owner ||
+        first.client_generation != second.client_generation ||
+        first.state != second.state || first.attempts != second.attempts ||
+        first.bad_nonce_retries != second.bad_nonce_retries ||
+        first.retry_nonce_len != second.retry_nonce_len ||
+        first.retry_nonce_ready != second.retry_nonce_ready) { ret false; }
+    var i: usize = 0;
+    for (i < 512) {
+        if (first.retry_nonce[i] != second.retry_nonce[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 32) {
+        if (first.url_digest[i] != second.url_digest[i] ||
+            first.payload_digest[i] != second.payload_digest[i] ||
+            first.kid_digest[i] != second.kid_digest[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+rec EntropyGuard {
+    source_validate: jose.EntropyValidateFun;
+    source_ctx:      ptr;
+    client:         *Client;
+    request:        *SignedRequest;
+    client_before:  Client;
+    request_before: SignedRequest;
+}
+
+fun guarded_entropy_validate(ctx: ptr) bool {
+    val guard: *EntropyGuard = ctx::*EntropyGuard;
+    ret guard.source_validate(guard.source_ctx) &&
+        client_same(guard.client_before, guard.client) &&
+        request_same(guard.request_before, guard.request) &&
+        spec_intact(guard.request);
+}
+
+fun callback_error(detail: str) problem.Error {
+    ret problem.local_code(problem.NONCE, problem.INVALID_STATE, detail);
+}
+
+fun pool_range_disjoint(snapshot: nonce.Pool, client: *Client,
+    request: *SignedRequest, data: *u8, len: usize) problem.Error {
+    if (!memory_range.valid(data, len)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid range at nonce provider boundary");
+    }
+    var range_before: [32]u8;
+    if (!digest(data, len, ?range_before[0])) {
+        ret callback_error("nonce ownership input could not be bound");
+    }
+    if (!callback_begin(client)) {
+        ret callback_error("nonce ownership callback is reentrant");
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val owned: bool = snapshot.aliases(snapshot.ctx, data, len);
+    val callback_intact: bool = callback_end(client, client_before, request,
+        request_before);
+    if (!callback_intact ||
+        !digest_same(view.view(data, len), ?range_before[0])) {
+        ret callback_error("nonce ownership callback mutated protocol state");
+    }
+    if (owned) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "nonce provider storage aliases protocol-owned storage");
+    }
+    ret problem.none();
+}
+
+fun pool_secret_disjoint(snapshot: nonce.Pool, client: *Client,
+    request: *SignedRequest, owner: ptr) problem.Error {
+    if (owner == nil || !callback_begin(client)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid secret range at nonce provider boundary");
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val owned: bool = snapshot.owns_secret(snapshot.ctx, owner);
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret callback_error("nonce secret ownership callback mutated protocol state");
+    }
+    if (owned) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "nonce provider storage aliases signing secrets");
+    }
+    ret problem.none();
+}
+
+fun pool_ready_snapshot(client: *Client, request: *SignedRequest,
+    output: *nonce.Pool) problem.Error {
+    if (client == nil || request == nil || output == nil ||
+        !nonce.descriptor_valid(client.nonces)) {
+        ret callback_error("nonce pool descriptor is invalid");
+    }
+    val snapshot: nonce.Pool = client.nonces;
+    val client_disjoint: problem.Error = pool_range_disjoint(snapshot, client,
+        request, client::*u8, $size_of(Client));
+    if (problem.failed(client_disjoint)) { ret client_disjoint; }
+    val request_disjoint: problem.Error = pool_range_disjoint(snapshot, client,
+        request, request::*u8, $size_of(SignedRequest));
+    if (problem.failed(request_disjoint)) { ret request_disjoint; }
+    if (!callback_begin(client)) {
+        ret callback_error("nonce readiness callback is reentrant");
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val ready: bool = snapshot.ready(snapshot.ctx);
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret callback_error("nonce readiness callback mutated protocol state");
+    }
+    if (!ready) { ret callback_error("nonce pool is not ready"); }
+    @output = snapshot;
+    ret problem.none();
+}
+
+fun pool_reserve(client: *Client, request: *SignedRequest, output: *u8,
+    capacity: usize) nonce.Reservation {
+    var snapshot: nonce.Pool;
+    if (!nonce.descriptor_valid(client.nonces)) {
+        ret nonce.Reservation{error: callback_error(
+            "nonce pool descriptor is invalid"), found: false,
+            token: 0, value: view.view(nil, 0)};
+    }
+    snapshot = client.nonces;
+    val before_ready: problem.Error = pool_range_disjoint(snapshot, client,
+        request, output, capacity);
+    if (problem.failed(before_ready)) {
+        ret nonce.Reservation{error: before_ready, found: false,
+            token: 0, value: view.view(nil, 0)};
+    }
+    val ready: problem.Error = pool_ready_snapshot(client, request, ?snapshot);
+    if (problem.failed(ready)) {
+        ret nonce.Reservation{error: ready, found: false, token: 0,
+            value: view.view(nil, 0)};
+    }
+    val disjoint: problem.Error = pool_range_disjoint(snapshot, client, request,
+        output, capacity);
+    if (problem.failed(disjoint)) {
+        ret nonce.Reservation{error: disjoint, found: false, token: 0,
+            value: view.view(nil, 0)};
+    }
+    if (!callback_begin(client)) {
+        ret nonce.Reservation{error: callback_error(
+            "nonce reservation callback is reentrant"), found: false,
+            token: 0, value: view.view(nil, 0)};
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val result: nonce.Reservation = snapshot.reserve(snapshot.ctx, output,
+        capacity);
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret nonce.Reservation{error: callback_error(
+            "nonce reservation callback mutated protocol state"),
+            found: false, token: 0, value: view.view(nil, 0)};
+    }
+    if (problem.failed(result.error)) {
+        if (result.found || result.token != 0 || result.value.data != nil ||
+            result.value.len != 0) {
+            ret nonce.Reservation{error: callback_error(
+                "nonce reservation callback returned inconsistent failure"),
+                found: false, token: 0, value: view.view(nil, 0)};
+        }
+        ret result;
+    }
+    if (!result.found) {
+        if (result.token != 0 || result.value.data != nil ||
+            result.value.len != 0) {
+            ret nonce.Reservation{error: callback_error(
+                "nonce reservation callback returned inconsistent empty result"),
+                found: false, token: 0, value: view.view(nil, 0)};
+        }
+        ret result;
+    }
+    if (result.token == 0 || result.value.data != output || result.value.len == 0 ||
+        result.value.len > capacity || result.value.len > snapshot.max_nonce_bytes ||
+        !nonce.value_valid(result.value, snapshot.max_nonce_bytes)) {
+        ret nonce.Reservation{error: callback_error(
+            "nonce reservation callback violated output ownership"),
+            found: false, token: 0, value: view.view(nil, 0)};
+    }
+    ret result;
+}
+
+fun pool_finish(client: *Client, request: *SignedRequest, snapshot: nonce.Pool,
+    token: u64, consume: bool) problem.Error {
+    if (token == 0 || !nonce.descriptor_valid(snapshot) ||
+        !callback_begin(client)) {
+        ret callback_error("nonce reservation transaction is invalid");
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    var result: problem.Error;
+    if (consume) { result = snapshot.commit(snapshot.ctx, token); }
+    or { result = snapshot.release(snapshot.ctx, token); }
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret callback_error("nonce reservation finalizer mutated protocol state");
+    }
+    ret result;
+}
+
+fun pool_put(client: *Client, request: *SignedRequest,
+    value: view.View) problem.Error {
+    var snapshot: nonce.Pool;
+    if (!nonce.descriptor_valid(client.nonces)) {
+        ret callback_error("nonce pool descriptor is invalid");
+    }
+    snapshot = client.nonces;
+    val before_ready: problem.Error = pool_range_disjoint(snapshot, client,
+        request, value.data, value.len);
+    if (problem.failed(before_ready)) { ret before_ready; }
+    val ready: problem.Error = pool_ready_snapshot(client, request, ?snapshot);
+    if (problem.failed(ready)) { ret ready; }
+    val disjoint: problem.Error = pool_range_disjoint(snapshot, client, request,
+        value.data, value.len);
+    if (problem.failed(disjoint)) { ret disjoint; }
+    if (!callback_begin(client)) {
+        ret callback_error("nonce put callback is reentrant");
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val result: problem.Error = snapshot.put(snapshot.ctx, value);
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret callback_error("nonce put callback mutated protocol state");
+    }
+    ret result;
+}
+
+fun pool_clear(client: *Client, request: *SignedRequest) problem.Error {
+    var snapshot: nonce.Pool;
+    val ready: problem.Error = pool_ready_snapshot(client, request, ?snapshot);
+    if (problem.failed(ready)) { ret ready; }
+    if (!callback_begin(client)) {
+        ret callback_error("nonce clear callback is reentrant");
+    }
+    val client_before: Client = @client;
+    val request_before: SignedRequest = @request;
+    val result: problem.Error = snapshot.clear(snapshot.ctx);
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret callback_error("nonce clear callback mutated protocol state");
+    }
+    ret result;
+}
+
+fun pool_prepare_disjoint(client: *Client, request: *SignedRequest,
+    signer: jose.Signer, private_key: jose.PrivateKey, work: contracts.Buffer,
+    output: contracts.Buffer) problem.Error {
+    val snapshot: nonce.Pool = client.nonces;
+    var result: problem.Error = pool_range_disjoint(snapshot, client, request,
+        work.data, work.capacity);
+    if (problem.failed(result)) { ret result; }
+    result = pool_range_disjoint(snapshot, client, request,
+        output.data, output.capacity);
+    if (problem.failed(result)) { ret result; }
+    result = pool_range_disjoint(snapshot, client, request,
+        request.spec.url.data, request.spec.url.len);
+    if (problem.failed(result)) { ret result; }
+    result = pool_range_disjoint(snapshot, client, request,
+        request.spec.payload.data, request.spec.payload.len);
+    if (problem.failed(result)) { ret result; }
+    result = pool_range_disjoint(snapshot, client, request,
+        request.spec.kid.data, request.spec.kid.len);
+    if (problem.failed(result)) { ret result; }
+    if (signer.algorithm == jose.ES256 || signer.algorithm == jose.EDDSA) {
+        result = pool_range_disjoint(snapshot, client, request,
+            signer.public_key.value.data, signer.public_key.value.len);
+        if (!problem.failed(result)) {
+            result = pool_secret_disjoint(snapshot, client, request,
+                private_key.secret_owner);
+        }
+    } or (signer.algorithm == jose.PS256) {
+        result = pool_range_disjoint(snapshot, client, request,
+            signer.public_key.rsa.modulus.data,
+            signer.public_key.rsa.modulus.len);
+        if (!problem.failed(result)) {
+            result = pool_range_disjoint(snapshot, client, request,
+                signer.public_key.rsa.exponent.data,
+                signer.public_key.rsa.exponent.len);
+        }
+        if (!problem.failed(result)) {
+            result = pool_range_disjoint(snapshot, client, request,
+                private_key.rsa.modulus.data, private_key.rsa.modulus.len);
+        }
+        if (!problem.failed(result)) {
+            result = pool_range_disjoint(snapshot, client, request,
+                private_key.rsa.public_exponent.data,
+                private_key.rsa.public_exponent.len);
+        }
+        if (!problem.failed(result)) {
+            result = pool_secret_disjoint(snapshot, client, request,
+                private_key.secret_owner);
+        }
+    }
+    if (!spec_intact(request)) {
+        ret callback_error("nonce ownership callback mutated signed inputs");
+    }
+    ret result;
+}
+
+pub fun limits_default() Limits {
+    ret Limits{
+        max_request_bytes: 1048576,
+        max_response_bytes: 1048576,
+        max_problem_bytes: 65536,
+        max_nonce_bytes: 512,
+        max_url_bytes: 4096,
+        max_json_scratch: 1048576,
+        max_json_depth: 16,
+        max_json_values: 4096,
+        max_json_key_bytes: 128,
+        max_json_key_comparisons: 65536,
+        max_caa_identities: 64,
+        max_problem_subproblems: 64,
+        max_bad_nonce_retries: 3,
+        request_timeout_ns: 30000000000,
+        response_fields: field.limits(128, 65536, 256, 8192),
+    };
+}
+
+fun limits_valid(configured: Limits) bool {
+    ret configured.max_request_bytes != 0 && configured.max_response_bytes != 0 &&
+        configured.max_request_bytes <= 0xbfffffffffffffff &&
+        configured.max_response_bytes <= 0xbfffffffffffffff &&
+        configured.max_problem_bytes != 0 &&
+        configured.max_problem_bytes <= configured.max_response_bytes &&
+        configured.max_nonce_bytes != 0 && configured.max_nonce_bytes <= 512 &&
+        configured.max_url_bytes != 0 && configured.max_url_bytes <= 4096 &&
+        configured.max_json_scratch != 0 && configured.max_json_depth != 0 &&
+        configured.max_json_values != 0 && configured.max_json_key_bytes != 0 &&
+        configured.max_json_key_bytes <= 128 &&
+        configured.max_json_key_comparisons != 0 &&
+        configured.max_caa_identities != 0 &&
+        configured.max_problem_subproblems != 0 &&
+        configured.max_bad_nonce_retries != 0 && configured.request_timeout_ns != 0 &&
+        configured.response_fields.max_count != 0 &&
+        configured.response_fields.max_bytes != 0 &&
+        configured.response_fields.max_name_bytes != 0 &&
+        configured.response_fields.max_value_bytes != 0;
+}
+
+pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.Error {
+    if (client == nil || nonces == nil ||
+        !memory_range.valid(client::*u8, $size_of(Client)) ||
+        !memory_range.valid(nonces::*u8, $size_of(nonce.Pool)) ||
+        memory_range.overlap(client::*u8, $size_of(Client),
+            nonces::*u8, $size_of(nonce.Pool)) ||
+        client.initialized || atomic.load(?client.callback_owner) != 0 ||
+        client.generation == 18446744073709551615 ||
+        !limits_valid(configured)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid acme client configuration");
+    }
+    val snapshot: nonce.Pool = @nonces;
+    if (!nonce.descriptor_valid(snapshot) ||
+        snapshot.max_nonce_bytes > configured.max_nonce_bytes) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid acme nonce pool configuration");
+    }
+    if (!callback_begin(client)) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "nonce ownership callback is reentrant");
+    }
+    val before: Client = @client;
+    val owned: bool = snapshot.aliases(snapshot.ctx, client::*u8,
+        $size_of(Client));
+    val alias_intact: bool = callback_end_client(client, before);
+    if (!alias_intact || !nonce.same(snapshot, @nonces) || owned) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "nonce ownership callback rejected or mutated client state");
+    }
+    if (!callback_begin(client)) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "nonce readiness callback is reentrant");
+    }
+    val ready_before: Client = @client;
+    val ready: bool = snapshot.ready(snapshot.ctx);
+    val ready_intact: bool = callback_end_client(client, ready_before);
+    if (!ready_intact || !nonce.same(snapshot, @nonces) || !ready) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "acme nonce pool is not ready or mutated client state");
+    }
+    client.nonces = snapshot;
+    client.limits = configured;
+    client.generation = client.generation + 1;
+    atomic.store(?client.callback_owner, 0);
+    client.initialized = true;
+    ret problem.none();
+}
+
+pub fun release(client: *Client) bool {
+    if (client == nil || !memory_range.valid(client::*u8, $size_of(Client)) ||
+        !client.initialized || atomic.load(?client.callback_owner) != 0) {
+        ret false;
+    }
+    client.nonces = nonce.Pool{};
+    client.limits = Limits{};
+    atomic.store(?client.callback_owner, 0);
+    client.initialized = false;
+    ret true;
+}
+
+fun json_limits(configured: Limits, maximum: usize) json.Limits {
+    var max_bytes: usize = maximum;
+    if (max_bytes > configured.max_response_bytes) { max_bytes = configured.max_response_bytes; }
+    ret json.Limits{max_bytes: max_bytes, max_depth: configured.max_json_depth,
+        max_values: configured.max_json_values,
+        max_key_bytes: configured.max_json_key_bytes,
+        max_key_comparisons: configured.max_json_key_comparisons};
+}
+
+fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
+    if (value == nil || value.kind != J.STRING) { ret false; }
+    val result: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
+    if (R.is_err[usize, str](result)) { ret false; }
+    @output = R.unwrap_ok[usize, str](result);
+    ret @output <= maximum;
+}
+
+fun caa_identity(data: *u8, len: usize) bool {
+    if (data == nil || len == 0 || len > 253) { ret false; }
+    var label_len: usize = 0;
+    var i: usize = 0;
+    for (i < len) {
+        val byte: u8 = data[i];
+        if (byte == '.') {
+            if (label_len == 0 || data[i - 1] == '-') { ret false; }
+            label_len = 0;
+        } or {
+            if (!((byte >= 'a' && byte <= 'z') ||
+                (byte >= 'A' && byte <= 'Z') ||
+                (byte >= '0' && byte <= '9') || byte == '-') ||
+                label_len == 63 || (label_len == 0 && byte == '-')) { ret false; }
+            label_len = label_len + 1;
+        }
+        i = i + 1;
+    }
+    ret label_len != 0 && data[len - 1] != '-';
+}
+
+fun replay_nonce_bytes(data: *u8, len: usize) bool {
+    if (data == nil || len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        val byte: u8 = data[i];
+        if (!((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_')) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun hex(byte: u8) bool {
+    ret (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f') ||
+        (byte >= 'A' && byte <= 'F');
+}
+
+fun unreserved(byte: u8) bool {
+    ret (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+        (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' ||
+        byte == '_' || byte == '~';
+}
+
+fun sub_delimiter(byte: u8) bool {
+    ret byte == '!' || byte == '$' || byte == '&' || byte == 39 ||
+        byte == '(' || byte == ')' || byte == '*' || byte == '+' ||
+        byte == ',' || byte == ';' || byte == '=';
+}
+
+fun component(data: *u8, start: usize, finish: usize,
+    slash: bool, query: bool) bool {
+    var i: usize = start;
+    for (i < finish) {
+        val byte: u8 = data[i];
+        if (unreserved(byte) || sub_delimiter(byte) || byte == ':' ||
+            byte == '@' || (slash && byte == '/') || (query && byte == '?')) {
+            i = i + 1;
+        } or {
+            if (byte != '%' || i + 2 >= finish || !hex(data[i + 1]) ||
+                !hex(data[i + 2])) { ret false; }
+            i = i + 3;
+        }
+    }
+    ret true;
+}
+
+fun port_valid(data: *u8, start: usize, finish: usize) bool {
+    if (start == finish) { ret false; }
+    var value: usize = 0;
+    var i: usize = start;
+    for (i < finish) {
+        if (data[i] < '0' || data[i] > '9') { ret false; }
+        value = value * 10 + (data[i] - '0')::usize;
+        if (value > 65535) { ret false; }
+        i = i + 1;
+    }
+    ret value != 0;
+}
+
+fun authority_valid(data: *u8, start: usize, finish: usize) bool {
+    if (start == finish) { ret false; }
+    if (data[start] == '[') {
+        var close: usize = start + 1;
+        for (close < finish && data[close] != ']') { close = close + 1; }
+        if (close == start + 1 || close == finish || close - start - 1 > 4096) {
+            ret false;
+        }
+        var literal: [4097]u8;
+        var i: usize = start + 1;
+        for (i < close) {
+            literal[i - start - 1] = data[i];
+            i = i + 1;
+        }
+        literal[close - start - 1] = 0;
+        if (R.is_err[ip.IPv6, str](ip.ipv6_parse(?literal[0]))) { ret false; }
+        if (close + 1 == finish) { ret true; }
+        ret data[close + 1] == ':' && port_valid(data, close + 2, finish);
+    }
+    var colon: usize = finish;
+    var i: usize = start;
+    for (i < finish) {
+        if (data[i] == '@' || data[i] == '[' || data[i] == ']') { ret false; }
+        if (data[i] == ':') {
+            if (colon != finish) { ret false; }
+            colon = i;
+        }
+        i = i + 1;
+    }
+    if (colon == start || !component(data, start, colon, false, false)) { ret false; }
+    ret colon == finish || port_valid(data, colon + 1, finish);
+}
+
+fun scheme_byte(byte: u8, lower: u8) bool {
+    ret byte == lower || byte == lower - 32;
+}
+
+fun https_bytes(data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len) || len < 9 ||
+        !scheme_byte(data[0], 'h') ||
+        !scheme_byte(data[1], 't') || !scheme_byte(data[2], 't') ||
+        !scheme_byte(data[3], 'p') || !scheme_byte(data[4], 's') ||
+        data[5] != ':' || data[6] != '/' || data[7] != '/' || data[8] == '/' ||
+        data[8] == '?' || data[8] == '#' || data[8] == '@') { ret false; }
+    var authority_end: usize = len;
+    var query_at: usize = len;
+    var i: usize = 8;
+    for (i < len) {
+        val byte: u8 = data[i];
+        if (authority_end == len && (byte == '/' || byte == '?')) {
+            authority_end = i;
+        }
+        if (byte == '#' || byte <= ' ' || byte >= 127) { ret false; }
+        if (byte == '?' && query_at == len) { query_at = i; }
+        i = i + 1;
+    }
+    if (!authority_valid(data, 8, authority_end)) { ret false; }
+    if (authority_end == len) { ret true; }
+    if (data[authority_end] == '?') {
+        ret component(data, authority_end + 1, len, true, true);
+    }
+    val path_end: usize = query_at;
+    if (!component(data, authority_end, path_end, true, false)) { ret false; }
+    ret query_at == len || component(data, query_at + 1, len, true, true);
+}
+
+fun https_value(value: *J.Value, maximum: usize) bool {
+    var len: usize = 0;
+    if (!decoded_len(value, maximum, ?len) || len < 9) { ret false; }
+    var decoded: [4096]u8;
+    val result: R.Result[usize, str] = J.value_string_decode(value, ?decoded[0], 4096);
+    ret !R.is_err[usize, str](result) && https_bytes(?decoded[0], len);
+}
+
+fun add_size(total: *usize, value: *J.Value, maximum: usize) bool {
+    if (value == nil) { ret true; }
+    var len: usize = 0;
+    if (!decoded_len(value, maximum, ?len) || len > 0xffffffffffffffff - @total) {
+        ret false;
+    }
+    @total = @total + len;
+    ret true;
+}
+
+fun copy_string(cursor: *Cursor, value: *J.Value, output: *view.View) bool {
+    if (value == nil) {
+        @output = view.view(nil, 0);
+        ret true;
+    }
+    var len: usize = 0;
+    if (!decoded_len(value, cursor.cap - cursor.pos, ?len)) { ret false; }
+    val start: usize = cursor.pos;
+    val result: R.Result[usize, str] = J.value_string_decode(value,
+        ?cursor.data[start], cursor.cap - start);
+    if (R.is_err[usize, str](result) || R.unwrap_ok[usize, str](result) != len) {
+        ret false;
+    }
+    cursor.pos = cursor.pos + len;
+    @output = view.view(?cursor.data[start], len);
+    ret true;
+}
+
+fun directory_error(detail: str) problem.Error {
+    ret problem.local_code(problem.PROTOCOL, problem.INVALID_DIRECTORY, detail);
+}
+
+pub fun parse_directory(response: Response, configured: Limits, scratch: *u8,
+    scratch_capacity: usize, storage: DirectoryStorage,
+    output: *Directory) problem.Error {
+    if (!limits_valid(configured) || output == nil ||
+        !status.is_final(response.status)) {
+        ret directory_error("invalid directory response");
+    }
+    val shaped: problem.Error = response_shape(response, configured);
+    if (problem.failed(shaped)) { ret shaped; }
+    if (response.status != status.OK) {
+        ret problem.http(response.status, response.body, response.retry_after_seconds);
+    }
+    if (response.body.data == nil || response.body.len == 0 ||
+        response.body.len > configured.max_response_bytes || scratch == nil ||
+        scratch_capacity == 0 ||
+        storage.data == nil || storage.caa_items == nil) {
+        ret directory_error("directory buffers violate limits");
+    }
+    var usable_scratch: usize = scratch_capacity;
+    if (usable_scratch > configured.max_json_scratch) {
+        usable_scratch = configured.max_json_scratch;
+    }
+    var caa_bytes: usize = 0;
+    if (!memory_range.size(storage.caa_capacity, $size_of(view.View),
+            ?caa_bytes) ||
+        !memory_range.valid(output::*u8, $size_of(Directory)) ||
+        mutable_regions_overlap(scratch, usable_scratch, storage.data,
+            storage.capacity) ||
+        mutable_regions_overlap(scratch, usable_scratch,
+            storage.caa_items::*u8, caa_bytes) ||
+        mutable_regions_overlap(scratch, usable_scratch, output::*u8,
+            $size_of(Directory)) ||
+        mutable_regions_overlap(storage.data, storage.capacity,
+            storage.caa_items::*u8, caa_bytes) ||
+        mutable_regions_overlap(storage.data, storage.capacity, output::*u8,
+            $size_of(Directory)) ||
+        mutable_regions_overlap(storage.caa_items::*u8, caa_bytes,
+            output::*u8, $size_of(Directory)) ||
+        response_overlaps(response, scratch, usable_scratch) ||
+        response_overlaps(response, storage.data, storage.capacity) ||
+        response_overlaps(response, storage.caa_items::*u8, caa_bytes) ||
+        response_overlaps(response, output::*u8, $size_of(Directory))) {
+        ret directory_error("directory buffers overlap or have invalid ranges");
+    }
+    val document: json.Document = json.parse(response.body, scratch,
+        usable_scratch, json_limits(configured, configured.max_response_bytes));
+    if (!document.valid) { ret document.error; }
+    var root: J.Value = document.root;
+    if (root.kind != J.OBJECT) { ret directory_error("directory is not an object"); }
+    val new_nonce: *J.Value = json.find(?root, "newNonce");
+    val new_account: *J.Value = json.find(?root, "newAccount");
+    val new_order: *J.Value = json.find(?root, "newOrder");
+    val new_authz: *J.Value = json.find(?root, "newAuthz");
+    val revoke_cert: *J.Value = json.find(?root, "revokeCert");
+    val key_change: *J.Value = json.find(?root, "keyChange");
+    val renewal_info: *J.Value = json.find(?root, "renewalInfo");
+    if (!https_value(new_nonce, configured.max_url_bytes) ||
+        !https_value(new_account, configured.max_url_bytes) ||
+        !https_value(new_order, configured.max_url_bytes) ||
+        (new_authz != nil && !https_value(new_authz, configured.max_url_bytes)) ||
+        (revoke_cert != nil && !https_value(revoke_cert, configured.max_url_bytes)) ||
+        (key_change != nil && !https_value(key_change, configured.max_url_bytes)) ||
+        (renewal_info != nil && !https_value(renewal_info, configured.max_url_bytes))) {
+        ret directory_error("directory endpoint is missing or invalid");
+    }
+    val meta: *J.Value = json.find(?root, "meta");
+    if (meta != nil && meta.kind != J.OBJECT) {
+        ret directory_error("directory meta is not an object");
+    }
+    var terms: *J.Value = nil;
+    var website: *J.Value = nil;
+    var caa: *J.Value = nil;
+    var external_required: bool = false;
+    if (meta != nil) {
+        terms = json.find(meta, "termsOfService");
+        website = json.find(meta, "website");
+        caa = json.find(meta, "caaIdentities");
+        val external: *J.Value = json.find(meta, "externalAccountRequired");
+        if ((terms != nil && !https_value(terms, configured.max_url_bytes)) ||
+            (website != nil && !https_value(website, configured.max_url_bytes)) ||
+            (external != nil && external.kind != J.BOOL) ||
+            (caa != nil && caa.kind != J.ARRAY)) {
+            ret directory_error("directory meta field has the wrong type");
+        }
+        if (external != nil) { external_required = J.value_bool(external); }
+    }
+    var caa_len: usize = 0;
+    if (caa != nil) { caa_len = J.value_count(caa); }
+    if (caa_len > configured.max_caa_identities || caa_len > storage.caa_capacity) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "directory caa storage is too small");
+    }
+    var required: usize = 0;
+    if (!add_size(?required, new_nonce, configured.max_url_bytes) ||
+        !add_size(?required, new_account, configured.max_url_bytes) ||
+        !add_size(?required, new_order, configured.max_url_bytes) ||
+        !add_size(?required, new_authz, configured.max_url_bytes) ||
+        !add_size(?required, revoke_cert, configured.max_url_bytes) ||
+        !add_size(?required, key_change, configured.max_url_bytes) ||
+        !add_size(?required, renewal_info, configured.max_url_bytes) ||
+        !add_size(?required, terms, configured.max_url_bytes) ||
+        !add_size(?required, website, configured.max_url_bytes)) {
+        ret directory_error("directory string violates limits");
+    }
+    var i: usize = 0;
+    for (i < caa_len) {
+        val item: *J.Value = J.value_get(caa, i);
+        var item_len: usize = 0;
+        if (!decoded_len(item, 255, ?item_len) || item_len == 0 ||
+            item_len > 0xffffffffffffffff - required) {
+            ret directory_error("directory caa identity is invalid");
+        }
+        var decoded: [255]u8;
+        val decoded_result: R.Result[usize, str] = J.value_string_decode(item,
+            ?decoded[0], 255);
+        if (R.is_err[usize, str](decoded_result) ||
+            !caa_identity(?decoded[0], item_len)) {
+            ret directory_error("directory caa identity is invalid");
+        }
+        required = required + item_len;
+        i = i + 1;
+    }
+    if (required > storage.capacity) {
+        ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
+            "directory text storage is too small");
+    }
+    var result: Directory;
+    var cursor: Cursor = Cursor{data: storage.data, cap: storage.capacity, pos: 0};
+    if (!copy_string(?cursor, new_nonce, ?result.new_nonce_url) ||
+        !copy_string(?cursor, new_account, ?result.new_account_url) ||
+        !copy_string(?cursor, new_order, ?result.new_order_url) ||
+        !copy_string(?cursor, new_authz, ?result.new_authz_url) ||
+        !copy_string(?cursor, revoke_cert, ?result.revoke_cert_url) ||
+        !copy_string(?cursor, key_change, ?result.key_change_url) ||
+        !copy_string(?cursor, renewal_info, ?result.renewal_info_url) ||
+        !copy_string(?cursor, terms, ?result.terms_url) ||
+        !copy_string(?cursor, website, ?result.website_url)) {
+        ret problem.local_code(problem.STATE, problem.INVALID_STATE,
+            "validated directory copy failed");
+    }
+    i = 0;
+    for (i < caa_len) {
+        if (!copy_string(?cursor, J.value_get(caa, i), ?storage.caa_items[i])) {
+            ret problem.local_code(problem.STATE, problem.INVALID_STATE,
+                "validated directory caa copy failed");
+        }
+        i = i + 1;
+    }
+    result.caa_identities = storage.caa_items;
+    result.caa_identity_len = caa_len;
+    result.external_account_required = external_required;
+    @output = result;
+    ret problem.none();
+}
+
+fun value_matches(value: view.View, expected: str) bool {
+    var i: usize = 0;
+    for (i < value.len) {
+        if (expected[i] == 0 || value.data[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret expected[value.len] == 0;
+}
+
+fun parse_problem(response: Response, configured: Limits, scratch: *u8,
+    scratch_capacity: usize, storage: ProblemStorage) problem.Error {
+    var fallback: problem.Error = problem.http(response.status, response.body,
+        response.retry_after_seconds);
+    if (response.body.data == nil || response.body.len == 0) { ret fallback; }
+    if (response.body.len > configured.max_problem_bytes || storage.data == nil) {
+        fallback.kind = problem.LIMIT;
+        fallback.code = problem.OUTPUT_TOO_SMALL;
+        fallback.detail = "acme problem exceeds configured storage";
+        ret fallback;
+    }
+    var usable_scratch: usize = scratch_capacity;
+    if (usable_scratch > configured.max_json_scratch) {
+        usable_scratch = configured.max_json_scratch;
+    }
+    var subproblem_bytes: usize = 0;
+    if (!memory_range.size(storage.subproblem_capacity,
+            $size_of(problem.Subproblem), ?subproblem_bytes) ||
+        !memory_range.valid(scratch, usable_scratch) ||
+        !memory_range.valid(storage.data, storage.capacity) ||
+        !memory_range.valid(storage.subproblems::*u8, subproblem_bytes) ||
+        memory_range.overlap(scratch, usable_scratch, storage.data,
+            storage.capacity) ||
+        memory_range.overlap(scratch, usable_scratch,
+            storage.subproblems::*u8, subproblem_bytes) ||
+        memory_range.overlap(storage.data, storage.capacity,
+            storage.subproblems::*u8, subproblem_bytes) ||
+        response_overlaps(response, scratch, usable_scratch) ||
+        response_overlaps(response, storage.data, storage.capacity) ||
+        response_overlaps(response, storage.subproblems::*u8,
+            subproblem_bytes)) {
+        fallback.kind = problem.PROTOCOL;
+        fallback.code = problem.INVALID_INPUT;
+        fallback.detail = "acme problem buffers overlap or have invalid ranges";
+        ret fallback;
+    }
+    val document: json.Document = json.parse(response.body, scratch,
+        usable_scratch, json_limits(configured, configured.max_problem_bytes));
+    if (!document.valid) {
+        fallback.kind = problem.PROTOCOL;
+        fallback.code = document.error.code;
+        fallback.detail = document.error.detail;
+        ret fallback;
+    }
+    var root: J.Value = document.root;
+    if (root.kind != J.OBJECT) {
+        fallback.kind = problem.PROTOCOL;
+        fallback.code = problem.MALFORMED_JSON;
+        fallback.detail = "acme problem is not an object";
+        ret fallback;
+    }
+    val typ: *J.Value = json.find(?root, "type");
+    val title: *J.Value = json.find(?root, "title");
+    val detail: *J.Value = json.find(?root, "detail");
+    val instance: *J.Value = json.find(?root, "instance");
+    val problem_status: *J.Value = json.find(?root, "status");
+    val subproblems: *J.Value = json.find(?root, "subproblems");
+    if (typ == nil || typ.kind != J.STRING ||
+        (title != nil && title.kind != J.STRING) ||
+        (detail != nil && detail.kind != J.STRING) ||
+        (instance != nil && instance.kind != J.STRING) ||
+        (subproblems != nil && subproblems.kind != J.ARRAY)) {
+        fallback.kind = problem.PROTOCOL;
+        fallback.code = problem.MALFORMED_JSON;
+        fallback.detail = "acme problem fields have invalid types";
+        ret fallback;
+    }
+    var required: usize = 0;
+    if (!add_size(?required, typ, configured.max_problem_bytes) ||
+        !add_size(?required, title, configured.max_problem_bytes) ||
+        !add_size(?required, detail, configured.max_problem_bytes) ||
+        !add_size(?required, instance, configured.max_problem_bytes)) {
+        fallback.kind = problem.LIMIT;
+        fallback.code = problem.OUTPUT_TOO_SMALL;
+        fallback.detail = "acme problem fields exceed configured limits";
+        ret fallback;
+    }
+    var subproblem_len: usize = 0;
+    if (subproblems != nil) { subproblem_len = J.value_count(subproblems); }
+    if (subproblem_len > configured.max_problem_subproblems ||
+        subproblem_len > storage.subproblem_capacity ||
+        (subproblem_len != 0 && storage.subproblems == nil)) {
+        fallback.kind = problem.LIMIT;
+        fallback.code = problem.OUTPUT_TOO_SMALL;
+        fallback.detail = "acme subproblem storage is too small";
+        ret fallback;
+    }
+    var i: usize = 0;
+    for (i < subproblem_len) {
+        val item: *J.Value = J.value_get(subproblems, i);
+        if (item == nil || item.kind != J.OBJECT) {
+            fallback.kind = problem.PROTOCOL;
+            fallback.code = problem.MALFORMED_JSON;
+            fallback.detail = "acme subproblem is not an object";
+            ret fallback;
+        }
+        val item_type: *J.Value = json.find(item, "type");
+        val item_detail: *J.Value = json.find(item, "detail");
+        val item_identifier: *J.Value = json.find(item, "identifier");
+        if (item_type == nil || item_type.kind != J.STRING ||
+            (item_detail != nil && item_detail.kind != J.STRING) ||
+            (item_identifier != nil && item_identifier.kind != J.OBJECT)) {
+            fallback.kind = problem.PROTOCOL;
+            fallback.code = problem.MALFORMED_JSON;
+            fallback.detail = "acme subproblem fields have invalid types";
+            ret fallback;
+        }
+        var identifier_type: *J.Value = nil;
+        var identifier_value: *J.Value = nil;
+        if (item_identifier != nil) {
+            identifier_type = json.find(item_identifier, "type");
+            identifier_value = json.find(item_identifier, "value");
+            if (identifier_type == nil || identifier_type.kind != J.STRING ||
+                identifier_value == nil || identifier_value.kind != J.STRING) {
+                fallback.kind = problem.PROTOCOL;
+                fallback.code = problem.MALFORMED_JSON;
+                fallback.detail = "acme subproblem identifier is invalid";
+                ret fallback;
+            }
+        }
+        if (!add_size(?required, item_type, configured.max_problem_bytes) ||
+            !add_size(?required, item_detail, configured.max_problem_bytes) ||
+            !add_size(?required, identifier_type, configured.max_problem_bytes) ||
+            !add_size(?required, identifier_value, configured.max_problem_bytes)) {
+            fallback.kind = problem.LIMIT;
+            fallback.code = problem.OUTPUT_TOO_SMALL;
+            fallback.detail = "acme subproblem fields exceed configured limits";
+            ret fallback;
+        }
+        i = i + 1;
+    }
+    if (required > storage.capacity) {
+        fallback.kind = problem.LIMIT;
+        fallback.code = problem.OUTPUT_TOO_SMALL;
+        fallback.detail = "acme problem storage is too small";
+        ret fallback;
+    }
+    var parsed_status: u16 = 0;
+    if (problem_status != nil) {
+        if (problem_status.kind != J.NUMBER || J.value_is_float(problem_status) ||
+            J.value_number(problem_status) < 100 || J.value_number(problem_status) > 599) {
+            fallback.kind = problem.PROTOCOL;
+            fallback.code = problem.MALFORMED_JSON;
+            fallback.detail = "acme problem status is invalid";
+            ret fallback;
+        }
+        parsed_status = J.value_number(problem_status)::u16;
+    }
+    var value: problem.Problem;
+    var cursor: Cursor = Cursor{data: storage.data, cap: storage.capacity, pos: 0};
+    if (!copy_string(?cursor, typ, ?value.typ) ||
+        !copy_string(?cursor, title, ?value.title) ||
+        !copy_string(?cursor, detail, ?value.detail) ||
+        !copy_string(?cursor, instance, ?value.instance)) {
+        fallback.kind = problem.STATE;
+        fallback.code = problem.INVALID_STATE;
+        fallback.detail = "validated acme problem copy failed";
+        ret fallback;
+    }
+    value.status = parsed_status;
+    i = 0;
+    for (i < subproblem_len) {
+        val item: *J.Value = J.value_get(subproblems, i);
+        val item_identifier: *J.Value = json.find(item, "identifier");
+        var parsed: problem.Subproblem = problem.Subproblem{
+            typ: view.view(nil, 0), detail: view.view(nil, 0),
+            identifier: problem.ProblemIdentifier{
+                typ: view.view(nil, 0), value: view.view(nil, 0)},
+        };
+        if (!copy_string(?cursor, json.find(item, "type"), ?parsed.typ) ||
+            !copy_string(?cursor, json.find(item, "detail"), ?parsed.detail) ||
+            (item_identifier != nil &&
+                (!copy_string(?cursor, json.find(item_identifier, "type"),
+                    ?parsed.identifier.typ) ||
+                !copy_string(?cursor, json.find(item_identifier, "value"),
+                    ?parsed.identifier.value)))) {
+            fallback.kind = problem.STATE;
+            fallback.code = problem.INVALID_STATE;
+            fallback.detail = "validated acme subproblem copy failed";
+            ret fallback;
+        }
+        storage.subproblems[i] = parsed;
+        i = i + 1;
+    }
+    value.subproblems = nil;
+    if (subproblem_len != 0) { value.subproblems = storage.subproblems; }
+    value.subproblem_len = subproblem_len;
+    ret problem.acme(value, response.status, response.body,
+        response.retry_after_seconds,
+        value_matches(value.typ, "urn:ietf:params:acme:error:badNonce"));
+}
+
+fun replay_nonce(response: Response, configured: Limits,
+    output: *view.View) problem.Error {
+    if (output == nil || response.fields == nil ||
+        !field.validate(response.fields, configured.response_fields, false)) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "http response fields are invalid");
+    }
+    var found: *field.Field = nil;
+    var i: usize = 0;
+    val name: view.View = view.view("Replay-Nonce", 12);
+    for (i < response.fields.len) {
+        if (field.name_equal(response.fields.items[i].name, name)) {
+            if (found != nil) {
+                @output = view.view(nil, 0);
+                ret problem.none();
+            }
+            found = ?response.fields.items[i];
+        }
+        i = i + 1;
+    }
+    if (found == nil) {
+        @output = view.view(nil, 0);
+        ret problem.none();
+    }
+    if (found.value.len == 0 || found.value.len > configured.max_nonce_bytes || found.value.data == nil ||
+        !replay_nonce_bytes(found.value.data, found.value.len)) {
+        @output = view.view(nil, 0);
+        ret problem.none();
+    }
+    @output = found.value;
+    ret problem.none();
+}
+
+fun store_response_nonce(client: *Client, response: Response,
+    request: *SignedRequest, stored: *bool) problem.Error {
+    var value: view.View;
+    val parsed: problem.Error = replay_nonce(response, client.limits,
+        ?value);
+    if (problem.failed(parsed)) { ret parsed; }
+    @stored = false;
+    if (value.len != 0) {
+        val put: problem.Error = pool_put(client, request, value);
+        if (problem.failed(put)) {
+            if (put.code == problem.DUPLICATE_NONCE ||
+                put.code == problem.NONCE_STORAGE_FULL) {
+                ret problem.none();
+            }
+            ret put;
+        }
+        @stored = true;
+    }
+    ret problem.none();
+}
+
+fun bind_response_nonce(client: *Client, request: *SignedRequest,
+    response: Response, required: bool, bound: *bool) problem.Error {
+    var value: view.View;
+    val parsed: problem.Error = replay_nonce(response, client.limits, ?value);
+    if (problem.failed(parsed)) { ret parsed; }
+    @bound = false;
+    if (value.len == 0) {
+        if (required) {
+            ret problem.local_code(problem.NONCE, problem.MISSING_NONCE,
+                "acme response did not provide a replay nonce");
+        }
+        wipe_retry_nonce(request);
+        ret problem.none();
+    }
+    val reserved: problem.Error = reserve_retry_nonce(request, value,
+        client.limits.max_nonce_bytes);
+    if (problem.failed(reserved)) { ret reserved; }
+    @bound = true;
+    ret problem.none();
+}
+
+fun invalid_wire(detail: str) WireRequest {
+    ret WireRequest{error: problem.local_code(problem.PROTOCOL,
+        problem.INVALID_INPUT, detail), method: method.from_kind(0),
+        url: view.view(nil, 0), content_type: view.view(nil, 0),
+        body: view.view(nil, 0), timeout_ns: 0, max_response_bytes: 0,
+        response_fields: field.Limits{},
+        replay_safe: false};
+}
+
+pub fun discovery_request(directory_url: view.View,
+    configured: Limits) WireRequest {
+    if (!limits_valid(configured) ||
+        !memory_range.valid(directory_url.data, directory_url.len) ||
+        directory_url.len == 0 || directory_url.len > configured.max_url_bytes ||
+        !https_bytes(directory_url.data, directory_url.len)) {
+        ret invalid_wire("invalid directory url or request policy");
+    }
+    ret WireRequest{error: problem.none(),
+        method: method.from_kind(method.GET), url: directory_url,
+        content_type: view.view(DIRECTORY_CONTENT_TYPE, 16),
+        body: view.view(nil, 0), timeout_ns: configured.request_timeout_ns,
+        max_response_bytes: configured.max_response_bytes,
+        response_fields: configured.response_fields, replay_safe: true};
+}
+
+pub fun nonce_request(client: *Client, directory: Directory) WireRequest {
+    if (client == nil || !memory_range.valid(client::*u8, $size_of(Client)) ||
+        !client.initialized || callback_reentrant(client) ||
+        !memory_range.valid(directory.new_nonce_url.data,
+            directory.new_nonce_url.len) ||
+        directory.new_nonce_url.len == 0 ||
+        directory.new_nonce_url.len > client.limits.max_url_bytes ||
+        !https_bytes(directory.new_nonce_url.data, directory.new_nonce_url.len)) {
+        ret invalid_wire("invalid nonce url or client state");
+    }
+    ret WireRequest{error: problem.none(),
+        method: method.from_kind(method.HEAD), url: directory.new_nonce_url,
+        content_type: view.view(nil, 0), body: view.view(nil, 0),
+        timeout_ns: client.limits.request_timeout_ns,
+        max_response_bytes: client.limits.max_response_bytes,
+        response_fields: client.limits.response_fields,
+        replay_safe: true};
+}
+
+pub fun begin_signed(client: *Client, request: *SignedRequest,
+    spec: SignedSpec) problem.Error {
+    if (client == nil || request == nil ||
+        !memory_range.valid(client::*u8, $size_of(Client)) ||
+        !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
+        !nonce.descriptor_valid(client.nonces) ||
+        memory_range.overlap(request::*u8, $size_of(SignedRequest),
+            client::*u8, $size_of(Client)) ||
+        memory_range.overlap(request::*u8, $size_of(SignedRequest),
+            spec.url.data, spec.url.len) ||
+        memory_range.overlap(request::*u8, $size_of(SignedRequest),
+            spec.payload.data, spec.payload.len) ||
+        memory_range.overlap(request::*u8, $size_of(SignedRequest),
+            spec.kid.data, spec.kid.len) ||
+        !memory_range.valid(spec.url.data, spec.url.len) ||
+        !memory_range.valid(spec.payload.data, spec.payload.len) ||
+        !memory_range.valid(spec.kid.data, spec.kid.len) ||
+        !client.initialized || callback_reentrant(client) ||
+        (request.state != REQUEST_EMPTY && request.state != REQUEST_COMPLETE &&
+            request.state != REQUEST_FAILED) ||
+        spec.url.data == nil ||
+        spec.url.len == 0 || spec.url.len > client.limits.max_url_bytes ||
+        !https_bytes(spec.url.data, spec.url.len) ||
+        spec.payload.len > client.limits.max_request_bytes ||
+        (spec.payload.len != 0 && spec.payload.data == nil) ||
+        (spec.use_jwk && spec.kid.len != 0) ||
+        (!spec.use_jwk && (spec.kid.data == nil || spec.kid.len == 0 ||
+            spec.kid.len > client.limits.max_url_bytes ||
+            !https_bytes(spec.kid.data, spec.kid.len)))) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "invalid signed request specification");
+    }
+    var url_digest: [32]u8;
+    var payload_digest: [32]u8;
+    var kid_digest: [32]u8;
+    if (!digest(spec.url.data, spec.url.len, ?url_digest[0]) ||
+        !digest(spec.payload.data, spec.payload.len, ?payload_digest[0]) ||
+        !digest(spec.kid.data, spec.kid.len, ?kid_digest[0])) {
+        ret problem.local_code(problem.STATE, problem.INVALID_STATE,
+            "signed request binding could not be initialized");
+    }
+    request.spec = spec;
+    request.wire_body = view.view(nil, 0);
+    request.client_owner = client::ptr;
+    request.client_generation = client.generation;
+    request.state = REQUEST_READY;
+    request.attempts = 0;
+    request.bad_nonce_retries = 0;
+    wipe_retry_nonce(request);
+    var i: usize = 0;
+    for (i < 32) {
+        request.url_digest[i] = url_digest[i];
+        request.payload_digest[i] = payload_digest[i];
+        request.kid_digest[i] = kid_digest[i];
+        i = i + 1;
+    }
+    ret problem.none();
+}
+
+pub fun prepare_signed(client: *Client, request: *SignedRequest,
+    signer: jose.Signer, private_key: jose.PrivateKey, entropy: jose.Entropy,
+    work: contracts.Buffer, output: contracts.Buffer) jose.Operation {
+    if (client == nil || request == nil ||
+        !memory_range.valid(client::*u8, $size_of(Client)) ||
+        !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
+        !client.initialized || callback_reentrant(client) ||
+        request.client_owner != client::ptr ||
+        request.client_generation != client.generation ||
+        !spec_intact(request) ||
+        (request.state != REQUEST_READY && request.state != REQUEST_RETRY) ||
+        request.attempts == 18446744073709551615 ||
+        (request.state == REQUEST_RETRY &&
+            (!request.retry_nonce_ready || request.retry_nonce_len == 0 ||
+                request.retry_nonce_len > client.limits.max_nonce_bytes ||
+                !replay_nonce_bytes(?request.retry_nonce[0],
+                    request.retry_nonce_len)))) {
+        ret jose.Operation{error: problem.local_code(problem.STATE,
+            problem.INVALID_STATE, "signed request is not ready"), written: 0};
+    }
+    var bounded_output: contracts.Buffer = output;
+    if (bounded_output.capacity > client.limits.max_request_bytes) {
+        bounded_output.capacity = client.limits.max_request_bytes;
+    }
+    if (!memory_range.valid(work.data, work.capacity) ||
+        !memory_range.valid(bounded_output.data, bounded_output.capacity) ||
+        !nonce.descriptor_valid(client.nonces) ||
+        memory_range.overlap(work.data, work.capacity,
+            bounded_output.data, bounded_output.capacity) ||
+        memory_range.overlap(work.data, work.capacity, client::*u8,
+            $size_of(Client)) ||
+        memory_range.overlap(work.data, work.capacity, request::*u8,
+            $size_of(SignedRequest)) ||
+        memory_range.overlap(bounded_output.data, bounded_output.capacity,
+            client::*u8, $size_of(Client)) ||
+        memory_range.overlap(bounded_output.data, bounded_output.capacity,
+            request::*u8, $size_of(SignedRequest))) {
+        ret jose.Operation{error: problem.local_code(problem.PROTOCOL,
+            problem.INVALID_INPUT, "signed request buffers overlap state"), written: 0};
+    }
+    if (jose.signing_inputs_overlap(signer, private_key,
+            request::*u8, $size_of(SignedRequest)) ||
+        jose.signing_inputs_overlap(signer, private_key,
+            client::*u8, $size_of(Client))) {
+        ret jose.Operation{error: problem.local_code(problem.PROTOCOL,
+            problem.INVALID_INPUT, "signing inputs alias protocol state"), written: 0};
+    }
+    val pool_storage: problem.Error = pool_prepare_disjoint(client, request,
+        signer, private_key, work, bounded_output);
+    if (problem.failed(pool_storage)) {
+        if (pool_storage.code == problem.INVALID_STATE) {
+            terminalize(request);
+        }
+        ret jose.Operation{error: pool_storage, written: 0};
+    }
+    var guarded_entropy: jose.Entropy = entropy;
+    var entropy_guard: EntropyGuard;
+    var entropy_guarded: bool = false;
+    if (signer.algorithm == jose.PS256 && jose.entropy_valid(entropy) &&
+        entropy.available) {
+        if (!callback_begin(client)) {
+            ret jose.Operation{error: callback_error(
+                "entropy ownership callback is reentrant"), written: 0};
+        }
+        val client_before: Client = @client;
+        val request_before: SignedRequest = @request;
+        val owned: bool =
+            jose.entropy_owns(entropy, client::*u8, $size_of(Client)) ||
+            jose.entropy_owns(entropy, request::*u8, $size_of(SignedRequest)) ||
+            jose.entropy_owns(entropy, request.spec.url.data,
+                request.spec.url.len) ||
+            jose.entropy_owns(entropy, request.spec.payload.data,
+                request.spec.payload.len) ||
+            jose.entropy_owns(entropy, request.spec.kid.data,
+                request.spec.kid.len) ||
+            jose.entropy_owns(entropy, work.data, work.capacity) ||
+            jose.entropy_owns(entropy, bounded_output.data,
+                bounded_output.capacity);
+        val callback_intact: bool = callback_end(client, client_before,
+            request, request_before);
+        if (!callback_intact) {
+            terminalize(request);
+            ret jose.Operation{error: problem.local_code(problem.SIGNING,
+                problem.INVALID_INPUT,
+                "entropy provider mutated protocol storage"), written: 0};
+        }
+        if (owned) {
+            ret jose.Operation{error: problem.local_code(problem.SIGNING,
+                problem.INVALID_INPUT,
+                "entropy provider aliases or mutated protocol storage"),
+                written: 0};
+        }
+        entropy_guard = EntropyGuard{source_validate: entropy.validate,
+            source_ctx: entropy.validation_ctx, client: client,
+            request: request};
+        guarded_entropy.validation_ctx = (?entropy_guard)::ptr;
+        guarded_entropy.validate = guarded_entropy_validate;
+        entropy_guarded = true;
+    }
+    request.wire_body = view.view(nil, 0);
+    var nonce_bytes: [512]u8;
+    var nonce_len: usize = 0;
+    var reservation_token: u64 = 0;
+    val reservation_pool: nonce.Pool = client.nonces;
+    val retrying: bool = request.state == REQUEST_RETRY;
+    if (retrying) {
+        nonce_len = request.retry_nonce_len;
+        var i: usize = 0;
+        for (i < nonce_len) {
+            nonce_bytes[i] = request.retry_nonce[i];
+            i = i + 1;
+        }
+    } or {
+        val reserved: nonce.Reservation = pool_reserve(client, request,
+            ?nonce_bytes[0], client.limits.max_nonce_bytes);
+        if (problem.failed(reserved.error)) {
+            terminalize(request);
+            ret jose.Operation{error: reserved.error, written: 0};
+        }
+        if (!reserved.found) {
+            request.state = REQUEST_NEEDS_NONCE;
+            ret jose.Operation{error: problem.local_code(problem.NONCE,
+                problem.MISSING_NONCE, "no replay nonce is available"), written: 0};
+        }
+        nonce_len = reserved.value.len;
+        reservation_token = reserved.token;
+    }
+    if (!spec_intact(request)) {
+        var i: usize = 0;
+        for (i < nonce_len) {
+            nonce_bytes[i] = 0;
+            i = i + 1;
+        }
+        if (reservation_token != 0) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+        }
+        terminalize(request);
+        ret jose.Operation{error: problem.local_code(problem.STATE,
+            problem.INVALID_STATE, "signed request inputs changed"), written: 0};
+    }
+    var output_before: [32]u8;
+    if (!digest(bounded_output.data, bounded_output.capacity,
+            ?output_before[0])) {
+        if (reservation_token != 0) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+        }
+        terminalize(request);
+        ret jose.Operation{error: problem.local_code(problem.STATE,
+            problem.INVALID_STATE, "signed output binding failed"), written: 0};
+    }
+    if (entropy_guarded) {
+        if (!callback_begin(client)) {
+            if (reservation_token != 0) {
+                pool_finish(client, request, reservation_pool,
+                    reservation_token, false);
+            }
+            terminalize(request);
+            ret jose.Operation{error: callback_error(
+                "entropy callback is reentrant"), written: 0};
+        }
+        entropy_guard.client_before = @client;
+        entropy_guard.request_before = @request;
+    }
+    val result: jose.Operation = jose.encode_jws(signer, private_key,
+        guarded_entropy,
+        jose.Protected{nonce: view.view(?nonce_bytes[0], nonce_len),
+            url: request.spec.url,
+            kid: request.spec.kid, use_jwk: request.spec.use_jwk,
+            include_nonce: true},
+        request.spec.payload, work, bounded_output);
+    var entropy_intact: bool = true;
+    if (entropy_guarded) {
+        entropy_intact = callback_end(client, entropy_guard.client_before,
+            request, entropy_guard.request_before);
+    }
+    var i: usize = 0;
+    for (i < nonce_len) {
+        nonce_bytes[i] = 0;
+        i = i + 1;
+    }
+    if (!entropy_intact) {
+        if (reservation_token != 0) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+        }
+        wipe_bytes(bounded_output.data, bounded_output.capacity);
+        terminalize(request);
+        ret jose.Operation{error: problem.local_code(problem.STATE,
+            problem.INVALID_STATE, "entropy callback mutated protocol state"),
+            written: 0};
+    }
+    if (!spec_intact(request)) {
+        if (reservation_token != 0) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+        }
+        if (!problem.failed(result.error)) {
+            wipe_bytes(output.data, result.written);
+        }
+        terminalize(request);
+        ret jose.Operation{error: problem.local_code(problem.STATE,
+            problem.INVALID_STATE, "signed request inputs changed during signing"),
+            written: 0};
+    }
+    if (problem.failed(result.error)) {
+        if (!retrying) {
+            val released: problem.Error = pool_finish(client, request,
+                reservation_pool, reservation_token, false);
+            if (problem.failed(released)) {
+                wipe_bytes(bounded_output.data, bounded_output.capacity);
+                terminalize(request);
+                ret jose.Operation{error: released, written: 0};
+            }
+            request.state = REQUEST_READY;
+        }
+        if (!digest_same(view.view(bounded_output.data,
+                bounded_output.capacity), ?output_before[0])) {
+            wipe_bytes(bounded_output.data, bounded_output.capacity);
+            terminalize(request);
+            ret jose.Operation{error: callback_error(
+                "signing callback changed unpublished output"), written: 0};
+        }
+        ret result;
+    }
+    if (!retrying) {
+        var body_digest: [32]u8;
+        if (!digest(output.data, result.written, ?body_digest[0])) {
+            pool_finish(client, request, reservation_pool,
+                reservation_token, false);
+            wipe_bytes(output.data, result.written);
+            terminalize(request);
+            ret jose.Operation{error: callback_error(
+                "signed body binding failed"), written: 0};
+        }
+        val committed: problem.Error = pool_finish(client, request,
+            reservation_pool, reservation_token, true);
+        if (problem.failed(committed) ||
+            !digest_same(view.view(output.data, result.written),
+                ?body_digest[0])) {
+            wipe_bytes(output.data, result.written);
+            terminalize(request);
+            if (problem.failed(committed)) {
+                ret jose.Operation{error: committed, written: 0};
+            }
+            ret jose.Operation{error: callback_error(
+                "nonce commit changed the signed body"), written: 0};
+        }
+    }
+    if (retrying) { wipe_retry_nonce(request); }
+    request.attempts = request.attempts + 1;
+    request.wire_body = view.view(output.data, result.written);
+    request.state = REQUEST_AWAITING;
+    ret result;
+}
+
+pub fun signed_wire(client: *Client, request: *SignedRequest) WireRequest {
+    if (client == nil || request == nil ||
+        !memory_range.valid(client::*u8, $size_of(Client)) ||
+        !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
+        !client.initialized || callback_reentrant(client) ||
+        request.client_owner != client::ptr ||
+        request.client_generation != client.generation ||
+        request.state != REQUEST_AWAITING || request.wire_body.data == nil ||
+        request.wire_body.len == 0 ||
+        !memory_range.valid(request.wire_body.data, request.wire_body.len) ||
+        !memory_range.valid(request.spec.url.data, request.spec.url.len) ||
+        !spec_intact(request) ||
+        request.wire_body.len > client.limits.max_request_bytes) {
+        ret invalid_wire("signed request is not ready for transport");
+    }
+    ret WireRequest{error: problem.none(),
+        method: method.from_kind(method.POST), url: request.spec.url,
+        content_type: view.view(JWS_CONTENT_TYPE, 21), body: request.wire_body,
+        timeout_ns: client.limits.request_timeout_ns,
+        max_response_bytes: client.limits.max_response_bytes,
+        response_fields: client.limits.response_fields,
+        replay_safe: false};
+}
+
+fun response_shape(response: Response, configured: Limits) problem.Error {
+    if (!memory_range.valid(response.body.data, response.body.len)) {
+        var cause: problem.Error = problem.http(response.status,
+            view.view(nil, 0), response.retry_after_seconds);
+        cause.kind = problem.PROTOCOL;
+        cause.code = problem.INVALID_INPUT;
+        cause.detail = "http response body view is invalid";
+        ret cause;
+    }
+    if (response.body.len > configured.max_response_bytes) {
+        var cause: problem.Error = problem.http(response.status,
+            view.view(nil, 0), response.retry_after_seconds);
+        cause.kind = problem.LIMIT;
+        cause.code = problem.OUTPUT_TOO_SMALL;
+        cause.detail = "http response body exceeds configured limits";
+        ret cause;
+    }
+    if (!fields_ranges_valid(response.fields) ||
+        !field.validate(response.fields, configured.response_fields, false)) {
+        var cause: problem.Error = problem.http(response.status,
+            response.body, response.retry_after_seconds);
+        cause.kind = problem.PROTOCOL;
+        cause.code = problem.INVALID_INPUT;
+        cause.detail = "http response fields violate configured limits";
+        ret cause;
+    }
+    ret problem.none();
+}
+
+pub fun accept_signed_response(client: *Client, request: *SignedRequest,
+    response: Response, scratch: *u8, scratch_capacity: usize,
+    storage: ProblemStorage) Decision {
+    if (client == nil || request == nil ||
+        !memory_range.valid(client::*u8, $size_of(Client)) ||
+        !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
+        !client.initialized || callback_reentrant(client) ||
+        request.client_owner != client::ptr ||
+        request.client_generation != client.generation ||
+        request.state != REQUEST_AWAITING || request.wire_body.data == nil ||
+        request.wire_body.len == 0 || !status.is_final(response.status)) {
+        val error: problem.Error = problem.local_code(problem.STATE,
+            problem.INVALID_STATE, "signed response is invalid for request state");
+        ret Decision{action: ACTION_FAILED, cause: error};
+    }
+    if (!spec_intact(request)) {
+        val error: problem.Error = problem.local_code(problem.STATE,
+            problem.INVALID_STATE, "signed request inputs changed before response");
+        terminalize(request);
+        ret Decision{action: ACTION_FAILED, cause: error};
+    }
+    val shaped: problem.Error = response_shape(response, client.limits);
+    if (problem.failed(shaped)) {
+        terminalize(request);
+        ret Decision{action: ACTION_FAILED, cause: shaped};
+    }
+    if (!nonce.descriptor_valid(client.nonces) ||
+        response_overlaps(response, request::*u8, $size_of(SignedRequest)) ||
+        response_overlaps(response, client::*u8, $size_of(Client))) {
+        val error: problem.Error = problem.local_code(problem.PROTOCOL,
+            problem.INVALID_INPUT, "response aliases signed request state");
+        terminalize(request);
+        ret Decision{action: ACTION_FAILED, cause: error};
+    }
+    if (response.status >= 200 && response.status < 300) {
+        var stored: bool = false;
+        val nonce_status: problem.Error = store_response_nonce(client, response,
+            request, ?stored);
+        if (problem.failed(nonce_status)) {
+            terminalize(request);
+            ret Decision{action: ACTION_FAILED, cause: nonce_status};
+        }
+        request.wire_body = view.view(nil, 0);
+        request.state = REQUEST_COMPLETE;
+        wipe_retry_nonce(request);
+        ret Decision{action: ACTION_COMPLETE, cause: problem.none()};
+    }
+    var subproblem_bytes: usize = 0;
+    if (!memory_range.size(storage.subproblem_capacity,
+            $size_of(problem.Subproblem), ?subproblem_bytes) ||
+        memory_range.overlap(scratch, scratch_capacity, request::*u8,
+            $size_of(SignedRequest)) ||
+        memory_range.overlap(storage.data, storage.capacity, request::*u8,
+            $size_of(SignedRequest)) ||
+        memory_range.overlap(storage.subproblems::*u8, subproblem_bytes,
+            request::*u8, $size_of(SignedRequest)) ||
+        memory_range.overlap(scratch, scratch_capacity, client::*u8,
+            $size_of(Client)) ||
+        memory_range.overlap(storage.data, storage.capacity, client::*u8,
+            $size_of(Client)) ||
+        memory_range.overlap(storage.subproblems::*u8, subproblem_bytes,
+            client::*u8, $size_of(Client))) {
+        val error: problem.Error = problem.local_code(problem.PROTOCOL,
+            problem.INVALID_INPUT, "problem buffers alias protocol state");
+        terminalize(request);
+        ret Decision{action: ACTION_FAILED, cause: error};
+    }
+    val cause: problem.Error = parse_problem(response, client.limits, scratch,
+        scratch_capacity, storage);
+    if (cause.code == problem.BAD_NONCE) {
+        val cleared: problem.Error = pool_clear(client, request);
+        if (problem.failed(cleared)) {
+            terminalize(request);
+            ret Decision{action: ACTION_FAILED, cause: cleared};
+        }
+        request.wire_body = view.view(nil, 0);
+        wipe_retry_nonce(request);
+        if (request.bad_nonce_retries >= client.limits.max_bad_nonce_retries) {
+            terminalize(request);
+            var limited: problem.Error = cause;
+            limited.kind = problem.POLICY;
+            limited.code = problem.RETRY_LIMIT;
+            limited.detail = "badNonce retry limit reached";
+            limited.retryable = false;
+            ret Decision{action: ACTION_FAILED, cause: limited};
+        }
+        var bound: bool = false;
+        val nonce_status: problem.Error = bind_response_nonce(client, request,
+            response, false, ?bound);
+        if (problem.failed(nonce_status)) {
+            terminalize(request);
+            ret Decision{action: ACTION_FAILED, cause: nonce_status};
+        }
+        request.bad_nonce_retries = request.bad_nonce_retries + 1;
+        if (bound) {
+            request.state = REQUEST_RETRY;
+            ret Decision{action: ACTION_RETRY_SIGNED, cause: cause};
+        }
+        request.state = REQUEST_NEEDS_NONCE;
+        ret Decision{action: ACTION_ACQUIRE_NONCE, cause: cause};
+    }
+    var stored: bool = false;
+    val nonce_status: problem.Error = store_response_nonce(client, response,
+        request, ?stored);
+    if (problem.failed(nonce_status)) {
+        terminalize(request);
+        ret Decision{action: ACTION_FAILED, cause: nonce_status};
+    }
+    terminalize(request);
+    ret Decision{action: ACTION_FAILED, cause: cause};
+}
+
+pub fun accept_nonce_response(client: *Client, request: *SignedRequest,
+    response: Response) problem.Error {
+    if (client == nil || request == nil ||
+        !memory_range.valid(client::*u8, $size_of(Client)) ||
+        !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
+        !client.initialized || callback_reentrant(client) ||
+        request.client_owner != client::ptr ||
+        request.client_generation != client.generation ||
+        request.state != REQUEST_NEEDS_NONCE || !status.is_final(response.status)) {
+        ret problem.local_code(problem.STATE, problem.INVALID_STATE,
+            "nonce response is invalid for request state");
+    }
+    if (!spec_intact(request)) {
+        terminalize(request);
+        ret problem.local_code(problem.STATE, problem.INVALID_STATE,
+            "signed request inputs changed before nonce response");
+    }
+    val shaped: problem.Error = response_shape(response, client.limits);
+    if (problem.failed(shaped)) {
+        request.state = REQUEST_FAILED;
+        wipe_retry_nonce(request);
+        ret shaped;
+    }
+    if (!nonce.descriptor_valid(client.nonces) ||
+        response_overlaps(response, request::*u8, $size_of(SignedRequest)) ||
+        response_overlaps(response, client::*u8, $size_of(Client))) {
+        terminalize(request);
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "nonce response aliases signed request state");
+    }
+    if (response.status != status.OK && response.status != status.NO_CONTENT) {
+        request.state = REQUEST_FAILED;
+        wipe_retry_nonce(request);
+        ret problem.http(response.status, response.body,
+            response.retry_after_seconds);
+    }
+    var bound: bool = false;
+    val result: problem.Error = bind_response_nonce(client, request, response,
+        true, ?bound);
+    if (problem.failed(result)) {
+        request.state = REQUEST_FAILED;
+        wipe_retry_nonce(request);
+        ret result;
+    }
+    request.state = REQUEST_RETRY;
+    ret problem.none();
 }

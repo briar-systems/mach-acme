@@ -1,0 +1,2009 @@
+use crypto.contracts;
+use crypto.group.p256;
+use crypto.signature;
+use http.core.field;
+use http.core.method;
+use http.core.status;
+use std.runtime;
+use std.sync.atomic;
+use std.sync.thread;
+use J: std.data.json;
+use std.encoding.base64;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+use acme.client;
+use acme.jose;
+use acme.json;
+use acme.memory_range;
+use acme.nonce;
+use acme.problem;
+
+fun equal(first: *u8, second: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun filled(data: *u8, value: u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (data[i] != value) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun fill(data: *u8, value: u8, len: usize) {
+    var i: usize = 0;
+    for (i < len) {
+        data[i] = value;
+        i = i + 1;
+    }
+}
+
+fun copy(data: *u8, source: *u8, len: usize) {
+    var i: usize = 0;
+    for (i < len) {
+        data[i] = source[i];
+        i = i + 1;
+    }
+}
+
+fun length(text: *u8) usize {
+    var len: usize = 0;
+    for (text[len] != 0) { len = len + 1; }
+    ret len;
+}
+
+fun deterministic_entropy(ctx: ptr, output: contracts.SecretBuffer) contracts.Error {
+    if (output.data == nil || output.capacity < 32) { ret contracts.INVALID_INPUT; }
+    var i: usize = 0;
+    for (i < 32) {
+        output.data[i] = i::u8;
+        i = i + 1;
+    }
+    ret contracts.OK;
+}
+
+fun unavailable_entropy(ctx: ptr, output: contracts.SecretBuffer) contracts.Error {
+    ret contracts.ENTROPY_UNAVAILABLE;
+}
+
+fun entropy_aliases_nothing(ctx: ptr, data: *u8, len: usize) bool {
+    ret false;
+}
+
+fun entropy_aliases_no_secret(ctx: ptr, data: *^u8, len: usize) bool {
+    ret false;
+}
+
+fun entropy_still_valid(ctx: ptr) bool {
+    ret true;
+}
+
+fun entropy_invalid_after(ctx: ptr) bool {
+    ret false;
+}
+
+rec SecretAliasProbe {
+    private_queried: bool;
+}
+
+fun entropy_aliases_private(ctx: ptr, data: *^u8, len: usize) bool {
+    val probe: *SecretAliasProbe = ctx::*SecretAliasProbe;
+    if (len == 256) {
+        probe.private_queried = true;
+        ret true;
+    }
+    ret false;
+}
+
+rec HostileEntropy {
+    owned:     *u8;
+    owned_len: usize;
+    mutate:    *u8;
+}
+
+fun hostile_entropy_aliases(ctx: ptr, data: *u8, len: usize) bool {
+    val hostile: *HostileEntropy = ctx::*HostileEntropy;
+    ret memory_range.overlap(data, len, hostile.owned, hostile.owned_len);
+}
+
+fun hostile_entropy_fill(ctx: ptr,
+    output: contracts.SecretBuffer) contracts.Error {
+    val hostile: *HostileEntropy = ctx::*HostileEntropy;
+    if (output.data == nil || output.capacity < 32) {
+        ret contracts.INVALID_INPUT;
+    }
+    var i: usize = 0;
+    for (i < 32) {
+        output.data[i] = i::u8;
+        i = i + 1;
+    }
+    if (hostile.mutate != nil) {
+        hostile.mutate[0] = hostile.mutate[0] ^ 1;
+    }
+    ret contracts.OK;
+}
+
+fun set_private(output: *^u8) {
+    val value: [32]u8 = [32]u8{
+        0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16,
+        0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6, 0x93,
+        0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12,
+        0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f, 0x67, 0x21
+    };
+    var i: usize = 0;
+    for (i < 32) {
+        output[i] = value[i];
+        i = i + 1;
+    }
+}
+
+fun es_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
+    private_bytes: *^u8, public_bytes: *u8) bool {
+    set_private(private_bytes);
+    val secret: contracts.SecretBytes = contracts.SecretBytes{data: private_bytes, len: 32};
+    val derived: contracts.Operation = p256.derive_public(secret,
+        contracts.Buffer{data: public_bytes, capacity: 65});
+    if (derived.error != contracts.OK) { ret false; }
+    @public_key = jose.PublicKey{algorithm: jose.ES256,
+        value: contracts.Bytes{data: public_bytes, len: 65}};
+    @private_key = jose.PrivateKey{algorithm: jose.ES256,
+        secret_owner: public_bytes::ptr, value: secret};
+    ret true;
+}
+
+fun empty_fields(fields: *field.Fields) {
+    @fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+}
+
+fun response(code: u16, fields: *field.Fields, body: view.View) client.Response {
+    ret client.Response{status: code, fields: fields, body: body,
+        retry_after_seconds: 0};
+}
+
+fun awaiting(protocol: *client.Client, request: *client.SignedRequest) {
+    request.state = client.REQUEST_EMPTY;
+    client.begin_signed(protocol, request, client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31),
+        use_jwk: false});
+    request.wire_body = view.view("prepared", 8);
+    request.state = client.REQUEST_AWAITING;
+}
+
+rec AcceptContext {
+    protocol: *client.Client;
+    request:  *client.SignedRequest;
+    fields:   *field.Fields;
+    result:   *i64;
+}
+
+fun accept_worker(arg: *u8) {
+    val context: *AcceptContext = arg::*AcceptContext;
+    val decision: client.Decision = client.accept_signed_response(
+        context.protocol, context.request,
+        response(status.OK, context.fields, view.view(nil, 0)), nil, 0,
+        client.ProblemStorage{data: nil, capacity: 0,
+            subproblems: nil, subproblem_capacity: 0});
+    if (decision.action == client.ACTION_COMPLETE) {
+        atomic.store(context.result, 1);
+    } or { atomic.store(context.result, -1); }
+}
+
+val HOSTILE_NORMAL:        u8 = 0;
+val HOSTILE_OVERSIZED:     u8 = 1;
+val HOSTILE_FOREIGN:       u8 = 2;
+val HOSTILE_TAKE_REQUEST:  u8 = 3;
+val HOSTILE_TAKE_CLIENT:   u8 = 4;
+val HOSTILE_PUT_REQUEST:   u8 = 5;
+val HOSTILE_CLEAR_REQUEST: u8 = 6;
+val HOSTILE_PUT_FAIL:      u8 = 7;
+val HOSTILE_COMMIT_FAIL:   u8 = 8;
+val HOSTILE_RELEASE_FAIL:  u8 = 9;
+val HOSTILE_REENTER:       u8 = 10;
+
+rec HostilePool {
+    mode:     u8;
+    protocol: *client.Client;
+    request:  *client.SignedRequest;
+    owned:    *u8;
+    owned_len: usize;
+    secret_owner: ptr;
+    commit_count: usize;
+    release_count: usize;
+    reentered: bool;
+}
+
+fun hostile_ready(ctx: ptr) bool {
+    ret ctx::*HostilePool != nil;
+}
+
+fun hostile_aliases(ctx: ptr, data: *u8, len: usize) bool {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    ret memory_range.overlap(data, len, hostile.owned, hostile.owned_len);
+}
+
+fun hostile_reserve(ctx: ptr, output: *u8,
+    capacity: usize) nonce.Reservation {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    if (hostile.mode == HOSTILE_REENTER && hostile.protocol != nil) {
+        hostile.reentered = client.release(hostile.protocol);
+    }
+    if (hostile.mode == HOSTILE_TAKE_REQUEST && hostile.request != nil) {
+        hostile.request.state = client.REQUEST_EMPTY;
+    }
+    if (hostile.mode == HOSTILE_TAKE_CLIENT && hostile.protocol != nil) {
+        hostile.protocol.nonces.reserve = nil;
+    }
+    if (hostile.mode == HOSTILE_OVERSIZED) {
+        ret nonce.Reservation{error: problem.none(), found: true, token: 1,
+            value: view.view(output, capacity + 1)};
+    }
+    if (hostile.mode == HOSTILE_FOREIGN) {
+        ret nonce.Reservation{error: problem.none(), found: true, token: 1,
+            value: view.view("foreign_nonce", 13)};
+    }
+    if (output == nil || capacity < 12) {
+        ret nonce.Reservation{error: problem.local_code(problem.LIMIT,
+            problem.OUTPUT_TOO_SMALL, "hostile test output is small"),
+            found: false, token: 0, value: view.view(nil, 0)};
+    }
+    copy(output, "custom_nonce", 12);
+    ret nonce.Reservation{error: problem.none(), found: true, token: 1,
+        value: view.view(output, 12)};
+}
+
+fun hostile_commit(ctx: ptr, token: u64) problem.Error {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    hostile.commit_count = hostile.commit_count + 1;
+    if (token != 1) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_INPUT,
+            "hostile test token is invalid");
+    }
+    if (hostile.mode == HOSTILE_COMMIT_FAIL) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "hostile commit failed");
+    }
+    ret problem.none();
+}
+
+fun hostile_release(ctx: ptr, token: u64) problem.Error {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    hostile.release_count = hostile.release_count + 1;
+    if (token != 1 || hostile.mode == HOSTILE_RELEASE_FAIL) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "hostile release failed");
+    }
+    ret problem.none();
+}
+
+fun hostile_owns_secret(ctx: ptr, owner: ptr) bool {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    ret owner != nil && owner == hostile.secret_owner;
+}
+
+fun hostile_put(ctx: ptr, value: view.View) problem.Error {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    if (hostile.mode == HOSTILE_PUT_REQUEST && hostile.request != nil) {
+        hostile.request.state = client.REQUEST_EMPTY;
+    }
+    if (hostile.mode == HOSTILE_PUT_FAIL) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "hostile put failed");
+    }
+    ret problem.none();
+}
+
+fun hostile_clear(ctx: ptr) problem.Error {
+    val hostile: *HostilePool = ctx::*HostilePool;
+    if (hostile.mode == HOSTILE_CLEAR_REQUEST && hostile.request != nil) {
+        hostile.request.state = client.REQUEST_EMPTY;
+    }
+    ret problem.none();
+}
+
+fun hostile_pool(context: *HostilePool) nonce.Pool {
+    ret nonce.Pool{ctx: context::ptr, reserve: hostile_reserve,
+        commit: hostile_commit, release: hostile_release, put: hostile_put,
+        clear: hostile_clear, ready: hostile_ready, aliases: hostile_aliases,
+        owns_secret: hostile_owns_secret,
+        max_nonce_bytes: 64, capacity: 4};
+}
+
+test "jose: rfc 7638 rsa jwk and sha-256 thumbprint are exact" {
+    val modulus_text: *u8 = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw";
+    var modulus: [256]u8;
+    var exponent: [3]u8;
+    if (base64.decode(modulus_text, length(modulus_text), ?modulus[0], 256) != 256 ||
+        base64.decode("AQAB", 4, ?exponent[0], 3) != 3) { ret 1; }
+    val public_key: jose.PublicKey = jose.PublicKey{algorithm: jose.PS256,
+        rsa: signature.RsaPublicKey{
+            modulus: contracts.Bytes{data: ?modulus[0], len: 256},
+            exponent: contracts.Bytes{data: ?exponent[0], len: 3}}};
+    var jwk: [512]u8;
+    val encoded: jose.Operation = jose.key_encode_jwk(public_key,
+        contracts.Buffer{data: ?jwk[0], capacity: 512});
+    val prefix: *u8 = "{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"";
+    if (problem.failed(encoded.error) || encoded.written != 373 ||
+        !equal(?jwk[0], prefix, length(prefix)) ||
+        !equal(?jwk[length(prefix)], modulus_text, length(modulus_text)) ||
+        jwk[encoded.written - 2] != '"' || jwk[encoded.written - 1] != '}') { ret 2; }
+    var thumbprint: [43]u8;
+    val thumb: jose.Operation = jose.key_thumbprint(public_key,
+        contracts.Buffer{data: ?thumbprint[0], capacity: 43});
+    if (problem.failed(thumb.error) || thumb.written != 43 ||
+        !equal(?thumbprint[0], "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs", 43)) { ret 3; }
+    ret 0;
+}
+
+test "jose: rfc 8555 protected fields are canonical and output is transactional" {
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0], ?public_bytes[0])) { ret 1; }
+    val signer: jose.Signer = jose.signer(public_key);
+    val protected: jose.Protected = jose.Protected{
+        nonce: view.view("Q_s3MWoqT05TrdkM2MTDcw", 22),
+        url: view.view("https://example.com/acme/chall/prV_B7yEyA4", 42),
+        kid: view.view("https://example.com/acme/acct/evOfKhNU60wg", 42),
+        use_jwk: false, include_nonce: true};
+    var work: [2048]u8;
+    var output: [512]u8;
+    var forged: jose.Signer = signer;
+    forged.algorithm = jose.PS256;
+    fill(?output[0], 0xa5, 512);
+    val rejected_signer: jose.Operation = jose.encode_jws(forged, private_key,
+        jose.no_entropy(), protected, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (rejected_signer.error.code != problem.INVALID_INPUT ||
+        !filled(?output[0], 0xa5, 512)) { ret 2; }
+    fill(?output[0], 0xa5, 512);
+    val too_small: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.no_entropy(), protected, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 8});
+    if (too_small.error.code != problem.OUTPUT_TOO_SMALL ||
+        !filled(?output[0], 0xa5, 512)) { ret 3; }
+    fill(?work[0], 0x6d, 2048);
+    val overlap: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.no_entropy(), protected, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 512},
+        contracts.Buffer{data: ?work[0], capacity: 512});
+    if (overlap.error.code != problem.INVALID_INPUT ||
+        !filled(?work[0], 0x6d, 2048)) { ret 4; }
+    fill(?output[0], 0xa5, 512);
+    var invalid_nonce: jose.Protected = protected;
+    invalid_nonce.nonce = view.view("bad+nonce", 9);
+    val rejected_nonce: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.no_entropy(), invalid_nonce, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (rejected_nonce.error.code != problem.INVALID_INPUT ||
+        !filled(?output[0], 0xa5, 512)) { ret 5; }
+    val encoded: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.no_entropy(), protected, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    val expected: *u8 = "{\"protected\":\"eyJhbGciOiJFUzI1NiIsImtpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vYWNtZS9hY2N0L2V2T2ZLaE5VNjB3ZyIsIm5vbmNlIjoiUV9zM01Xb3FUMDVUcmRrTTJNVERjdyIsInVybCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vYWNtZS9jaGFsbC9wclZfQjd5RXlBNCJ9\",\"payload\":\"e30\",\"signature\":\"";
+    if (problem.failed(encoded.error)) { ret 6; }
+    if (encoded.written != length(expected) + 88) { ret 7; }
+    if (!equal(?output[0], expected, length(expected))) { ret 8; }
+    if (output[encoded.written - 2] != '"' || output[encoded.written - 1] != '}') { ret 9; }
+    var i: usize = length(expected);
+    for (i < encoded.written - 2) {
+        val byte: u8 = output[i];
+        if (!((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_')) { ret 10; }
+        i = i + 1;
+    }
+    val nested: jose.Protected = jose.Protected{
+        nonce: view.view(nil, 0),
+        url: view.view("https://example.com/acme/key-change", 35),
+        kid: view.view(nil, 0), use_jwk: true, include_nonce: false};
+    val nested_encoded: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.no_entropy(), nested, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(nested_encoded.error) || nested_encoded.written == 0) { ret 11; }
+    ret 0;
+}
+
+test "jose and json: hostile aliases and overflowing views fail before mutation" {
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 1; }
+    val signer: jose.Signer = jose.signer(public_key);
+    val protected: jose.Protected = jose.Protected{
+        nonce: view.view("hostile_nonce", 13),
+        url: view.view("https://example.com/acme/order", 30),
+        kid: view.view("https://example.com/acme/acct/1", 31),
+        use_jwk: false, include_nonce: true};
+    var work: [2048]u8;
+    var output: [512]u8;
+    fill(?work[0], 0x6d, 2048);
+    fill(?output[0], 0xa5, 512);
+    work[0] = '{';
+    work[1] = '}';
+    val payload_work: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.no_entropy(), protected, view.view(?work[0], 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (payload_work.error.code != problem.INVALID_INPUT ||
+        work[0] != '{' || work[1] != '}' || work[2] != 0x6d ||
+        !filled(?output[0], 0xa5, 512)) { ret 2; }
+
+    fill(?output[0], 0xa5, 512);
+    output[0] = '{';
+    output[1] = '}';
+    val payload_output: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.no_entropy(), protected, view.view(?output[0], 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (payload_output.error.code != problem.INVALID_INPUT ||
+        output[0] != '{' || output[1] != '}' || output[2] != 0xa5) { ret 3; }
+
+    var nonce_work: jose.Protected = protected;
+    nonce_work.nonce = view.view(?work[32], 13);
+    copy(?work[32], "hostile_nonce", 13);
+    val protected_alias: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.no_entropy(), nonce_work, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (protected_alias.error.code != problem.INVALID_INPUT ||
+        !equal(?work[32], "hostile_nonce", 13)) { ret 4; }
+
+    val public_first: u8 = public_bytes[0];
+    val key_output: jose.Operation = jose.key_encode_jwk(public_key,
+        contracts.Buffer{data: ?public_bytes[0], capacity: 65});
+    val thumb_output: jose.Operation = jose.key_thumbprint(public_key,
+        contracts.Buffer{data: ?public_bytes[1], capacity: 43});
+    if (key_output.error.code != problem.INVALID_INPUT ||
+        thumb_output.error.code != problem.INVALID_INPUT ||
+        public_bytes[0] != public_first) { ret 5; }
+
+    var message: [64]u8;
+    fill(?message[0], 0x72, 64);
+    val signing_alias: jose.Operation = jose.key_sign(private_key,
+        jose.no_entropy(), contracts.Bytes{data: ?message[0], len: 32},
+        contracts.Buffer{data: ?message[16], capacity: 48});
+    if (signing_alias.error.code != problem.INVALID_INPUT ||
+        !filled(?message[0], 0x72, 64)) { ret 6; }
+
+    val near_end: *u8 = 0xfffffffffffffff0::*u8;
+    fill(?output[0], 0xa5, 512);
+    val overflowing: jose.Operation = jose.key_sign(private_key,
+        jose.no_entropy(), contracts.Bytes{data: near_end, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 64});
+    if (overflowing.error.code != problem.INVALID_INPUT ||
+        !filled(?output[0], 0xa5, 512)) { ret 7; }
+
+    var json_bytes: [2]u8 = [2]u8{'{', '}'};
+    val json_limits: json.Limits = json.Limits{max_bytes: 64,
+        max_depth: 4, max_values: 8, max_key_bytes: 16,
+        max_key_comparisons: 32};
+    val json_alias: json.Document = json.parse(
+        view.view(?json_bytes[0], 2), ?json_bytes[0], 2, json_limits);
+    if (json_alias.valid || json_alias.error.code != problem.INVALID_INPUT ||
+        json_bytes[0] != '{' || json_bytes[1] != '}') { ret 8; }
+    val json_overflow: json.Document = json.parse(view.view(near_end, 32),
+        ?work[0], 2048, json_limits);
+    if (json_overflow.valid ||
+        json_overflow.error.code != problem.INVALID_INPUT) { ret 9; }
+    ret 0;
+}
+
+test "json: numeric grammar, key lookup, and duplicate work fail closed" {
+    var scratch: [8192]u8;
+    val configured: json.Limits = json.Limits{max_bytes: 256,
+        max_depth: 4, max_values: 16, max_key_bytes: 16,
+        max_key_comparisons: 32};
+    val leading: *u8 = "{\"n\":01}";
+    val positive_overflow: *u8 = "{\"n\":9223372036854775808}";
+    val negative_overflow: *u8 = "{\"n\":-9223372036854775808}";
+    val leading_result: json.Document = json.parse(
+        view.view(leading, length(leading)), ?scratch[0], 8192, configured);
+    val positive_result: json.Document = json.parse(
+        view.view(positive_overflow, length(positive_overflow)),
+        ?scratch[0], 8192, configured);
+    val negative_result: json.Document = json.parse(
+        view.view(negative_overflow, length(negative_overflow)),
+        ?scratch[0], 8192, configured);
+    if (leading_result.valid || leading_result.error.code != problem.MALFORMED_JSON ||
+        positive_result.valid || positive_result.error.kind != problem.LIMIT ||
+        negative_result.valid || negative_result.error.kind != problem.LIMIT) {
+        ret 1;
+    }
+    val valid_text: *u8 = "{\"n\":9223372036854775807,\"f\":1.5e+2}";
+    val valid: json.Document = json.parse(view.view(valid_text,
+        length(valid_text)), ?scratch[0], 8192, configured);
+    var root: J.Value = valid.root;
+    val number: *J.Value = json.find(?root, "n");
+    if (!valid.valid || number == nil || json.find(nil, "n") != nil ||
+        json.find(number, "n") != nil || json.find(?root, nil) != nil) { ret 2; }
+
+    var hostile: [32768]u8;
+    var pos: usize = 0;
+    hostile[pos] = '{';
+    pos = pos + 1;
+    val digits: *u8 = "0123456789abcdef";
+    var i: usize = 0;
+    for (i < 4095) {
+        if (i != 0) {
+            hostile[pos] = ',';
+            pos = pos + 1;
+        }
+        hostile[pos] = '"';
+        hostile[pos + 1] = digits[(i >> 8) & 15];
+        hostile[pos + 2] = digits[(i >> 4) & 15];
+        hostile[pos + 3] = digits[i & 15];
+        hostile[pos + 4] = '"';
+        hostile[pos + 5] = ':';
+        hostile[pos + 6] = '0';
+        pos = pos + 7;
+        i = i + 1;
+    }
+    hostile[pos] = '}';
+    pos = pos + 1;
+    var large_scratch: [2097152]u8;
+    val bounded: json.Document = json.parse(view.view(?hostile[0], pos),
+        ?large_scratch[0], 2097152, json.Limits{max_bytes: 32768,
+            max_depth: 2, max_values: 4096, max_key_bytes: 3,
+            max_key_comparisons: 64});
+    if (bounded.valid || bounded.error.kind != problem.LIMIT ||
+        bounded.error.code != problem.MALFORMED_JSON) { ret 3; }
+    ret 0;
+}
+
+test "jose: rfc 8032 ed25519 account signing vector is exact" {
+    var seed: [32]^u8 = [32]^u8{
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60,
+        0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+        0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19,
+        0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60
+    };
+    val public_key_bytes: [32]u8 = [32]u8{
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+        0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+        0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+        0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a
+    };
+    val expected: [64]u8 = [64]u8{
+        0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72,
+        0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e, 0x82, 0x8a,
+        0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74,
+        0xd8, 0x73, 0xe0, 0x65, 0x22, 0x49, 0x01, 0x55,
+        0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac,
+        0xc6, 0x1e, 0x39, 0x70, 0x1c, 0xf9, 0xb4, 0x6b,
+        0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24,
+        0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x0b
+    };
+    val public_key: jose.PublicKey = jose.PublicKey{algorithm: jose.EDDSA,
+        value: contracts.Bytes{data: (?public_key_bytes[0]):~*u8, len: 32}};
+    val private_key: jose.PrivateKey = jose.PrivateKey{algorithm: jose.EDDSA,
+        secret_owner: ((?public_key_bytes[0]):~*u8)::ptr,
+        value: contracts.SecretBytes{data: ?seed[0], len: 32}};
+    var jwk: [80]u8;
+    val encoded: jose.Operation = jose.key_encode_jwk(public_key,
+        contracts.Buffer{data: ?jwk[0], capacity: 80});
+    val expected_jwk: *u8 =
+        "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}";
+    if (problem.failed(encoded.error) || encoded.written != 79 ||
+        !equal(?jwk[0], expected_jwk, 79)) { ret 1; }
+    var output: [64]u8;
+    val signed: jose.Operation = jose.key_sign(private_key,
+        jose.no_entropy(), contracts.Bytes{data: nil, len: 0},
+        contracts.Buffer{data: ?output[0], capacity: 64});
+    if (problem.failed(signed.error) || signed.written != 64 ||
+        !equal(?output[0], (?expected[0]):~*u8, 64)) { ret 2; }
+    ret 0;
+}
+
+test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures" {
+    val modulus_text: *u8 = "p_teNxO8by2eprJiu3ngRFferEuSKek_LmzyJCkogfOvJaUhm7J_SNN3xzaNNHpDvwsnw1sucOIckxzOySA-fqApVBCRo6R4zQ45x_hThuOcqKLMs4Pv4NngoOq-lbu4To76FfOFwgdrqqKPoOopivLyo-CmvmrcEvT21uBl_MKNeJw_LdqkVE6YyHmnBdESgcGSamwFKwBeF5UAZrr3mDD7HTNFR6OO5HBNokQdOWZ_U_PFoZGhrYp36JhvnNAewm1MDaItjskRlOWaE3mRmcscE855_ttHe_T_St-0LxH5Ik0Urtio0HY58zUT0MiZKVKluFQvlKo9fm_Nor5esQ";
+    val private_text: *u8 = "eTcvHD0dE50cY23fSAUBQpkTfu6uBeKYAr8kMv0AQqF1qvknOaVZGMHt3zxVDVb2As8FXe6gfab1kyCNctT61hKzv_pHHfgMs8cUvTy5LfQIJZYLl7WGcW0Qr6Ai8CmcmlzSEOmbzhC6d5mWpqd3N2P9c3G2mBYyCtdVWh3TeoKHcutpJXAdfkWfc-aLeOuF46OMY-HdBYkL3uG77bgkdXbfgrhzDNMRWxRyUxOD_RRQ6UvzHy0Xb3KnN971VZFWydjrH_Hz-aj5T7Kmfu8h-dDMc_DonPEzhJ4SyO5vITdm_llR2MJJf8NhsXl4lQqKm1deNI2x04m6Kr6nzBaB";
+    var modulus: [256]u8;
+    var exponent: [3]u8;
+    var private_public: [256]u8;
+    var private_bytes: [256]^u8;
+    if (base64.decode(modulus_text, length(modulus_text), ?modulus[0], 256) != 256 ||
+        base64.decode("AQAB", 4, ?exponent[0], 3) != 3 ||
+        base64.decode(private_text, length(private_text), ?private_public[1], 255) != 255) {
+        ret 1;
+    }
+    private_public[0] = 0;
+    var i: usize = 0;
+    for (i < 256) {
+        private_bytes[i] = private_public[i];
+        i = i + 1;
+    }
+    fill(?private_public[0], 0, 256);
+    val rsa_public: signature.RsaPublicKey = signature.RsaPublicKey{
+        modulus: contracts.Bytes{data: ?modulus[0], len: 256},
+        exponent: contracts.Bytes{data: ?exponent[0], len: 3}};
+    val rsa_private: signature.RsaPrivateKey = signature.RsaPrivateKey{
+        modulus: contracts.Bytes{data: ?modulus[0], len: 256},
+        public_exponent: contracts.Bytes{data: ?exponent[0], len: 3},
+        private_exponent: contracts.SecretBytes{data: ?private_bytes[0], len: 256}};
+    val key: jose.PrivateKey = jose.PrivateKey{algorithm: jose.PS256,
+        secret_owner: (?modulus[0])::ptr, rsa: rsa_private};
+    var output: [256]u8;
+    var message_bytes: [32]u8;
+    copy(?message_bytes[0], "mach-acme openssl rsa-pss vector", 32);
+    val message: *u8 = ?message_bytes[0];
+    val signed: jose.Operation = jose.key_sign(key,
+        jose.entropy_provider(nil, deterministic_entropy, entropy_aliases_nothing,
+            entropy_aliases_no_secret, entropy_still_valid),
+        contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (problem.failed(signed.error)) { ret 20; }
+    if (signed.written != 256) { ret 21; }
+    if (signature.verify_rsa_pss_sha256(rsa_public,
+            contracts.Bytes{data: message, len: 32},
+            contracts.Bytes{data: ?output[0], len: 256}) != contracts.OK) { ret 22; }
+    var probe: SecretAliasProbe;
+    val owned_private: jose.Operation = jose.key_sign(key,
+        jose.entropy_provider((?probe)::ptr, deterministic_entropy,
+            entropy_aliases_nothing, entropy_aliases_private,
+            entropy_still_valid), contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (owned_private.error.code != problem.INVALID_INPUT ||
+        owned_private.written != 0 || !probe.private_queried) { ret 23; }
+    fill(?output[0], 0xa5, 256);
+    val unavailable: jose.Operation = jose.key_sign(key,
+        jose.entropy_provider(nil, unavailable_entropy, entropy_aliases_nothing,
+            entropy_aliases_no_secret, entropy_still_valid),
+        contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (unavailable.error.code != problem.ENTROPY_UNAVAILABLE || unavailable.written != 0 ||
+        !filled(?output[0], 0xa5, 256)) { ret 3; }
+    val missing: jose.Operation = jose.key_sign(key,
+        jose.Entropy{ctx: nil, fill: nil, available: true},
+        contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (missing.error.code != problem.ENTROPY_UNAVAILABLE || missing.written != 0 ||
+        !filled(?output[0], 0xa5, 256)) { ret 4; }
+    var hostile: HostileEntropy;
+    hostile.owned = message;
+    hostile.owned_len = 32;
+    val owned: jose.Operation = jose.key_sign(key,
+        jose.entropy_provider((?hostile)::ptr, hostile_entropy_fill,
+            hostile_entropy_aliases, entropy_aliases_no_secret,
+            entropy_still_valid),
+        contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (owned.error.code != problem.INVALID_INPUT || owned.written != 0 ||
+        !filled(?output[0], 0xa5, 256)) { ret 5; }
+    hostile.owned = nil;
+    hostile.owned_len = 0;
+    hostile.mutate = message;
+    val mutated: jose.Operation = jose.key_sign(key,
+        jose.entropy_provider((?hostile)::ptr, hostile_entropy_fill,
+            hostile_entropy_aliases, entropy_aliases_no_secret,
+            entropy_still_valid),
+        contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (mutated.error.code != problem.INVALID_INPUT || mutated.written != 0 ||
+        message[0] == 'm' || !filled(?output[0], 0xa5, 256)) { ret 6; }
+    message[0] = 'm';
+    val invalidated: jose.Operation = jose.key_sign(key,
+        jose.entropy_provider(nil, deterministic_entropy,
+            entropy_aliases_nothing, entropy_aliases_no_secret,
+            entropy_invalid_after),
+        contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (invalidated.error.code != problem.INVALID_INPUT ||
+        invalidated.written != 0 || !filled(?output[0], 0xa5, 256)) { ret 7; }
+    val modulus_first: u8 = modulus[0];
+    hostile.mutate = ?modulus[0];
+    val key_mutated: jose.Operation = jose.key_sign(key,
+        jose.entropy_provider((?hostile)::ptr, hostile_entropy_fill,
+            hostile_entropy_aliases, entropy_aliases_no_secret,
+            entropy_still_valid),
+        contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (key_mutated.error.code != problem.INVALID_INPUT ||
+        key_mutated.written != 0 || modulus[0] == modulus_first ||
+        !filled(?output[0], 0xa5, 256)) { ret 8; }
+    modulus[0] = modulus_first;
+    ret 0;
+}
+
+test "client: wire requests bind exact body and transport policy" {
+    var configured: client.Limits = client.limits_default();
+    configured.request_timeout_ns = 123456789;
+    val directory_url: view.View = view.view("https://example.com/acme/directory", 34);
+    val discovery: client.WireRequest = client.discovery_request(directory_url,
+        configured);
+    if (problem.failed(discovery.error) || discovery.method.kind != method.GET ||
+        discovery.url.data != directory_url.data || discovery.url.len != 34 ||
+        discovery.timeout_ns != configured.request_timeout_ns ||
+        discovery.max_response_bytes != configured.max_response_bytes ||
+        !discovery.replay_safe) { ret 1; }
+    val fragment: *u8 = "https://example.com/acme/directory#fragment";
+    if (client.discovery_request(view.view(fragment, length(fragment)),
+        configured).error.code != problem.INVALID_INPUT) { ret 2; }
+    val spaced: *u8 = "https://exa mple.com/acme/directory";
+    if (client.discovery_request(view.view(spaced, length(spaced)),
+        configured).error.code != problem.INVALID_INPUT) { ret 3; }
+    val escaped: *u8 = "https://example.com/acme/%zz";
+    if (client.discovery_request(view.view(escaped, length(escaped)),
+        configured).error.code != problem.INVALID_INPUT) { ret 4; }
+
+    var slots: [1]nonce.Slot;
+    var nonce_storage: [64]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1,
+        ?nonce_storage[0], 64, 64))) { ret 5; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, configured))) { ret 6; }
+    var directory: client.Directory;
+    directory.new_nonce_url = view.view("https://example.com/acme/nonce", 30);
+    val nonce_wire: client.WireRequest = client.nonce_request(?protocol, directory);
+    if (problem.failed(nonce_wire.error) || nonce_wire.method.kind != method.HEAD ||
+        nonce_wire.timeout_ns != configured.request_timeout_ns ||
+        nonce_wire.max_response_bytes != configured.max_response_bytes ||
+        !nonce_wire.replay_safe) { ret 7; }
+
+    var request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?request, client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31), use_jwk: false})) ||
+        problem.failed(pool.put(pool.ctx,
+            view.view("wire_nonce", 10)))) { ret 8; }
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 9; }
+    var work: [2048]u8;
+    var output: [512]u8;
+    val signed: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    val wire: client.WireRequest = client.signed_wire(?protocol, ?request);
+    if (problem.failed(signed.error) || problem.failed(wire.error) ||
+        wire.method.kind != method.POST || wire.body.data != ?output[0] ||
+        wire.body.len != signed.written || wire.timeout_ns != configured.request_timeout_ns ||
+        wire.max_response_bytes != configured.max_response_bytes || wire.replay_safe) { ret 10; }
+
+    var small_slots: [1]nonce.Slot;
+    var small_nonce_storage: [64]u8;
+    var small_memory: nonce.Memory;
+    var small_configured: client.Limits = configured;
+    small_configured.max_request_bytes = 512;
+    if (problem.failed(nonce.init_memory(?small_memory, ?small_slots[0], 1,
+        ?small_nonce_storage[0], 64, 64))) { ret 11; }
+    var small_pool: nonce.Pool = nonce.pool(?small_memory);
+    var small_protocol: client.Client;
+    var small_request: client.SignedRequest;
+    if (problem.failed(client.init(?small_protocol, ?small_pool, small_configured)) ||
+        problem.failed(small_pool.put(small_pool.ctx, view.view("small_nonce", 11))) ||
+        problem.failed(client.begin_signed(?small_protocol, ?small_request,
+            request.spec))) { ret 12; }
+    fill(?output[0], 0xa5, 512);
+    val limited: jose.Operation = client.prepare_signed(?small_protocol,
+        ?small_request, jose.signer(public_key), private_key,
+        jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 1});
+    if (limited.error.code != problem.OUTPUT_TOO_SMALL || limited.written != 0 ||
+        small_request.state != client.REQUEST_READY ||
+        !filled(?output[0], 0xa5, 512) ||
+        !problem.failed(client.signed_wire(?small_protocol,
+            ?small_request).error)) { ret 13; }
+    val resumed: jose.Operation = client.prepare_signed(?small_protocol,
+        ?small_request, jose.signer(public_key), private_key,
+        jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(resumed.error) ||
+        small_request.state != client.REQUEST_AWAITING) { ret 14; }
+    ret 0;
+}
+
+test "client: https scheme matching is ascii case insensitive" {
+    val configured: client.Limits = client.limits_default();
+    val mixed_url: view.View = view.view(
+        "HtTpS://example.com/acme/directory", 34);
+    if (problem.failed(client.discovery_request(mixed_url,
+        configured).error)) { ret 1; }
+
+    val body: *u8 = "{\"newNonce\":\"HTTPS://a.example/nonce\",\"newAccount\":\"hTtPs://a.example/account\",\"newOrder\":\"HtTpS://a.example/order\"}";
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var scratch: [8192]u8;
+    var text: [512]u8;
+    var caa: [1]view.View;
+    var directory: client.Directory;
+    val parsed: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(body, length(body))), configured,
+        ?scratch[0], 8192, client.DirectoryStorage{data: ?text[0], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (problem.failed(parsed) || directory.new_nonce_url.len != 23 ||
+        !equal(directory.new_nonce_url.data, "HTTPS://a.example/nonce", 23)) { ret 2; }
+
+    var slots: [1]nonce.Slot;
+    var nonce_storage: [64]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1,
+        ?nonce_storage[0], 64, 64))) { ret 3; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, configured)) ||
+        problem.failed(client.nonce_request(?protocol, directory).error)) { ret 4; }
+    var request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?request,
+        client.SignedSpec{url: view.view("HTTPS://a.example/order", 23),
+            payload: view.view("{}", 2),
+            kid: view.view("hTtPs://a.example/account", 25),
+            use_jwk: false}))) { ret 5; }
+    ret 0;
+}
+
+test "client: mutable state and parser aliases fail transactionally" {
+    val configured: client.Limits = client.limits_default();
+    var fields: field.Fields;
+    empty_fields(?fields);
+    val body: *u8 = "{\"newNonce\":\"https://a.example/nonce\",\"newAccount\":\"https://a.example/account\",\"newOrder\":\"https://a.example/order\"}";
+    var shared: [8192]u8;
+    var caa: [1]view.View;
+    var directory: client.Directory;
+    directory.new_nonce_url = view.view("sentinel", 8);
+    fill(?shared[0], 0x5a, 8192);
+    val scratch_storage: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(body, length(body))), configured,
+        ?shared[0], 8192, client.DirectoryStorage{data: ?shared[128], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (scratch_storage.code != problem.INVALID_DIRECTORY ||
+        directory.new_nonce_url.len != 8 || !filled(?shared[0], 0x5a, 8192)) { ret 1; }
+
+    var response_storage: [512]u8;
+    fill(?response_storage[0], 0x6b, 512);
+    copy(?response_storage[0], body, length(body));
+    var scratch: [8192]u8;
+    val body_storage: problem.Error = client.parse_directory(
+        response(status.OK, ?fields,
+            view.view(?response_storage[0], length(body))), configured,
+        ?scratch[0], 8192, client.DirectoryStorage{data: ?response_storage[0],
+            capacity: 512, caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (body_storage.code != problem.INVALID_DIRECTORY ||
+        !equal(?response_storage[0], body, length(body)) ||
+        directory.new_nonce_url.len != 8) { ret 2; }
+
+    var item: [1]field.Field;
+    var aliased_fields: field.Fields = field.init(?item[0], 1,
+        field.limits(1, 128, 32, 64));
+    fill(?response_storage[0], 'v', 512);
+    if (field.append(?aliased_fields, field.Field{name: view.view("X-Test", 6),
+        value: view.view(?response_storage[0], 8), sensitive: false}) !=
+        field.ADD_OK) { ret 3; }
+    val field_storage: problem.Error = client.parse_directory(
+        response(status.OK, ?aliased_fields, view.view(body, length(body))),
+        configured, ?scratch[0], 8192,
+        client.DirectoryStorage{data: ?response_storage[0], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (field_storage.code != problem.INVALID_DIRECTORY ||
+        !filled(?response_storage[0], 'v', 512) ||
+        directory.new_nonce_url.len != 8) { ret 4; }
+
+    val near_end: *u8 = 0xfffffffffffffff0::*u8;
+    val overflow: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(body, length(body))), configured,
+        near_end, 32, client.DirectoryStorage{data: ?response_storage[0],
+            capacity: 512, caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (overflow.code != problem.INVALID_DIRECTORY ||
+        directory.new_nonce_url.len != 8) { ret 5; }
+
+    var forged_fields: field.Fields;
+    empty_fields(?forged_fields);
+    forged_fields.items = near_end::*field.Field;
+    forged_fields.capacity = 2;
+    val invalid_fields: problem.Error = client.parse_directory(
+        response(status.BAD_GATEWAY, ?forged_fields, view.view(nil, 0)),
+        configured, ?scratch[0], 8192,
+        client.DirectoryStorage{data: ?response_storage[0], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (invalid_fields.code != problem.INVALID_INPUT ||
+        directory.new_nonce_url.len != 8) { ret 6; }
+
+    var slots: [2]nonce.Slot;
+    var nonce_storage: [128]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 2,
+        ?nonce_storage[0], 128, 64))) { ret 7; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, configured))) { ret 8; }
+
+    var colliding_client: client.Client;
+    if (client.init(?colliding_client,
+        (?colliding_client)::*nonce.Pool, configured).code !=
+        problem.INVALID_INPUT) { ret 9; }
+
+    var begin_alias: client.SignedRequest;
+    begin_alias.state = client.REQUEST_EMPTY;
+    copy(?begin_alias.retry_nonce[0], "https://a.example/order", 23);
+    val rejected_begin: problem.Error = client.begin_signed(?protocol,
+        ?begin_alias, client.SignedSpec{
+            url: view.view(?begin_alias.retry_nonce[0], 23),
+            payload: view.view("{}", 2),
+            kid: view.view("https://a.example/account", 25), use_jwk: false});
+    if (rejected_begin.code != problem.INVALID_INPUT ||
+        !equal(?begin_alias.retry_nonce[0], "https://a.example/order", 23)) { ret 10; }
+
+    var request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?request,
+        client.SignedSpec{url: view.view("https://a.example/order", 23),
+            payload: view.view("{}", 2),
+            kid: view.view("https://a.example/account", 25), use_jwk: false})) ||
+        problem.failed(pool.put(pool.ctx, view.view("preserved_nonce", 15)))) { ret 11; }
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 12; }
+    var work: [2048]u8;
+    val rejected_prepare: jose.Operation = client.prepare_signed(?protocol,
+        ?request, jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: (?request)::*u8,
+            capacity: $size_of(client.SignedRequest)});
+    var nonce_output: [64]u8;
+    val retained: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
+    if (rejected_prepare.error.code != problem.INVALID_INPUT ||
+        request.state != client.REQUEST_READY || problem.failed(retained.error) ||
+        !retained.found || retained.value.len != 15 ||
+        !equal(retained.value.data, "preserved_nonce", 15)) { ret 13; }
+
+    awaiting(?protocol, ?request);
+    copy(?request.retry_nonce[0], "response_nonce", 14);
+    var response_item: [1]field.Field;
+    var response_fields: field.Fields = field.init(?response_item[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?response_fields, field.Field{
+        name: view.view("Replay-Nonce", 12),
+        value: view.view(?request.retry_nonce[0], 14), sensitive: false}) !=
+        field.ADD_OK) { ret 14; }
+    val wire_before: *u8 = request.wire_body.data;
+    val rejected_response: client.Decision = client.accept_signed_response(
+        ?protocol, ?request, response(status.OK, ?response_fields,
+            view.view(nil, 0)), ?scratch[0], 8192,
+        client.ProblemStorage{data: ?response_storage[0], capacity: 512,
+            subproblems: nil, subproblem_capacity: 0});
+    if (rejected_response.cause.code != problem.INVALID_INPUT ||
+        request.state != client.REQUEST_FAILED ||
+        request.wire_body.data != nil || wire_before == nil) { ret 15; }
+
+    awaiting(?protocol, ?request);
+    fill(?shared[0], 0xb7, 8192);
+    val problem_body: *u8 = "{\"type\":7}";
+    val problem_alias: client.Decision = client.accept_signed_response(
+        ?protocol, ?request, response(status.BAD_REQUEST, ?fields,
+            view.view(problem_body, length(problem_body))), ?shared[0], 8192,
+        client.ProblemStorage{data: ?shared[128], capacity: 512,
+            subproblems: nil, subproblem_capacity: 0});
+    if (problem_alias.cause.code != problem.INVALID_INPUT ||
+        request.state != client.REQUEST_FAILED ||
+        !filled(?shared[0], 0xb7, 8192)) { ret 16; }
+    ret 0;
+}
+
+test "client: ownership generations reject foreign and stale request handles" {
+    var slots: [2]nonce.Slot;
+    var nonce_storage: [128]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 2,
+        ?nonce_storage[0], 128, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var first: client.Client;
+    var second: client.Client;
+    val configured: client.Limits = client.limits_default();
+    if (problem.failed(client.init(?first, ?pool, configured)) ||
+        problem.failed(client.init(?second, ?pool, configured)) ||
+        problem.failed(pool.put(pool.ctx, view.view("owner_nonce", 11)))) { ret 2; }
+    val generation: u64 = first.generation;
+    if (!problem.failed(client.init(?first, ?pool, configured)) ||
+        first.generation != generation) { ret 3; }
+
+    var request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?first, ?request, client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31), use_jwk: false}))) {
+        ret 4;
+    }
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 5; }
+    var work: [2048]u8;
+    var output: [512]u8;
+    val signed: jose.Operation = client.prepare_signed(?first, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(signed.error) ||
+        !problem.failed(client.signed_wire(?second, ?request).error)) { ret 6; }
+
+    if (!client.release(?first) ||
+        !problem.failed(client.signed_wire(?first, ?request).error) ||
+        problem.failed(client.init(?first, ?pool, configured)) ||
+        first.generation != generation + 1 ||
+        !problem.failed(client.signed_wire(?first, ?request).error)) { ret 7; }
+
+    if (!client.release(?first) || !client.release(?second) ||
+        problem.failed(nonce.release_memory(?memory)) || nonce.valid(?pool)) { ret 8; }
+    var stale: client.Client;
+    if (!problem.failed(client.init(?stale, ?pool, configured))) { ret 9; }
+    ret 0;
+}
+
+test "client: lets encrypt staging directory fixture discovers bounded endpoints" {
+    val body: *u8 = "{\"FrDPtXot1mU\":\"https://community.letsencrypt.org/t/adding-random-entries-to-the-directory/33417\",\"keyChange\":\"https://acme-staging-v02.api.letsencrypt.org/acme/key-change\",\"meta\":{\"caaIdentities\":[\"letsencrypt.org\"],\"profiles\":{\"classic\":\"https://letsencrypt.org/docs/profiles#classic\"},\"termsOfService\":\"https://letsencrypt.org/documents/LE-SA-v1.8-July-06-2026.pdf\",\"website\":\"https://letsencrypt.org/docs/staging-environment/\"},\"newAccount\":\"https://acme-staging-v02.api.letsencrypt.org/acme/new-acct\",\"newNonce\":\"https://acme-staging-v02.api.letsencrypt.org/acme/new-nonce\",\"newOrder\":\"https://acme-staging-v02.api.letsencrypt.org/acme/new-order\",\"renewalInfo\":\"https://acme-staging-v02.api.letsencrypt.org/acme/renewal-info\",\"revokeCert\":\"https://acme-staging-v02.api.letsencrypt.org/acme/revoke-cert\"}";
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var scratch: [16384]u8;
+    var text: [1024]u8;
+    var caa: [4]view.View;
+    var directory: client.Directory;
+    val result: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(body, length(body))),
+        client.limits_default(), ?scratch[0], 16384,
+        client.DirectoryStorage{data: ?text[0], capacity: 1024,
+            caa_items: ?caa[0], caa_capacity: 4}, ?directory);
+    if (problem.failed(result)) { ret 1; }
+    if (directory.new_nonce_url.len != 59) { ret 2; }
+    if (directory.new_account_url.len != 58) { ret 3; }
+    if (directory.new_order_url.len != 59) { ret 4; }
+    if (directory.renewal_info_url.len != 62) { ret 5; }
+    if (directory.revoke_cert_url.len != 61) { ret 6; }
+    if (directory.key_change_url.len != 60) { ret 7; }
+    if (directory.caa_identity_len != 1 ||
+        !equal(directory.caa_identities[0].data, "letsencrypt.org", 15)) { ret 8; }
+    if (directory.external_account_required) { ret 9; }
+    ret 0;
+}
+
+test "client: hostile directory inputs preserve caller outputs" {
+    val duplicate: *u8 = "{\"newNonce\":\"https://a.example/nonce\",\"newNonce\":\"https://b.example/nonce\",\"newAccount\":\"https://a.example/account\",\"newOrder\":\"https://a.example/order\"}";
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var scratch: [8192]u8;
+    var text: [512]u8;
+    var caa: [2]view.View;
+    fill(?text[0], 0x5a, 512);
+    var directory: client.Directory;
+    directory.new_nonce_url = view.view("sentinel", 8);
+    val result: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(duplicate, length(duplicate))),
+        client.limits_default(), ?scratch[0], 8192,
+        client.DirectoryStorage{data: ?text[0], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 2}, ?directory);
+    if (result.code != problem.MALFORMED_JSON ||
+        directory.new_nonce_url.len != 8 || !filled(?text[0], 0x5a, 512)) { ret 1; }
+    val insecure: *u8 = "{\"newNonce\":\"http://a.example/nonce\",\"newAccount\":\"https://a.example/account\",\"newOrder\":\"https://a.example/order\"}";
+    val insecure_result: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(insecure, length(insecure))),
+        client.limits_default(), ?scratch[0], 8192,
+        client.DirectoryStorage{data: ?text[0], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 2}, ?directory);
+    if (insecure_result.code != problem.INVALID_DIRECTORY ||
+        directory.new_nonce_url.len != 8 || !filled(?text[0], 0x5a, 512)) { ret 2; }
+    val escaped_duplicate: *u8 = "{\"newNonce\":\"https://a.example/nonce\",\"new\\u004eonce\":\"https://b.example/nonce\",\"newAccount\":\"https://a.example/account\",\"newOrder\":\"https://a.example/order\"}";
+    val escaped_result: problem.Error = client.parse_directory(
+        response(status.OK, ?fields, view.view(escaped_duplicate, length(escaped_duplicate))),
+        client.limits_default(), ?scratch[0], 8192,
+        client.DirectoryStorage{data: ?text[0], capacity: 512,
+            caa_items: ?caa[0], caa_capacity: 2}, ?directory);
+    if (escaped_result.code != problem.MALFORMED_JSON ||
+        directory.new_nonce_url.len != 8 || !filled(?text[0], 0x5a, 512)) { ret 3; }
+    ret 0;
+}
+
+test "client: directory response policy rejects and sanitizes hostile shapes" {
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var configured: client.Limits = client.limits_default();
+    configured.max_response_bytes = 64;
+    configured.max_problem_bytes = 64;
+    var scratch: [256]u8;
+    var text: [256]u8;
+    var caa: [1]view.View;
+    var directory: client.Directory;
+    directory.new_nonce_url = view.view("sentinel", 8);
+
+    val invalid_view: problem.Error = client.parse_directory(
+        response(status.BAD_GATEWAY, ?fields, view.view(nil, 1)), configured,
+        ?scratch[0], 256, client.DirectoryStorage{data: ?text[0], capacity: 256,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (invalid_view.kind != problem.PROTOCOL ||
+        invalid_view.code != problem.INVALID_INPUT ||
+        invalid_view.http.status != status.BAD_GATEWAY ||
+        invalid_view.http.body.data != nil || invalid_view.http.body.len != 0 ||
+        directory.new_nonce_url.len != 8) { ret 1; }
+
+    val oversized: problem.Error = client.parse_directory(
+        response(status.BAD_GATEWAY, ?fields, view.view("x", 65)), configured,
+        ?scratch[0], 256, client.DirectoryStorage{data: ?text[0], capacity: 256,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (oversized.kind != problem.LIMIT ||
+        oversized.code != problem.OUTPUT_TOO_SMALL ||
+        oversized.http.status != status.BAD_GATEWAY ||
+        oversized.http.body.data != nil || oversized.http.body.len != 0 ||
+        directory.new_nonce_url.len != 8) { ret 2; }
+
+    val invalid_fields: problem.Error = client.parse_directory(
+        response(status.BAD_GATEWAY, nil, view.view("failure", 7)), configured,
+        ?scratch[0], 256, client.DirectoryStorage{data: ?text[0], capacity: 256,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (invalid_fields.kind != problem.PROTOCOL ||
+        invalid_fields.code != problem.INVALID_INPUT ||
+        invalid_fields.http.status != status.BAD_GATEWAY ||
+        invalid_fields.http.body.len != 7 ||
+        directory.new_nonce_url.len != 8) { ret 3; }
+    ret 0;
+}
+
+test "client: badNonce consumes stale state and retries with the fresh response nonce" {
+    var slots: [3]nonce.Slot;
+    var nonce_storage: [192]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 3,
+        ?nonce_storage[0], 192, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var configured: client.Limits = client.limits_default();
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, configured)) ||
+        problem.failed(pool.put(pool.ctx, view.view("stale_nonce", 11))) ||
+        problem.failed(pool.put(pool.ctx, view.view("first_nonce", 11)))) { ret 2; }
+    var request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?request, client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31), use_jwk: false}))) { ret 3; }
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0], ?public_bytes[0])) { ret 4; }
+    var work: [2048]u8;
+    var output: [512]u8;
+    val first: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(first.error) || request.state != client.REQUEST_AWAITING ||
+        request.attempts != 1) { ret 5; }
+    var response_items: [1]field.Field;
+    var response_fields: field.Fields = field.init(?response_items[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?response_fields, field.Field{
+        name: view.view("Replay-Nonce", 12), value: view.view("fresh_nonce", 11),
+        sensitive: false}) != field.ADD_OK) { ret 6; }
+    val body: *u8 = "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"title\":\"bad nonce\",\"status\":400,\"detail\":\"retry with a fresh nonce\"}";
+    var json_scratch: [8192]u8;
+    var problem_storage: [512]u8;
+    val decision: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.BAD_REQUEST, ?response_fields,
+            view.view(body, length(body))), ?json_scratch[0], 8192,
+        client.ProblemStorage{data: ?problem_storage[0], capacity: 512,
+            subproblems: nil, subproblem_capacity: 0});
+    if (decision.action != client.ACTION_RETRY_SIGNED ||
+        decision.cause.code != problem.BAD_NONCE ||
+        decision.cause.http.status != status.BAD_REQUEST ||
+        request.state != client.REQUEST_RETRY || request.bad_nonce_retries != 1 ||
+        !request.retry_nonce_ready || request.retry_nonce_len != 11 ||
+        !equal(?request.retry_nonce[0], "fresh_nonce", 11)) { ret 7; }
+    val retry: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(retry.error) || request.attempts != 2 ||
+        request.state != client.REQUEST_AWAITING) { ret 8; }
+    var nonce_output: [64]u8;
+    val remaining: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
+    if (problem.failed(remaining.error) || remaining.found) { ret 9; }
+    ret 0;
+}
+
+test "client: interleaved badNonce recovery remains bound to each request" {
+    var slots: [4]nonce.Slot;
+    var nonce_storage: [256]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 4,
+        ?nonce_storage[0], 256, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool,
+        client.limits_default()))) { ret 2; }
+    var first: client.SignedRequest;
+    var second: client.SignedRequest;
+    val spec: client.SignedSpec = client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31),
+        use_jwk: false};
+    if (problem.failed(client.begin_signed(?protocol, ?first, spec)) ||
+        problem.failed(client.begin_signed(?protocol, ?second, spec)) ||
+        problem.failed(pool.put(pool.ctx, view.view("seed_a", 6)))) { ret 3; }
+
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 4; }
+    val signer: jose.Signer = jose.signer(public_key);
+    var first_work: [2048]u8;
+    var second_work: [2048]u8;
+    var first_output: [512]u8;
+    var second_output: [512]u8;
+    if (problem.failed(client.prepare_signed(?protocol, ?first, signer,
+            private_key, jose.no_entropy(),
+            contracts.Buffer{data: ?first_work[0], capacity: 2048},
+            contracts.Buffer{data: ?first_output[0], capacity: 512}).error) ||
+        problem.failed(pool.put(pool.ctx, view.view("seed_b", 6))) ||
+        problem.failed(client.prepare_signed(?protocol, ?second, signer,
+            private_key, jose.no_entropy(),
+            contracts.Buffer{data: ?second_work[0], capacity: 2048},
+            contracts.Buffer{data: ?second_output[0], capacity: 512}).error)) { ret 5; }
+
+    val body: *u8 = "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"detail\":\"retry\"}";
+    var item: [1]field.Field;
+    var fields: field.Fields = field.init(?item[0], 1,
+        field.limits(1, 128, 32, 64));
+    var scratch: [8192]u8;
+    var storage: [512]u8;
+    if (field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("fresh_a", 7), sensitive: false}) != field.ADD_OK) { ret 6; }
+    val first_decision: client.Decision = client.accept_signed_response(?protocol,
+        ?first, response(status.BAD_REQUEST, ?fields,
+            view.view(body, length(body))), ?scratch[0], 8192,
+        client.ProblemStorage{data: ?storage[0], capacity: 512,
+            subproblems: nil, subproblem_capacity: 0});
+    if (first_decision.action != client.ACTION_RETRY_SIGNED ||
+        first.state != client.REQUEST_RETRY || !first.retry_nonce_ready ||
+        first.retry_nonce_len != 7 ||
+        !equal(?first.retry_nonce[0], "fresh_a", 7)) { ret 7; }
+
+    if (!field.reset(?fields) ||
+        field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+            value: view.view("fresh_b", 7), sensitive: false}) != field.ADD_OK) { ret 8; }
+    val second_decision: client.Decision = client.accept_signed_response(?protocol,
+        ?second, response(status.BAD_REQUEST, ?fields,
+            view.view(body, length(body))), ?scratch[0], 8192,
+        client.ProblemStorage{data: ?storage[0], capacity: 512,
+            subproblems: nil, subproblem_capacity: 0});
+    if (second_decision.action != client.ACTION_RETRY_SIGNED ||
+        second.state != client.REQUEST_RETRY || !second.retry_nonce_ready ||
+        second.retry_nonce_len != 7 ||
+        !equal(?second.retry_nonce[0], "fresh_b", 7) ||
+        !first.retry_nonce_ready || first.retry_nonce_len != 7 ||
+        !equal(?first.retry_nonce[0], "fresh_a", 7)) { ret 9; }
+
+    var nonce_output: [64]u8;
+    val shared_empty: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
+    if (problem.failed(shared_empty.error) || shared_empty.found) { ret 10; }
+    val second_retry: jose.Operation = client.prepare_signed(?protocol, ?second,
+        signer, private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?second_work[0], capacity: 2048},
+        contracts.Buffer{data: ?second_output[0], capacity: 512});
+    if (problem.failed(second_retry.error) ||
+        second.state != client.REQUEST_AWAITING || second.retry_nonce_ready ||
+        second.retry_nonce_len != 0 || !first.retry_nonce_ready ||
+        !equal(?first.retry_nonce[0], "fresh_a", 7)) { ret 11; }
+
+    fill(?first_output[0], 0xa5, 512);
+    val failed_retry: jose.Operation = client.prepare_signed(?protocol, ?first,
+        signer, private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?first_work[0], capacity: 2048},
+        contracts.Buffer{data: ?first_output[0], capacity: 1});
+    if (failed_retry.error.code != problem.OUTPUT_TOO_SMALL ||
+        first.state != client.REQUEST_RETRY || !first.retry_nonce_ready ||
+        first.retry_nonce_len != 7 ||
+        !equal(?first.retry_nonce[0], "fresh_a", 7) ||
+        !filled(?first_output[0], 0xa5, 512)) { ret 12; }
+    val first_retry: jose.Operation = client.prepare_signed(?protocol, ?first,
+        signer, private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?first_work[0], capacity: 2048},
+        contracts.Buffer{data: ?first_output[0], capacity: 512});
+    if (problem.failed(first_retry.error) ||
+        first.state != client.REQUEST_AWAITING || first.retry_nonce_ready ||
+        first.retry_nonce_len != 0 || first.attempts != 2 ||
+        second.attempts != 2) { ret 13; }
+    ret 0;
+}
+
+test "client: badNonce acquisition and retry exhaustion preserve protocol causes" {
+    var slots: [2]nonce.Slot;
+    var nonce_storage: [128]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 2,
+        ?nonce_storage[0], 128, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var configured: client.Limits = client.limits_default();
+    configured.max_bad_nonce_retries = 1;
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, configured)) ||
+        problem.failed(pool.put(pool.ctx, view.view("stale_nonce", 11)))) { ret 2; }
+    var request: client.SignedRequest;
+    awaiting(?protocol, ?request);
+    val body: *u8 = "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"title\":\"bad nonce\",\"status\":400}";
+    var empty: field.Fields;
+    empty_fields(?empty);
+    var scratch: [8192]u8;
+    var storage: [512]u8;
+    val acquire: client.Decision = client.accept_signed_response(?protocol, ?request,
+        response(status.BAD_REQUEST, ?empty, view.view(body, length(body))),
+        ?scratch[0], 8192, client.ProblemStorage{data: ?storage[0], capacity: 512,
+            subproblems: nil, subproblem_capacity: 0});
+    if (acquire.action != client.ACTION_ACQUIRE_NONCE ||
+        acquire.cause.code != problem.BAD_NONCE ||
+        request.state != client.REQUEST_NEEDS_NONCE || request.bad_nonce_retries != 1) {
+        ret 3;
+    }
+    var nonce_output: [64]u8;
+    val stale: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
+    if (problem.failed(stale.error) || stale.found) { ret 4; }
+    var fresh_items: [1]field.Field;
+    var fresh_fields: field.Fields = field.init(?fresh_items[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?fresh_fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("head_nonce", 10), sensitive: false}) != field.ADD_OK) { ret 5; }
+    val accepted: problem.Error = client.accept_nonce_response(?protocol, ?request,
+        response(status.NO_CONTENT, ?fresh_fields, view.view(nil, 0)));
+    if (problem.failed(accepted) || request.state != client.REQUEST_RETRY ||
+        !request.retry_nonce_ready || request.retry_nonce_len != 10 ||
+        !equal(?request.retry_nonce[0], "head_nonce", 10)) { ret 6; }
+
+    awaiting(?protocol, ?request);
+    request.bad_nonce_retries = 1;
+    var limit_items: [1]field.Field;
+    var limit_fields: field.Fields = field.init(?limit_items[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?limit_fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("limit_nonce", 11), sensitive: false}) != field.ADD_OK) { ret 7; }
+    val limited: client.Decision = client.accept_signed_response(?protocol, ?request,
+        response(status.BAD_REQUEST, ?limit_fields, view.view(body, length(body))),
+        ?scratch[0], 8192, client.ProblemStorage{data: ?storage[0], capacity: 512,
+            subproblems: nil, subproblem_capacity: 0});
+    if (limited.action != client.ACTION_FAILED || limited.cause.code != problem.RETRY_LIMIT ||
+        limited.cause.http.status != status.BAD_REQUEST || limited.cause.problem.typ.len == 0 ||
+        limited.cause.retryable || request.state != client.REQUEST_FAILED) { ret 8; }
+    val remaining: nonce.Taken = nonce.take(pool, ?nonce_output[0], 64);
+    if (problem.failed(remaining.error) || remaining.found ||
+        request.retry_nonce_ready || request.retry_nonce_len != 0) { ret 9; }
+    ret 0;
+}
+
+test "client: malformed acme problems retain their http cause transactionally" {
+    var slots: [1]nonce.Slot;
+    var nonce_storage: [64]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1,
+        ?nonce_storage[0], 64, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, client.limits_default()))) { ret 2; }
+    var request: client.SignedRequest;
+    awaiting(?protocol, ?request);
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var scratch: [4096]u8;
+    var storage: [64]u8;
+    fill(?storage[0], 0xb7, 64);
+    val body: *u8 = "{\"type\":7,\"detail\":\"wrong type\"}";
+    val decision: client.Decision = client.accept_signed_response(?protocol, ?request,
+        response(status.BAD_REQUEST, ?fields, view.view(body, length(body))),
+        ?scratch[0], 4096, client.ProblemStorage{data: ?storage[0], capacity: 64,
+            subproblems: nil, subproblem_capacity: 0});
+    if (decision.action != client.ACTION_FAILED ||
+        decision.cause.code != problem.MALFORMED_JSON ||
+        decision.cause.http.status != status.BAD_REQUEST ||
+        decision.cause.http.body.len != length(body) ||
+        !filled(?storage[0], 0xb7, 64)) { ret 3; }
+    awaiting(?protocol, ?request);
+    val valid: *u8 = "{\"type\":\"urn:ietf:params:acme:error:rejectedIdentifier\",\"detail\":\"policy\"}";
+    val too_small: client.Decision = client.accept_signed_response(?protocol, ?request,
+        response(status.BAD_REQUEST, ?fields, view.view(valid, length(valid))),
+        ?scratch[0], 4096, client.ProblemStorage{data: ?storage[0], capacity: 1,
+            subproblems: nil, subproblem_capacity: 0});
+    if (too_small.action != client.ACTION_FAILED ||
+        too_small.cause.code != problem.OUTPUT_TOO_SMALL ||
+        too_small.cause.http.status != status.BAD_REQUEST ||
+        !filled(?storage[0], 0xb7, 64)) { ret 4; }
+
+    awaiting(?protocol, ?request);
+    val compound: *u8 = "{\"type\":\"urn:ietf:params:acme:error:rejectedIdentifier\",\"detail\":\"order failed\",\"subproblems\":[{\"type\":\"urn:ietf:params:acme:error:dns\",\"detail\":\"dns failed\",\"identifier\":{\"type\":\"dns\",\"value\":\"bad.example\"}}]}";
+    var compound_storage: [512]u8;
+    var subproblems: [2]problem.Subproblem;
+    val structured: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.BAD_REQUEST, ?fields,
+            view.view(compound, length(compound))), ?scratch[0], 4096,
+        client.ProblemStorage{data: ?compound_storage[0], capacity: 512,
+            subproblems: ?subproblems[0], subproblem_capacity: 2});
+    if (structured.action != client.ACTION_FAILED ||
+        structured.cause.code != problem.ACME_PROBLEM ||
+        structured.cause.problem.subproblem_len != 1 ||
+        structured.cause.problem.subproblems != ?subproblems[0] ||
+        !equal(subproblems[0].identifier.typ.data, "dns", 3) ||
+        !equal(subproblems[0].identifier.value.data, "bad.example", 11) ||
+        !equal(subproblems[0].detail.data, "dns failed", 10)) { ret 5; }
+    ret 0;
+}
+
+test "client: invalid and excess response nonces are ignored" {
+    var slots: [1]nonce.Slot;
+    var nonce_storage: [64]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1,
+        ?nonce_storage[0], 64, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, client.limits_default())) ||
+        problem.failed(pool.put(pool.ctx, view.view("existing_nonce", 14)))) { ret 2; }
+    var items: [2]field.Field;
+    var fields: field.Fields = field.init(?items[0], 2,
+        field.limits(2, 256, 32, 64));
+    if (field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("bad+nonce", 9), sensitive: false}) != field.ADD_OK) { ret 3; }
+    var request: client.SignedRequest;
+    awaiting(?protocol, ?request);
+    var scratch: [256]u8;
+    var storage: [256]u8;
+    val invalid: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.OK, ?fields, view.view(nil, 0)),
+        ?scratch[0], 256,
+        client.ProblemStorage{data: ?storage[0], capacity: 256,
+            subproblems: nil, subproblem_capacity: 0});
+    if (invalid.action != client.ACTION_COMPLETE ||
+        request.state != client.REQUEST_COMPLETE) { ret 4; }
+
+    if (!field.reset(?fields) ||
+        field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("fresh_nonce", 11), sensitive: false}) != field.ADD_OK) { ret 5; }
+    awaiting(?protocol, ?request);
+    val full: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.OK, ?fields, view.view(nil, 0)),
+        ?scratch[0], 256,
+        client.ProblemStorage{data: ?storage[0], capacity: 256,
+            subproblems: nil, subproblem_capacity: 0});
+    if (full.action != client.ACTION_COMPLETE ||
+        request.state != client.REQUEST_COMPLETE) { ret 6; }
+    var output: [64]u8;
+    val retained: nonce.Taken = nonce.take(pool, ?output[0], 64);
+    if (problem.failed(retained.error) || !retained.found || retained.value.len != 14 ||
+        !equal(retained.value.data, "existing_nonce", 14)) { ret 7; }
+
+    if (!field.reset(?fields) ||
+        field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("first_nonce", 11), sensitive: false}) != field.ADD_OK ||
+        field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+            value: view.view("second_nonce", 12), sensitive: false}) != field.ADD_OK) { ret 8; }
+    awaiting(?protocol, ?request);
+    val multiple: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.OK, ?fields, view.view(nil, 0)),
+        ?scratch[0], 256,
+        client.ProblemStorage{data: ?storage[0], capacity: 256,
+            subproblems: nil, subproblem_capacity: 0});
+    if (multiple.action != client.ACTION_COMPLETE ||
+        request.state != client.REQUEST_COMPLETE ||
+        nonce.take(pool, ?output[0], 64).found) { ret 9; }
+    ret 0;
+}
+
+test "client: nonce callbacks preserve immutable descriptors and exact state" {
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 1; }
+    val spec: client.SignedSpec = client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31),
+        use_jwk: false};
+    var work: [2048]u8;
+    var output: [512]u8;
+
+    var context: HostilePool;
+    var supplied: nonce.Pool = hostile_pool(?context);
+    var protocol: client.Client;
+    var request: client.SignedRequest;
+    if (problem.failed(client.init(?protocol, ?supplied,
+            client.limits_default()))) { ret 2; }
+    supplied.reserve = nil;
+    supplied.ready = nil;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec))) { ret 3; }
+    val first: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(first.error) || request.state != client.REQUEST_AWAITING ||
+        protocol.nonces.reserve::usize == 0 ||
+        protocol.nonces.ready::usize == 0) {
+        ret 4;
+    }
+
+    var item: [1]field.Field;
+    var fields: field.Fields = field.init(?item[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("response_nonce", 14), sensitive: false}) !=
+        field.ADD_OK) { ret 5; }
+    context.mode = HOSTILE_PUT_REQUEST;
+    context.request = ?request;
+    val wire_before: view.View = request.wire_body;
+    val put_mutation: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.OK, ?fields, view.view(nil, 0)), nil, 0,
+        client.ProblemStorage{data: nil, capacity: 0,
+            subproblems: nil, subproblem_capacity: 0});
+    if (put_mutation.action != client.ACTION_FAILED ||
+        put_mutation.cause.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_FAILED ||
+        request.wire_body.data != nil || wire_before.data == nil) { ret 6; }
+
+    context.mode = HOSTILE_OVERSIZED;
+    context.request = nil;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec))) { ret 7; }
+    fill(?output[0], 0xa5, 512);
+    val oversized: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (oversized.error.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_FAILED || !filled(?output[0], 0xa5, 512)) {
+        ret 8;
+    }
+    context.mode = HOSTILE_FOREIGN;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec))) { ret 9; }
+    val foreign: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (foreign.error.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_FAILED || !filled(?output[0], 0xa5, 512)) {
+        ret 10;
+    }
+    context.mode = HOSTILE_TAKE_REQUEST;
+    context.request = ?request;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec))) { ret 11; }
+    val request_mutation: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (request_mutation.error.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_FAILED || !filled(?output[0], 0xa5, 512)) {
+        ret 12;
+    }
+
+    context.mode = HOSTILE_NORMAL;
+    context.request = nil;
+    if (problem.failed(client.begin_signed(?protocol, ?request, spec)) ||
+        problem.failed(client.prepare_signed(?protocol, ?request,
+            jose.signer(public_key), private_key, jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error)) { ret 13; }
+    context.mode = HOSTILE_CLEAR_REQUEST;
+    context.request = ?request;
+    val bad_nonce: *u8 =
+        "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"detail\":\"retry\"}";
+    var scratch: [4096]u8;
+    var storage: [256]u8;
+    val clear_mutation: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.BAD_REQUEST, ?fields,
+            view.view(bad_nonce, length(bad_nonce))), ?scratch[0], 4096,
+        client.ProblemStorage{data: ?storage[0], capacity: 256,
+            subproblems: nil, subproblem_capacity: 0});
+    if (clear_mutation.action != client.ACTION_FAILED ||
+        clear_mutation.cause.code != problem.INVALID_STATE ||
+        request.state != client.REQUEST_FAILED || request.wire_body.data != nil) {
+        ret 14;
+    }
+
+    var client_context: HostilePool;
+    var client_pool: nonce.Pool = hostile_pool(?client_context);
+    var mutated_client: client.Client;
+    var client_request: client.SignedRequest;
+    if (problem.failed(client.init(?mutated_client, ?client_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?mutated_client, ?client_request, spec))) {
+        ret 15;
+    }
+    client_context.mode = HOSTILE_TAKE_CLIENT;
+    client_context.protocol = ?mutated_client;
+    val client_mutation: jose.Operation = client.prepare_signed(?mutated_client,
+        ?client_request, jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (client_mutation.error.code != problem.INVALID_STATE ||
+        mutated_client.nonces.reserve::usize != 0 ||
+        client_request.state != client.REQUEST_FAILED) { ret 16; }
+    ret 0;
+}
+
+test "client: nonce provider ownership is disjoint at every callback boundary" {
+    var context: HostilePool;
+    var pool: nonce.Pool = hostile_pool(?context);
+    var protocol: client.Client;
+    context.owned = (?protocol)::*u8;
+    context.owned_len = $size_of(client.Client);
+    if (client.init(?protocol, ?pool, client.limits_default()).code !=
+        problem.INVALID_STATE) { ret 1; }
+
+    context.owned = nil;
+    context.owned_len = 0;
+    if (problem.failed(client.init(?protocol, ?pool,
+            client.limits_default()))) { ret 2; }
+    var request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?request,
+        client.SignedSpec{url: view.view("https://example.com/acme/order", 30),
+            payload: view.view("{}", 2),
+            kid: view.view("https://example.com/acme/acct/1", 31),
+            use_jwk: false}))) { ret 3; }
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+            ?public_bytes[0])) { ret 4; }
+    var work: [2048]u8;
+    var output: [512]u8;
+    context.owned = ?work[0];
+    context.owned_len = 2048;
+    fill(?output[0], 0xa5, 512);
+    val rejected: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (rejected.error.code != problem.INVALID_INPUT || rejected.written != 0 ||
+        request.state != client.REQUEST_READY || !filled(?output[0], 0xa5, 512)) {
+        ret 5;
+    }
+    ret 0;
+}
+
+test "client: provider transactions fail closed before wire publication" {
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 1; }
+    val spec: client.SignedSpec = client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31),
+        use_jwk: false};
+    var work: [2048]u8;
+    var output: [512]u8;
+
+    var reentrant_context: HostilePool;
+    reentrant_context.mode = HOSTILE_REENTER;
+    var reentrant_pool: nonce.Pool = hostile_pool(?reentrant_context);
+    var reentrant_client: client.Client;
+    var reentrant_request: client.SignedRequest;
+    if (problem.failed(client.init(?reentrant_client, ?reentrant_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?reentrant_client,
+            ?reentrant_request, spec))) { ret 2; }
+    reentrant_context.protocol = ?reentrant_client;
+    val reentrant: jose.Operation = client.prepare_signed(?reentrant_client,
+        ?reentrant_request, jose.signer(public_key), private_key,
+        jose.no_entropy(), contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(reentrant.error) || reentrant_context.reentered ||
+        !reentrant_client.initialized ||
+        atomic.load(?reentrant_client.callback_owner) != 0 ||
+        reentrant_request.state != client.REQUEST_AWAITING ||
+        reentrant_context.commit_count != 1) { ret 3; }
+
+    var commit_context: HostilePool;
+    commit_context.mode = HOSTILE_COMMIT_FAIL;
+    var commit_pool: nonce.Pool = hostile_pool(?commit_context);
+    var commit_client: client.Client;
+    var commit_request: client.SignedRequest;
+    if (problem.failed(client.init(?commit_client, ?commit_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?commit_client, ?commit_request,
+            spec))) { ret 4; }
+    fill(?output[0], 0xa5, 512);
+    val commit_failed: jose.Operation = client.prepare_signed(?commit_client,
+        ?commit_request, jose.signer(public_key), private_key,
+        jose.no_entropy(), contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (commit_failed.error.code != problem.INVALID_STATE ||
+        commit_failed.written != 0 || commit_context.commit_count != 1 ||
+        commit_request.state != client.REQUEST_FAILED ||
+        commit_request.wire_body.data != nil || output[0] != 0) { ret 5; }
+
+    var release_context: HostilePool;
+    release_context.mode = HOSTILE_RELEASE_FAIL;
+    var release_pool: nonce.Pool = hostile_pool(?release_context);
+    var release_client: client.Client;
+    var release_request: client.SignedRequest;
+    if (problem.failed(client.init(?release_client, ?release_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?release_client, ?release_request,
+            spec))) { ret 6; }
+    fill(?output[0], 0xa5, 512);
+    val release_failed: jose.Operation = client.prepare_signed(?release_client,
+        ?release_request, jose.signer(public_key), private_key,
+        jose.no_entropy(), contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 1});
+    if (release_failed.error.code != problem.INVALID_STATE ||
+        release_failed.written != 0 || release_context.release_count != 1 ||
+        release_request.state != client.REQUEST_FAILED ||
+        release_request.wire_body.data != nil || output[0] != 0) {
+        ret 7;
+    }
+
+    var secret_context: HostilePool;
+    secret_context.secret_owner = private_key.secret_owner;
+    var secret_pool: nonce.Pool = hostile_pool(?secret_context);
+    var secret_client: client.Client;
+    var secret_request: client.SignedRequest;
+    if (problem.failed(client.init(?secret_client, ?secret_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?secret_client, ?secret_request,
+            spec))) { ret 8; }
+    fill(?output[0], 0xa5, 512);
+    val secret_owned: jose.Operation = client.prepare_signed(?secret_client,
+        ?secret_request, jose.signer(public_key), private_key,
+        jose.no_entropy(), contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (secret_owned.error.code != problem.INVALID_INPUT ||
+        secret_owned.written != 0 || secret_request.state != client.REQUEST_READY ||
+        secret_context.commit_count != 0 || secret_context.release_count != 0 ||
+        !filled(?output[0], 0xa5, 512)) { ret 9; }
+
+    var response_context: HostilePool;
+    var response_pool: nonce.Pool = hostile_pool(?response_context);
+    var response_client: client.Client;
+    var response_request: client.SignedRequest;
+    if (problem.failed(client.init(?response_client, ?response_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?response_client, ?response_request,
+            spec)) ||
+        problem.failed(client.prepare_signed(?response_client,
+            ?response_request, jose.signer(public_key), private_key,
+            jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error)) { ret 10; }
+    var item: [1]field.Field;
+    var fields: field.Fields = field.init(?item[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("response_nonce", 14), sensitive: false}) !=
+        field.ADD_OK) { ret 11; }
+    response_context.mode = HOSTILE_PUT_FAIL;
+    val response_failed: client.Decision = client.accept_signed_response(
+        ?response_client, ?response_request,
+        response(status.OK, ?fields, view.view(nil, 0)), nil, 0,
+        client.ProblemStorage{data: nil, capacity: 0,
+            subproblems: nil, subproblem_capacity: 0});
+    if (response_failed.action != client.ACTION_FAILED ||
+        response_failed.cause.code != problem.INVALID_STATE ||
+        response_request.state != client.REQUEST_FAILED ||
+        response_request.wire_body.data != nil) { ret 12; }
+
+    var payload: [2]u8 = [2]u8{'{', '}'};
+    var mutation_context: HostilePool;
+    var mutation_pool: nonce.Pool = hostile_pool(?mutation_context);
+    var mutation_client: client.Client;
+    var mutation_request: client.SignedRequest;
+    val mutation_spec: client.SignedSpec = client.SignedSpec{url: spec.url,
+        payload: view.view(?payload[0], 2), kid: spec.kid, use_jwk: false};
+    if (problem.failed(client.init(?mutation_client, ?mutation_pool,
+            client.limits_default())) ||
+        problem.failed(client.begin_signed(?mutation_client, ?mutation_request,
+            mutation_spec)) ||
+        problem.failed(client.prepare_signed(?mutation_client,
+            ?mutation_request, jose.signer(public_key), private_key,
+            jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error)) { ret 13; }
+    payload[0] = '[';
+    var empty: field.Fields;
+    empty_fields(?empty);
+    val changed: client.Decision = client.accept_signed_response(
+        ?mutation_client, ?mutation_request,
+        response(status.OK, ?empty, view.view(nil, 0)), nil, 0,
+        client.ProblemStorage{data: nil, capacity: 0,
+            subproblems: nil, subproblem_capacity: 0});
+    if (changed.action != client.ACTION_FAILED ||
+        changed.cause.code != problem.INVALID_STATE ||
+        mutation_request.state != client.REQUEST_FAILED ||
+        mutation_request.wire_body.data != nil) { ret 14; }
+    ret 0;
+}
+
+test "client: callback boundaries serialize concurrent requests" {
+    var slots: [4]nonce.Slot;
+    var nonce_storage: [256]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 4,
+        ?nonce_storage[0], 256, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool,
+        client.limits_default()))) { ret 2; }
+    var first: client.SignedRequest;
+    var second: client.SignedRequest;
+    awaiting(?protocol, ?first);
+    awaiting(?protocol, ?second);
+    var first_item: [1]field.Field;
+    var second_item: [1]field.Field;
+    var first_fields: field.Fields = field.init(?first_item[0], 1,
+        field.limits(1, 128, 32, 64));
+    var second_fields: field.Fields = field.init(?second_item[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?first_fields, field.Field{
+            name: view.view("Replay-Nonce", 12),
+            value: view.view("concurrent_one", 14), sensitive: false}) !=
+            field.ADD_OK ||
+        field.append(?second_fields, field.Field{
+            name: view.view("Replay-Nonce", 12),
+            value: view.view("concurrent_two", 14), sensitive: false}) !=
+            field.ADD_OK) { ret 3; }
+    var first_result: i64 = 0;
+    var second_result: i64 = 0;
+    var first_context: AcceptContext = AcceptContext{protocol: ?protocol,
+        request: ?first, fields: ?first_fields, result: ?first_result};
+    var second_context: AcceptContext = AcceptContext{protocol: ?protocol,
+        request: ?second, fields: ?second_fields, result: ?second_result};
+    var first_thread: thread.Thread;
+    var second_thread: thread.Thread;
+    thread.spawn_with(accept_worker, (?first_context)::*u8, ?first_thread);
+    if (first_thread.tid < 0) { ret 4; }
+    thread.spawn_with(accept_worker, (?second_context)::*u8, ?second_thread);
+    if (second_thread.tid < 0) {
+        thread.join(?first_thread);
+        ret 5;
+    }
+    thread.join(?first_thread);
+    thread.join(?second_thread);
+    if (atomic.load(?first_result) != 1 || atomic.load(?second_result) != 1 ||
+        first.state != client.REQUEST_COMPLETE ||
+        second.state != client.REQUEST_COMPLETE ||
+        atomic.load(?protocol.callback_owner) != 0) { ret 6; }
+    var output: [64]u8;
+    val newest: nonce.Taken = nonce.take(pool, ?output[0], 64);
+    val older: nonce.Taken = nonce.take(pool, ?output[0], 64);
+    if (problem.failed(newest.error) || !newest.found ||
+        problem.failed(older.error) || !older.found ||
+        nonce.take(pool, ?output[0], 64).found) { ret 7; }
+    ret 0;
+}
+
+test "client: signed url payload and kid are immutably bound" {
+    var slots: [1]nonce.Slot;
+    var nonce_storage: [64]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1,
+            ?nonce_storage[0], 64, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    if (problem.failed(pool.put(pool.ctx, view.view("binding_nonce", 13)))) {
+        ret 2;
+    }
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool,
+            client.limits_default()))) { ret 3; }
+    var url: [30]u8;
+    var payload: [2]u8;
+    var kid: [31]u8;
+    copy(?url[0], "https://example.com/acme/order", 30);
+    copy(?payload[0], "{}", 2);
+    copy(?kid[0], "https://example.com/acme/acct/1", 31);
+    val spec: client.SignedSpec = client.SignedSpec{
+        url: view.view(?url[0], 30), payload: view.view(?payload[0], 2),
+        kid: view.view(?kid[0], 31), use_jwk: false};
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+            ?public_bytes[0])) { ret 4; }
+    var work: [2048]u8;
+    var output: [512]u8;
+
+    var url_request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?url_request, spec))) {
+        ret 5;
+    }
+    url[8] = 'f';
+    fill(?output[0], 0xa5, 512);
+    if (client.prepare_signed(?protocol, ?url_request, jose.signer(public_key),
+            private_key, jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
+            problem.INVALID_STATE || !filled(?output[0], 0xa5, 512)) { ret 6; }
+    url[8] = 'e';
+
+    var payload_request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?payload_request, spec))) {
+        ret 7;
+    }
+    payload[0] = '[';
+    if (client.prepare_signed(?protocol, ?payload_request,
+            jose.signer(public_key), private_key, jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
+            problem.INVALID_STATE || !filled(?output[0], 0xa5, 512)) { ret 8; }
+    payload[0] = '{';
+
+    var kid_request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?kid_request, spec))) {
+        ret 9;
+    }
+    kid[8] = 'f';
+    if (client.prepare_signed(?protocol, ?kid_request, jose.signer(public_key),
+            private_key, jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error.code !=
+            problem.INVALID_STATE || !filled(?output[0], 0xa5, 512)) { ret 10; }
+    kid[8] = 'e';
+
+    var prepared: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?prepared, spec)) ||
+        problem.failed(client.prepare_signed(?protocol, ?prepared,
+            jose.signer(public_key), private_key, jose.no_entropy(),
+            contracts.Buffer{data: ?work[0], capacity: 2048},
+            contracts.Buffer{data: ?output[0], capacity: 512}).error)) { ret 11; }
+    url[8] = 'f';
+    if (!problem.failed(client.signed_wire(?protocol, ?prepared).error)) { ret 12; }
+    url[8] = 'e';
+    payload[0] = '[';
+    if (!problem.failed(client.signed_wire(?protocol, ?prepared).error)) { ret 13; }
+    payload[0] = '{';
+    kid[8] = 'f';
+    if (!problem.failed(client.signed_wire(?protocol, ?prepared).error)) { ret 14; }
+    ret 0;
+}
+
+test "nonce: hostile values, duplicates, and small outputs are transactional" {
+    var slots: [1]nonce.Slot;
+    var storage: [16]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1, ?storage[0], 16, 16))) {
+        ret 1;
+    }
+    val pool: nonce.Pool = nonce.pool(?memory);
+    if (pool.put(pool.ctx, view.view("bad+nonce", 9)).code != problem.INVALID_INPUT ||
+        problem.failed(pool.put(pool.ctx, view.view("valid_nonce", 11))) ||
+        pool.put(pool.ctx, view.view("valid_nonce", 11)).code != problem.DUPLICATE_NONCE) {
+        ret 2;
+    }
+    var output: [16]u8;
+    fill(?output[0], 0xcc, 16);
+    val small: nonce.Taken = nonce.take(pool, ?output[0], 4);
+    if (small.error.code != problem.OUTPUT_TOO_SMALL || small.found ||
+        !filled(?output[0], 0xcc, 16)) { ret 3; }
+    val taken: nonce.Taken = nonce.take(pool, ?output[0], 16);
+    if (problem.failed(taken.error) || !taken.found || taken.value.len != 11) { ret 4; }
+    val exhausted: nonce.Taken = nonce.take(pool, ?output[0], 16);
+    if (problem.failed(exhausted.error) || exhausted.found) { ret 5; }
+    ret 0;
+}
