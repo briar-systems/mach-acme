@@ -121,8 +121,9 @@ mach test test/live --profile release
 test/live/harness/start.sh.stop
 ```
 
-The harness runs `pebble`, its challenge test server, and a plain-HTTP front
-end on loopback. `mach-acme` emits typed HTTPS wire requests and TLS
+`start.sh` builds the stack's binaries on first use, so a clean checkout needs
+only Go on the path. The harness runs `pebble`, its challenge test server, and
+a plain-HTTP front end on loopback. `mach-acme` emits typed HTTPS wire requests and TLS
 termination belongs to `mach-tls`, so the front end terminates TLS while every
 ACME byte, URL, status, and header passes through unchanged.
 
