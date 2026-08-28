@@ -22,8 +22,10 @@ echo $! >"$run/challtestsrv.pid"
 # PEBBLE_VA_NOSLEEP removes the randomized validation delay so ordering in the
 # tests is deterministic. PEBBLE_WFE_NONCEREJECT=0 disables pebble's default 5%
 # random badNonce injection; the badNonce path has its own dedicated fixtures.
+# PEBBLE_AUTHZREUSE=0 stops the authority handing back an authorization an
+# earlier run already validated, so each run starts from pending.
 cd "$tools"
-PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=0 \
+PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=0 PEBBLE_AUTHZREUSE=0 \
     "$bin/pebble" -config "$tools/test/config/pebble-config.json" \
     -dnsserver 127.0.0.1:8053 \
     >"$run/pebble.log" 2>&1 &

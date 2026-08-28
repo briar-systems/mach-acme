@@ -18,6 +18,7 @@ use acme.identifier;
 use acme.jose;
 use acme.json;
 use acme.memory_range;
+use acme.poll;
 use acme.problem;
 
 pub val PENDING:    u8 = 1;
@@ -926,191 +927,44 @@ pub fun challenge_admissible(value: Authorization, kind: u8) bool {
         kind == challenge.TLS_ALPN_01;
 }
 
-pub def PollAction: u8;
-
-pub val POLL_WAIT:      PollAction = 1;
-pub val POLL_READY:     PollAction = 2;
-pub val POLL_TERMINAL:  PollAction = 3;
-pub val POLL_DEADLINE:  PollAction = 4;
-pub val POLL_CANCELLED: PollAction = 5;
-pub val POLL_LIMIT:     PollAction = 6;
-
-pub rec PollPolicy {
-    min_delay_ns: u64;
-    max_delay_ns: u64;
-    max_attempts: usize;
-}
-
-pub rec Poll {
-    policy:      PollPolicy;
-    deadline_ns: i64;
-    attempts:    usize;
-    cancelled:   bool;
-    started:     bool;
-}
-
-pub rec PollDecision {
-    action:   PollAction;
-    delay_ns: u64;
-    cause:    problem.Error;
-}
-
-pub fun poll_policy_default() PollPolicy {
-    ret PollPolicy{min_delay_ns: 1000000000, max_delay_ns: 30000000000,
-        max_attempts: 32};
-}
-
-pub fun poll_policy_valid(value: PollPolicy) bool {
-    ret value.min_delay_ns != 0 && value.max_delay_ns >= value.min_delay_ns &&
-        value.max_delay_ns <= 3600000000000 && value.max_attempts != 0 &&
-        value.max_attempts <= 4096;
-}
-
-pub fun poll_begin(state: *Poll, policy: PollPolicy,
-    deadline_ns: i64) problem.Error {
-    if (state == nil || !memory_range.valid(state::*u8, $size_of(Poll)) ||
-        !poll_policy_valid(policy)) {
-        ret problem.local_code(problem.POLICY, problem.INVALID_INPUT,
-            "invalid poll policy");
+# order polling reduces the rfc 8555 status vocabulary to the shared bounded
+# poll decision, so orders, challenges, and renewal never drift apart
+pub fun poll_next(state: *poll.State, current: u8, target: u8,
+    retry_after_seconds: u64, now_ns: i64) poll.Decision {
+    if (current == 0 || target == 0) {
+        ret poll.Decision{action: poll.TERMINAL, delay_ns: 0,
+            cause: problem.local_code(problem.STATE, problem.INVALID_STATE,
+                "order poll received an unknown status")};
     }
-    state.policy = policy;
-    state.deadline_ns = deadline_ns;
-    state.attempts = 0;
-    state.cancelled = false;
-    state.started = true;
-    ret problem.none();
+    ret poll.next(state, current == target, status_terminal(current),
+        retry_after_seconds, now_ns);
 }
 
-pub fun poll_cancel(state: *Poll) bool {
-    if (state == nil || !memory_range.valid(state::*u8, $size_of(Poll)) ||
-        !state.started) { ret false; }
-    state.cancelled = true;
-    ret true;
-}
-
-fun poll_decision(action: PollAction, delay_ns: u64,
-    cause: problem.Error) PollDecision {
-    ret PollDecision{action: action, delay_ns: delay_ns, cause: cause};
-}
-
-# bounded exponential backoff. doubling stops at max_delay_ns, so a long poll
-# can never produce an unbounded or overflowing wait.
-fun backoff(policy: PollPolicy, attempts: usize) u64 {
-    var delay: u64 = policy.min_delay_ns;
-    var i: usize = 0;
-    for (i < attempts) {
-        if (delay >= policy.max_delay_ns || delay > 0x7fffffffffffffff) {
-            ret policy.max_delay_ns;
-        }
-        delay = delay * 2;
-        i = i + 1;
-    }
-    if (delay > policy.max_delay_ns) { ret policy.max_delay_ns; }
-    ret delay;
-}
-
-fun retry_after_ns(seconds: u64) u64 {
-    if (seconds > 0xffffffffffffffff / 1000000000) {
-        ret 0xffffffffffffffff;
-    }
-    ret seconds * 1000000000;
-}
-
-# the caller owns the clock. every wait is decided from the supplied monotonic
-# reading, the authority's Retry-After, and the absolute deadline.
-pub fun poll_next(state: *Poll, current: u8, target: u8,
-    retry_after_seconds: u64, now_ns: i64) PollDecision {
-    if (state == nil || !memory_range.valid(state::*u8, $size_of(Poll)) ||
-        !state.started || !poll_policy_valid(state.policy) || current == 0 ||
-        target == 0) {
-        ret poll_decision(POLL_TERMINAL, 0,
-            problem.local_code(problem.STATE, problem.INVALID_STATE,
-                "poll state is not initialized"));
-    }
-    if (state.cancelled) {
-        ret poll_decision(POLL_CANCELLED, 0,
-            problem.local_code(problem.POLICY, problem.INVALID_STATE,
-                "poll was cancelled"));
-    }
-    if (current == target) { ret poll_decision(POLL_READY, 0, problem.none()); }
-    if (status_terminal(current)) {
-        ret poll_decision(POLL_TERMINAL, 0,
-            problem.local_code(problem.PROTOCOL, problem.INVALID_STATE,
-                "order reached a terminal status other than the target"));
-    }
-    if (state.attempts >= state.policy.max_attempts) {
-        ret poll_decision(POLL_LIMIT, 0,
-            problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
-                "poll attempt limit reached"));
-    }
-    var delay: u64 = backoff(state.policy, state.attempts);
-    val advised: u64 = retry_after_ns(retry_after_seconds);
-    if (advised > delay) { delay = advised; }
-    if (delay > state.policy.max_delay_ns) { delay = state.policy.max_delay_ns; }
-    if (now_ns >= state.deadline_ns) {
-        ret poll_decision(POLL_DEADLINE, 0,
-            problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
-                "poll deadline reached"));
-    }
-    val remaining: u64 = (state.deadline_ns - now_ns)::u64;
-    if (delay > remaining) {
-        ret poll_decision(POLL_DEADLINE, 0,
-            problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
-                "poll delay would pass the deadline"));
-    }
-    state.attempts = state.attempts + 1;
-    ret poll_decision(POLL_WAIT, delay, problem.none());
-}
-
-test "acme.order: polling honours retry-after, deadlines, and backoff bounds" {
-    var state: Poll;
-    var policy: PollPolicy = poll_policy_default();
+test "acme.order: polling maps order statuses onto the bounded decision" {
+    var state: poll.State;
+    var policy: poll.Policy = poll.policy_default();
     policy.min_delay_ns = 1000000000;
     policy.max_delay_ns = 8000000000;
     policy.max_attempts = 4;
-    if (problem.failed(poll_begin(?state, policy, 1000000000000))) { ret 1; }
-    # bounded exponential backoff doubles and then saturates
-    val first: PollDecision = poll_next(?state, PENDING, READY, 0, 0);
-    val second: PollDecision = poll_next(?state, PENDING, READY, 0, 0);
-    val third: PollDecision = poll_next(?state, PENDING, READY, 0, 0);
-    val fourth: PollDecision = poll_next(?state, PENDING, READY, 0, 0);
-    if (first.action != POLL_WAIT || first.delay_ns != 1000000000 ||
-        second.delay_ns != 2000000000 || third.delay_ns != 4000000000 ||
-        fourth.delay_ns != 8000000000) { ret 2; }
-    if (poll_next(?state, PENDING, READY, 0, 0).action != POLL_LIMIT) { ret 3; }
-    # a larger retry-after wins, but stays clamped to the policy ceiling
-    if (problem.failed(poll_begin(?state, policy, 1000000000000))) { ret 4; }
-    val advised: PollDecision = poll_next(?state, PENDING, READY, 5, 0);
-    if (advised.action != POLL_WAIT || advised.delay_ns != 5000000000) { ret 5; }
-    if (problem.failed(poll_begin(?state, policy, 1000000000000))) { ret 6; }
-    if (poll_next(?state, PENDING, READY, 3600, 0).delay_ns !=
-        policy.max_delay_ns) { ret 7; }
-    # a wait that would pass the absolute deadline is refused, not truncated
-    if (problem.failed(poll_begin(?state, policy, 500000000))) { ret 8; }
-    if (poll_next(?state, PENDING, READY, 0, 0).action != POLL_DEADLINE ||
-        state.attempts != 0) { ret 9; }
-    if (problem.failed(poll_begin(?state, policy, 100))) { ret 10; }
-    if (poll_next(?state, PENDING, READY, 0, 100).action != POLL_DEADLINE) {
-        ret 11;
+    if (problem.failed(poll.begin(?state, policy, 1000000000000))) { ret 1; }
+    # a pending order waits, and the authority's advice outranks the floor
+    if (poll_next(?state, PENDING, READY, 0, 0).delay_ns != 1000000000 ||
+        poll_next(?state, PENDING, READY, 5, 0).delay_ns != 5000000000) {
+        ret 2;
     }
-    # terminal states and cancellation stop the loop without waiting
-    if (problem.failed(poll_begin(?state, policy, 1000000000000))) { ret 12; }
-    if (poll_next(?state, READY, READY, 0, 0).action != POLL_READY ||
-        poll_next(?state, INVALID, READY, 0, 0).action != POLL_TERMINAL ||
-        poll_next(?state, VALID, READY, 0, 0).action != POLL_TERMINAL ||
-        poll_next(?state, PROCESSING, VALID, 0, 0).action != POLL_WAIT) {
-        ret 13;
+    if (problem.failed(poll.begin(?state, policy, 1000000000000))) { ret 3; }
+    # reaching the target, overshooting it, and failing are distinct
+    if (poll_next(?state, READY, READY, 0, 0).action != poll.READY ||
+        poll_next(?state, VALID, READY, 0, 0).action != poll.TERMINAL ||
+        poll_next(?state, INVALID, READY, 0, 0).action != poll.TERMINAL ||
+        poll_next(?state, PROCESSING, VALID, 0, 0).action != poll.WAIT ||
+        poll_next(?state, READY, VALID, 0, 0).action != poll.WAIT) { ret 4; }
+    # an unknown status is never treated as progress
+    if (poll_next(?state, 0, READY, 0, 0).action != poll.TERMINAL ||
+        poll_next(?state, PENDING, 0, 0, 0).action != poll.TERMINAL) { ret 5; }
+    if (!poll.cancel(?state) ||
+        poll_next(?state, PENDING, READY, 0, 0).action != poll.CANCELLED) {
+        ret 6;
     }
-    if (!poll_cancel(?state) ||
-        poll_next(?state, PENDING, READY, 0, 0).action != POLL_CANCELLED) {
-        ret 14;
-    }
-    var fresh: Poll;
-    if (poll_next(?fresh, PENDING, READY, 0, 0).action != POLL_TERMINAL) {
-        ret 15;
-    }
-    var bad: PollPolicy = policy;
-    bad.min_delay_ns = 0;
-    if (!problem.failed(poll_begin(?state, bad, 1000))) { ret 16; }
     ret 0;
 }

@@ -1,0 +1,193 @@
+# bounded polling decisions over a caller-owned clock
+#
+# orders, challenges, and renewal all wait on a remote status. the wait policy
+# is identical in every case, so it lives here once and is status agnostic.
+# callers reduce their own status to `reached` and `terminal` and keep their
+# own vocabulary.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use acme.memory_range;
+use acme.problem;
+
+pub def Action: u8;
+
+pub val WAIT:      Action = 1;
+pub val READY:     Action = 2;
+pub val TERMINAL:  Action = 3;
+pub val DEADLINE:  Action = 4;
+pub val CANCELLED: Action = 5;
+pub val LIMIT:     Action = 6;
+
+pub rec Policy {
+    min_delay_ns: u64;
+    max_delay_ns: u64;
+    max_attempts: usize;
+}
+
+pub rec State {
+    policy:      Policy;
+    deadline_ns: i64;
+    attempts:    usize;
+    cancelled:   bool;
+    started:     bool;
+}
+
+pub rec Decision {
+    action:   Action;
+    delay_ns: u64;
+    cause:    problem.Error;
+}
+
+pub fun policy_default() Policy {
+    ret Policy{min_delay_ns: 1000000000, max_delay_ns: 30000000000,
+        max_attempts: 32};
+}
+
+pub fun policy_valid(value: Policy) bool {
+    ret value.min_delay_ns != 0 && value.max_delay_ns >= value.min_delay_ns &&
+        value.max_delay_ns <= 3600000000000 && value.max_attempts != 0 &&
+        value.max_attempts <= 4096;
+}
+
+pub fun begin(state: *State, policy: Policy, deadline_ns: i64) problem.Error {
+    if (state == nil || !memory_range.valid(state::*u8, $size_of(State)) ||
+        !policy_valid(policy)) {
+        ret problem.local_code(problem.POLICY, problem.INVALID_INPUT,
+            "invalid poll policy");
+    }
+    state.policy = policy;
+    state.deadline_ns = deadline_ns;
+    state.attempts = 0;
+    state.cancelled = false;
+    state.started = true;
+    ret problem.none();
+}
+
+pub fun cancel(state: *State) bool {
+    if (state == nil || !memory_range.valid(state::*u8, $size_of(State)) ||
+        !state.started) { ret false; }
+    state.cancelled = true;
+    ret true;
+}
+
+pub fun cancelled(state: *State) bool {
+    ret state != nil && memory_range.valid(state::*u8, $size_of(State)) &&
+        state.started && state.cancelled;
+}
+
+fun decision(action: Action, delay_ns: u64, cause: problem.Error) Decision {
+    ret Decision{action: action, delay_ns: delay_ns, cause: cause};
+}
+
+# bounded exponential backoff. doubling stops at max_delay_ns, so a long wait
+# can never overflow or grow without a ceiling.
+fun backoff(policy: Policy, attempts: usize) u64 {
+    var delay: u64 = policy.min_delay_ns;
+    var i: usize = 0;
+    for (i < attempts) {
+        if (delay >= policy.max_delay_ns || delay > 0x7fffffffffffffff) {
+            ret policy.max_delay_ns;
+        }
+        delay = delay * 2;
+        i = i + 1;
+    }
+    if (delay > policy.max_delay_ns) { ret policy.max_delay_ns; }
+    ret delay;
+}
+
+fun advised_ns(seconds: u64) u64 {
+    if (seconds > 0xffffffffffffffff / 1000000000) {
+        ret 0xffffffffffffffff;
+    }
+    ret seconds * 1000000000;
+}
+
+# the caller owns the clock. every wait is decided from the supplied monotonic
+# reading, the authority's Retry-After, and the absolute deadline.
+pub fun next(state: *State, reached: bool, terminal: bool,
+    retry_after_seconds: u64, now_ns: i64) Decision {
+    if (state == nil || !memory_range.valid(state::*u8, $size_of(State)) ||
+        !state.started || !policy_valid(state.policy)) {
+        ret decision(TERMINAL, 0,
+            problem.local_code(problem.STATE, problem.INVALID_STATE,
+                "poll state is not initialized"));
+    }
+    if (state.cancelled) {
+        ret decision(CANCELLED, 0,
+            problem.local_code(problem.POLICY, problem.INVALID_STATE,
+                "poll was cancelled"));
+    }
+    if (reached) { ret decision(READY, 0, problem.none()); }
+    if (terminal) {
+        ret decision(TERMINAL, 0,
+            problem.local_code(problem.PROTOCOL, problem.INVALID_STATE,
+                "resource reached a terminal status other than the target"));
+    }
+    if (state.attempts >= state.policy.max_attempts) {
+        ret decision(LIMIT, 0,
+            problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
+                "poll attempt limit reached"));
+    }
+    var delay: u64 = backoff(state.policy, state.attempts);
+    val advised: u64 = advised_ns(retry_after_seconds);
+    if (advised > delay) { delay = advised; }
+    if (delay > state.policy.max_delay_ns) { delay = state.policy.max_delay_ns; }
+    if (now_ns >= state.deadline_ns) {
+        ret decision(DEADLINE, 0,
+            problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
+                "poll deadline reached"));
+    }
+    val remaining: u64 = (state.deadline_ns - now_ns)::u64;
+    if (delay > remaining) {
+        ret decision(DEADLINE, 0,
+            problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
+                "poll delay would pass the deadline"));
+    }
+    state.attempts = state.attempts + 1;
+    ret decision(WAIT, delay, problem.none());
+}
+
+test "acme.poll: waits are bounded, advised, and deadline aware" {
+    var state: State;
+    var policy: Policy = policy_default();
+    policy.min_delay_ns = 1000000000;
+    policy.max_delay_ns = 8000000000;
+    policy.max_attempts = 4;
+    if (problem.failed(begin(?state, policy, 1000000000000))) { ret 1; }
+    if (next(?state, false, false, 0, 0).delay_ns != 1000000000 ||
+        next(?state, false, false, 0, 0).delay_ns != 2000000000 ||
+        next(?state, false, false, 0, 0).delay_ns != 4000000000 ||
+        next(?state, false, false, 0, 0).delay_ns != 8000000000) { ret 2; }
+    if (next(?state, false, false, 0, 0).action != LIMIT) { ret 3; }
+    # advice outranks the floor but never the ceiling
+    if (problem.failed(begin(?state, policy, 1000000000000))) { ret 4; }
+    if (next(?state, false, false, 5, 0).delay_ns != 5000000000) { ret 5; }
+    if (problem.failed(begin(?state, policy, 1000000000000))) { ret 6; }
+    if (next(?state, false, false, 3600, 0).delay_ns != policy.max_delay_ns ||
+        next(?state, false, false, 0xffffffffffffffff, 0).delay_ns !=
+            policy.max_delay_ns) { ret 7; }
+    # a wait that would pass the deadline is refused, not truncated, and the
+    # attempt counter does not advance
+    if (problem.failed(begin(?state, policy, 500000000))) { ret 8; }
+    if (next(?state, false, false, 0, 0).action != DEADLINE ||
+        state.attempts != 0) { ret 9; }
+    if (problem.failed(begin(?state, policy, 100))) { ret 10; }
+    if (next(?state, false, false, 0, 100).action != DEADLINE) { ret 11; }
+    # reached, terminal, and cancelled are distinct outcomes
+    if (problem.failed(begin(?state, policy, 1000000000000))) { ret 12; }
+    if (next(?state, true, false, 0, 0).action != READY ||
+        next(?state, false, true, 0, 0).action != TERMINAL ||
+        next(?state, true, true, 0, 0).action != READY) { ret 13; }
+    if (!cancel(?state) || !cancelled(?state) ||
+        next(?state, true, false, 0, 0).action != CANCELLED) { ret 14; }
+    var fresh: State;
+    if (next(?fresh, false, false, 0, 0).action != TERMINAL ||
+        cancel(?fresh) || cancelled(?fresh)) { ret 15; }
+    var bad: Policy = policy;
+    bad.min_delay_ns = 0;
+    if (!problem.failed(begin(?state, bad, 1000))) { ret 16; }
+    ret 0;
+}

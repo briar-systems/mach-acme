@@ -249,6 +249,73 @@ interpretation. A terminal status that is not the target is reported distinctly
 from reaching the target, so an order that went `invalid` is never mistaken for
 success.
 
+## Challenges
+
+`challenge.key_authorization` computes the RFC 8555 section 8.1 value by
+deriving the account key's RFC 7638 thumbprint internally. The caller supplies
+the challenge and the signer, never a thumbprint, so a challenge cannot be
+answered with a key the account does not hold. Output cannot overlap the token
+or the public key, and a capacity failure publishes nothing.
+
+Derived data is exact and bounded:
+
+- HTTP-01: the `/.well-known/acme-challenge/<token>` path, with the key
+  authorization as the response body
+- DNS-01: the `_acme-challenge.<base domain>` record name and the
+  `base64url(SHA-256(keyAuthorization))` value. A wildcard order is validated
+  against its base domain, so the record name never carries the wildcard label.
+- TLS-ALPN-01: the RFC 8737 section 3 `SHA-256(keyAuthorization)` digest and the
+  DER `OCTET STRING` that carries it as the `acmeIdentifier` extension value.
+  The caller builds the self-signed certificate and marks that extension
+  critical.
+
+Every key authorization is re-validated before it is used as digest input, so a
+malformed value never reaches a hash or a provider.
+
+`challenge.Attempt` binds one presentation to one provider and one location.
+Cleanup is owed exactly when presentation succeeded. A provider that declines
+the challenge through `supports` is never asked to present. A presentation that
+returned a failure owes no cleanup, because a provider that could not publish
+is responsible for its own partial state.
+
+`challenge.finish` is the single exit for success, failure, timeout, and
+cancellation. It invokes cleanup exactly once and is idempotent afterwards: a
+repeated call is accepted and does not reach the provider again. A cleanup that
+fails reports that failure and is still never repeated, so a provider cannot be
+asked to withdraw the same state twice. The presentation and cleanup call
+counters are public so exactly-once is observed rather than inferred. Provider
+callbacks are serialized and same-thread reentrancy is rejected before a nested
+callback can move the attempt.
+
+`challenge.begin_respond` submits the RFC 8555 section 7.5.1 empty JSON object
+to the challenge URL under the account `kid`, and rejects any other payload.
+
+## DNS propagation
+
+Observing a published record is a caller policy, not a library timer.
+`challenge.Probe` carries an injectable observation callback, so a deployment
+supplies a resolver and a test supplies a deterministic answer. Each
+`propagation_next` performs exactly one observation. Confirmations must be
+consecutive: a record that appears and then disappears restarts the count
+rather than proceeding. The wait is bounded by the shared poll policy's attempt
+ceiling, delay ceiling, and absolute deadline, and cancellation is honoured
+before any observation is made.
+
+## Bounded waiting
+
+`acme.poll` holds the single wait policy that orders, challenges, and renewal
+share, so the three can never drift apart. It is status agnostic: callers
+reduce their own vocabulary to `reached` and `terminal`.
+
+Retry-After is honoured when it exceeds the local backoff floor, and every wait
+is clamped to the policy ceiling, so a hostile or mistaken advisory cannot
+produce an unbounded wait. Backoff doubles from the floor and saturates without
+overflowing. A wait that would pass the absolute deadline is refused rather
+than truncated, and a decision that produced no wait does not advance the
+attempt counter. Cancellation is checked before any status interpretation, and
+a terminal status that is not the target is reported distinctly from reaching
+the target.
+
 ## Replay nonce ownership
 
 A `nonce.Pool` owns copies of available nonces. The supplied memory implementation

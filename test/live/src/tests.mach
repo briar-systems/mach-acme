@@ -11,6 +11,7 @@ use http.core.field;
 use http.core.method;
 use http.core.status;
 use R: std.types.result;
+use T: std.chrono.time;
 use std.net.ip;
 use std.net.tcp;
 use IO: std.io.error;
@@ -30,9 +31,12 @@ use acme.identifier;
 use acme.jose;
 use acme.nonce;
 use acme.order;
+use acme.poll;
 use acme.problem;
+use std.system.os;
 
 val ACME_PORT:      u16 = 14001;
+val MANAGE_PORT:    u16 = 8055;
 val MAX_BODY_BYTES: usize = 65536;
 val MAX_FIELDS:     usize = 64;
 
@@ -40,6 +44,15 @@ fun length(text: *u8) usize {
     var i: usize = 0;
     for (text[i] != 0) { i = i + 1; }
     ret i;
+}
+
+fun equal(first: *u8, second: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 fun copy(destination: *u8, source: *u8, len: usize) {
@@ -844,30 +857,347 @@ test "live: post-as-get order polling drives the bounded poll decision" {
     # the live status feeds the bounded poll decision. this authority does not
     # advise Retry-After on a pending order; it does once a challenge is
     # processing, which the challenge suite exercises.
-    var state: order.Poll;
-    var policy: order.PollPolicy = order.poll_policy_default();
+    var state: poll.State;
+    var policy: poll.Policy = poll.policy_default();
     policy.min_delay_ns = 1000000000;
     policy.max_delay_ns = 60000000000;
-    if (problem.failed(order.poll_begin(?state, policy, 3600000000000))) {
+    if (problem.failed(poll.begin(?state, policy, 3600000000000))) {
         ret 8;
     }
     val advised: u64 = retry_after(?exchange);
-    val waited: order.PollDecision = order.poll_next(?state, polled.status,
+    val waited: poll.Decision = order.poll_next(?state, polled.status,
         order.READY, advised, 0);
-    if (waited.action != order.POLL_WAIT) { ret 9; }
+    if (waited.action != poll.WAIT) { ret 9; }
     var expected: u64 = policy.min_delay_ns;
     if (advised * 1000000000 > expected) { expected = advised * 1000000000; }
     if (waited.delay_ns != expected) { ret 10; }
 
     # an absolute deadline the next wait would pass stops the loop
-    if (problem.failed(order.poll_begin(?state, policy, 500000000))) { ret 11; }
+    if (problem.failed(poll.begin(?state, policy, 500000000))) { ret 11; }
     if (order.poll_next(?state, polled.status, order.READY, advised, 0).action
-        != order.POLL_DEADLINE) { ret 12; }
+        != poll.DEADLINE) { ret 12; }
 
     # cancellation is observable from outside the poll loop
-    if (problem.failed(order.poll_begin(?state, policy, 3600000000000)) ||
-        !order.poll_cancel(?state) ||
+    if (problem.failed(poll.begin(?state, policy, 3600000000000)) ||
+        !poll.cancel(?state) ||
         order.poll_next(?state, polled.status, order.READY, advised,
-            0).action != order.POLL_CANCELLED) { ret 13; }
+            0).action != poll.CANCELLED) { ret 13; }
     ret 0;
+}
+
+# posts a json document to the challenge test server's management api. that
+# server answers the authority's http-01, dns-01, and tls-alpn-01 validation.
+fun manage(path: *u8, body: *u8, len: usize) bool {
+    var head: [1024]u8;
+    var writer: Writer = Writer{data: ?head[0], cap: 1024, pos: 0};
+    if (!put_text(?writer, "POST ") || !put_text(?writer, path) ||
+        !put_text(?writer, " HTTP/1.1\r\nHost: 127.0.0.1:8055\r\n") ||
+        !put_text(?writer,
+            "User-Agent: mach-acme-live/0.1\r\nConnection: close\r\n") ||
+        !put_text(?writer, "Content-Type: application/json\r\nContent-Length: ") ||
+        !put_number(?writer, len) || !put_text(?writer, "\r\n\r\n")) {
+        ret false;
+    }
+    val connected: R.Result[tcp.Stream, IO.Error] = tcp.connect(
+        ip.endpoint(127, 0, 0, 1, MANAGE_PORT));
+    if (R.is_err[tcp.Stream, IO.Error](connected)) { ret false; }
+    var stream: tcp.Stream = R.unwrap_ok[tcp.Stream, IO.Error](connected);
+    tcp.stream_set_read_timeout(?stream, 10000);
+    var ok: bool = send_all(?stream, ?head[0], writer.pos) &&
+        send_all(?stream, body, len);
+    var reply: [4096]u8;
+    var total: usize = 0;
+    for (ok) {
+        val received: R.Result[usize, IO.Error] = tcp.stream_read(?stream,
+            ?reply[total], 4096 - total);
+        if (R.is_err[usize, IO.Error](received)) { ok = false; }
+        or {
+            val count: usize = R.unwrap_ok[usize, IO.Error](received);
+            if (count == 0) { brk; }
+            total = total + count;
+            if (total == 4096) { brk; }
+        }
+    }
+    tcp.stream_close(?stream);
+    if (!ok || total < 12) { ret false; }
+    var code: u16 = 0;
+    ret parse_status(?reply[0], total, ?code) != 0 && code == 200;
+}
+
+fun put_json_string(writer: *Writer, value: view.View) bool {
+    if (!put_text(writer, "\"")) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        if (value.data[i] == '"' || value.data[i] == '\\') { ret false; }
+        if (!put(writer, ?value.data[i], 1)) { ret false; }
+        i = i + 1;
+    }
+    ret put_text(writer, "\"");
+}
+
+# a live challenge provider backed by the challenge test server
+rec LiveProvider {
+    subject:      identifier.Identifier;
+    key_auth:     view.View;
+    token:        view.View;
+    dns_record:   [320]u8;
+    dns_name_len: usize;
+    dns_value:    [64]u8;
+    kind:         u8;
+    published:    bool;
+}
+
+fun live_supports(ctx: ptr, subject: identifier.Identifier, kind: u8) bool {
+    ret kind == challenge.HTTP_01 || kind == challenge.DNS_01 ||
+        kind == challenge.TLS_ALPN_01;
+}
+
+fun live_present(ctx: ptr, subject: identifier.Identifier,
+    value: challenge.Challenge,
+    key_auth: view.View) R.Result[challenge.Presentation, problem.Error] {
+    val state: *LiveProvider = ctx::*LiveProvider;
+    state.kind = value.typ;
+    state.token = value.token;
+    var body: [1024]u8;
+    var writer: Writer = Writer{data: ?body[0], cap: 1024, pos: 0};
+    var ok: bool = false;
+    if (value.typ == challenge.HTTP_01) {
+        ok = put_text(?writer, "{\"token\":") &&
+            put_json_string(?writer, value.token) &&
+            put_text(?writer, ",\"content\":") &&
+            put_json_string(?writer, key_auth) && put_text(?writer, "}") &&
+            manage("/add-http01", ?body[0], writer.pos);
+    } or (value.typ == challenge.DNS_01) {
+        # the record name and value are the library's own computation, so the
+        # authority validates exactly what mach-acme produced
+        val named: challenge.Operation = challenge.dns_name(subject,
+            contracts.Buffer{data: ?state.dns_record[0], capacity: 320});
+        val valued: challenge.Operation = challenge.dns_value(key_auth,
+            contracts.Buffer{data: ?state.dns_value[0], capacity: 64});
+        if (problem.failed(named.error) || problem.failed(valued.error)) {
+            ret R.err[challenge.Presentation, problem.Error](named.error);
+        }
+        state.dns_name_len = named.written;
+        ok = put_text(?writer, "{\"host\":") &&
+            put_json_string(?writer,
+                view.view(?state.dns_record[0], named.written)) &&
+            put_text(?writer, ",\"value\":") &&
+            put_json_string(?writer,
+                view.view(?state.dns_value[0], valued.written)) &&
+            put_text(?writer, "}") &&
+            manage("/set-txt", ?body[0], writer.pos);
+    } or {
+        ok = put_text(?writer, "{\"host\":") &&
+            put_json_string(?writer, subject.value) &&
+            put_text(?writer, ",\"content\":") &&
+            put_json_string(?writer, key_auth) && put_text(?writer, "}") &&
+            manage("/add-tlsalpn01", ?body[0], writer.pos);
+    }
+    if (!ok) {
+        ret R.err[challenge.Presentation, problem.Error](
+            problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
+                "challenge test server rejected the presentation"));
+    }
+    state.subject = subject;
+    state.key_auth = key_auth;
+    state.published = true;
+    ret R.ok[challenge.Presentation, problem.Error](
+        challenge.Presentation{ctx: ctx});
+}
+
+fun live_cleanup(ctx: ptr,
+    presentation: challenge.Presentation) R.Result[bool, problem.Error] {
+    val state: *LiveProvider = ctx::*LiveProvider;
+    var body: [1024]u8;
+    var writer: Writer = Writer{data: ?body[0], cap: 1024, pos: 0};
+    var ok: bool = false;
+    if (state.kind == challenge.HTTP_01) {
+        ok = put_text(?writer, "{\"token\":") &&
+            put_json_string(?writer, state.token) && put_text(?writer, "}") &&
+            manage("/del-http01", ?body[0], writer.pos);
+    } or (state.kind == challenge.DNS_01) {
+        ok = put_text(?writer, "{\"host\":") &&
+            put_json_string(?writer,
+                view.view(?state.dns_record[0], state.dns_name_len)) &&
+            put_text(?writer, "}") &&
+            manage("/clear-txt", ?body[0], writer.pos);
+    } or {
+        ok = put_text(?writer, "{\"host\":") &&
+            put_json_string(?writer, state.subject.value) &&
+            put_text(?writer, "}") &&
+            manage("/del-tlsalpn01", ?body[0], writer.pos);
+    }
+    state.published = false;
+    if (!ok) {
+        ret R.err[bool, problem.Error](
+            problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
+                "challenge test server rejected the cleanup"));
+    }
+    ret R.ok[bool, problem.Error](true);
+}
+
+fun live_provider(state: *LiveProvider) challenge.Provider {
+    state.published = false;
+    state.kind = 0;
+    state.dns_name_len = 0;
+    ret challenge.Provider{ctx: state::ptr, supports: live_supports,
+        present: live_present, cleanup: live_cleanup};
+}
+
+fun monotonic_ns() i64 {
+    val current: T.Time = T.monotonic();
+    ret current.sec * 1000000000 + current.nsec;
+}
+
+# drives one identifier all the way through one challenge type against the
+# live authority: order, authorization, key authorization, presentation,
+# response, polling to valid, and cleanup.
+fun run_challenge(session: *Session, exchange: *Exchange, name: str,
+    name_len: usize, kind: u8, provider: *LiveProvider,
+    attempt: *challenge.Attempt, advised: *u64) i32 {
+    var names: [1]identifier.Identifier;
+    names[0] = dns_name(name, name_len);
+    var text: [8192]u8;
+    var parsed_names: [8]identifier.Identifier;
+    var authorizations: [8]view.View;
+    var created: order.Order;
+    var decision: client.Decision;
+    if (!create_order(session, exchange, ?names[0], 1,
+            identifier.policy_default(),
+            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+            ?created, ?decision)) { ret 10; }
+    if (created.authorization_len != 1) { ret 11; }
+
+    var authorization: order.Authorization;
+    var authorization_text: [8192]u8;
+    var challenges: [8]challenge.Challenge;
+    val storage: order.AuthorizationStorage = order.AuthorizationStorage{
+        data: ?authorization_text[0], capacity: 8192,
+        challenges: ?challenges[0], challenge_capacity: 8};
+    if (!fetch_authorization(session, exchange, authorizations[0],
+            identifier.policy_default(), storage, ?authorization)) { ret 12; }
+    if (!order.challenge_admissible(authorization, kind)) { ret 13; }
+    val selected: *challenge.Challenge = order.select_challenge(authorization,
+        kind);
+    if (selected == nil || selected.status != challenge.PENDING) { ret 14; }
+
+    # the key authorization is derived from the account key this session
+    # actually registered, not supplied by the test
+    var key_auth_bytes: [256]u8;
+    val key_auth: challenge.Operation = challenge.key_authorization(@selected,
+        jose.signer(session.public_key),
+        contracts.Buffer{data: ?key_auth_bytes[0], capacity: 256});
+    if (problem.failed(key_auth.error)) { ret 15; }
+
+    if (problem.failed(challenge.attempt_init(attempt,
+            live_provider(provider)))) { ret 16; }
+    if (problem.failed(challenge.begin(attempt, authorization.identifier,
+            @selected, key_auth.value))) { ret 17; }
+    if (attempt.present_calls != 1 || !challenge.presented(attempt)) { ret 18; }
+
+    # tell the authority the challenge is ready
+    var respond: client.SignedRequest;
+    if (problem.failed(challenge.begin_respond(?session.protocol, ?respond,
+            selected.url, session.account.url,
+            view.view(challenge.RESPOND_PAYLOAD, 2),
+            jose.signer(session.public_key)))) { ret 19; }
+    if (!run_signed(session, ?respond, exchange, ?decision)) { ret 20; }
+
+    # poll the authorization until the authority validates it
+    var state: poll.State;
+    var policy: poll.Policy = poll.policy_default();
+    policy.min_delay_ns = 200000000;
+    policy.max_delay_ns = 2000000000;
+    policy.max_attempts = 40;
+    if (problem.failed(poll.begin(?state, policy,
+            monotonic_ns() + 60000000000))) { ret 21; }
+    @advised = 0;
+    var settled: bool = false;
+    var rounds: usize = 0;
+    for (!settled && rounds < 40) {
+        rounds = rounds + 1;
+        if (!fetch_authorization(session, exchange, authorizations[0],
+                identifier.policy_default(), storage, ?authorization)) {
+            ret 22;
+        }
+        val advice: u64 = retry_after(exchange);
+        if (advice > @advised) { @advised = advice; }
+        # the authority's advice is honoured, but this suite must finish, so
+        # the wait is taken from the policy floor rather than the advice
+        val step: poll.Decision = poll.next(?state,
+            authorization.status == order.AUTH_VALID,
+            authorization.status == order.AUTH_INVALID, 0, monotonic_ns());
+        if (step.action == poll.READY) { settled = true; }
+        or (step.action == poll.WAIT) { os.sleep(step.delay_ns::i64); }
+        or { ret 23; }
+    }
+    if (!settled || authorization.status != order.AUTH_VALID) { ret 24; }
+
+    # cleanup runs exactly once on the success path too
+    if (problem.failed(challenge.finish(attempt)) ||
+        attempt.cleanup_calls != 1 || provider.published) { ret 25; }
+    if (problem.failed(challenge.finish(attempt)) ||
+        attempt.cleanup_calls != 1) { ret 26; }
+
+    # every authorization is valid, so the order is ready to finalize
+    var polled: order.Order;
+    var poll_text: [8192]u8;
+    var poll_names: [8]identifier.Identifier;
+    var poll_authorizations: [8]view.View;
+    var fetch: client.SignedRequest;
+    if (problem.failed(order.begin_fetch(?session.protocol, ?fetch,
+            created.url, session.account.url,
+            jose.signer(session.public_key)))) { ret 27; }
+    if (!run_signed(session, ?fetch, exchange, ?decision)) { ret 28; }
+    if (problem.failed(order.parse(response(exchange), created.url,
+            identifier.policy_default(), order.limits_default(),
+            ?session.scratch[0], 32768,
+            order_storage(?poll_text[0], ?poll_names[0],
+                ?poll_authorizations[0]), ?polled))) { ret 29; }
+    if (polled.status != order.READY || polled.finalize_url.len == 0) {
+        ret 30;
+    }
+    ret 0;
+}
+
+test "live: http-01 validates against the authority end to end" {
+    var session: Session;
+    var exchange: Exchange;
+    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_account(?session, ?exchange)) { ret 2; }
+    var provider: LiveProvider;
+    var attempt: challenge.Attempt;
+    var advised: u64 = 0;
+    ret run_challenge(?session, ?exchange, "http01.live.example", 19,
+        challenge.HTTP_01, ?provider, ?attempt, ?advised);
+}
+
+test "live: dns-01 validates the library's own record name and digest" {
+    var session: Session;
+    var exchange: Exchange;
+    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_account(?session, ?exchange)) { ret 2; }
+    var provider: LiveProvider;
+    var attempt: challenge.Attempt;
+    var advised: u64 = 0;
+    val outcome: i32 = run_challenge(?session, ?exchange, "dns01.live.example",
+        18, challenge.DNS_01, ?provider, ?attempt, ?advised);
+    if (outcome != 0) { ret outcome; }
+    # the record the authority resolved was named and valued by mach-acme
+    if (provider.dns_name_len != 34 ||
+        !equal(?provider.dns_record[0], "_acme-challenge.dns01.live.example",
+            34)) { ret 3; }
+    ret 0;
+}
+
+test "live: tls-alpn-01 validates against the authority end to end" {
+    var session: Session;
+    var exchange: Exchange;
+    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_account(?session, ?exchange)) { ret 2; }
+    var provider: LiveProvider;
+    var attempt: challenge.Attempt;
+    var advised: u64 = 0;
+    ret run_challenge(?session, ?exchange, "alpn01.live.example", 19,
+        challenge.TLS_ALPN_01, ?provider, ?attempt, ?advised);
 }
