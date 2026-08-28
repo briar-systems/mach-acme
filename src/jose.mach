@@ -10,6 +10,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.view;
+use acme.memory_range;
 use acme.problem;
 
 pub def Algorithm: u8;
@@ -232,10 +233,12 @@ fun base64url(writer: *Writer, input: *u8, len: usize) bool {
 fun valid_rsa_public(key: signature.RsaPublicKey) bool {
     val modulus: contracts.Bytes = key.modulus;
     val exponent: contracts.Bytes = key.exponent;
-    if (modulus.data == nil || modulus.len < signature.RSA_MIN_MODULUS_SIZE ||
+    if (!memory_range.valid(modulus.data, modulus.len) ||
+        modulus.len < signature.RSA_MIN_MODULUS_SIZE ||
         modulus.len > signature.RSA_MAX_MODULUS_SIZE || modulus.len % 4 != 0 ||
         modulus.data[0] < 0x80 || (modulus.data[modulus.len - 1] & 1) == 0 ||
-        exponent.data == nil || exponent.len == 0 || exponent.len > modulus.len ||
+        !memory_range.valid(exponent.data, exponent.len) || exponent.len == 0 ||
+        exponent.len > modulus.len ||
         (exponent.len > 1 && exponent.data[0] == 0) ||
         (exponent.data[exponent.len - 1] & 1) == 0) {
         ret false;
@@ -255,13 +258,15 @@ fun valid_rsa_public(key: signature.RsaPublicKey) bool {
 
 fun valid_rsa_private(key: signature.RsaPrivateKey) bool {
     ret valid_rsa_public(signature.RsaPublicKey{modulus: key.modulus,
-        exponent: key.public_exponent}) && key.private_exponent.data != nil &&
+        exponent: key.public_exponent}) &&
+        key.private_exponent.data != nil &&
         key.private_exponent.len == key.modulus.len;
 }
 
 fun public_key_valid(key: PublicKey) bool {
     if (key.algorithm == ES256) {
-        if (key.value.data == nil || key.value.len != 65 || key.value.data[0] != 0x04) {
+        if (!memory_range.valid(key.value.data, key.value.len) ||
+            key.value.len != 65 || key.value.data[0] != 0x04) {
             ret false;
         }
         ret signature.verify_ecdsa_p256_sha256(key.value,
@@ -269,7 +274,8 @@ fun public_key_valid(key: PublicKey) bool {
             contracts.Bytes{data: nil, len: 0}) == contracts.AUTH_FAILED;
     }
     if (key.algorithm == EDDSA) {
-        if (key.value.data == nil || key.value.len != 32) { ret false; }
+        if (!memory_range.valid(key.value.data, key.value.len) ||
+            key.value.len != 32) { ret false; }
         var invalid_signature: [64]u8;
         ret signature.verify_ed25519(key.value,
             contracts.Bytes{data: nil, len: 0},
@@ -281,10 +287,12 @@ fun public_key_valid(key: PublicKey) bool {
 
 fun private_key_valid(key: PrivateKey) bool {
     if (key.algorithm == ES256) {
-        ret key.value.data != nil && key.value.len == 32;
+        ret key.value.data != nil &&
+            key.value.len == 32;
     }
     if (key.algorithm == EDDSA) {
-        ret key.value.data != nil && key.value.len == 32;
+        ret key.value.data != nil &&
+            key.value.len == 32;
     }
     if (key.algorithm == PS256) { ret valid_rsa_private(key.rsa); }
     ret false;
@@ -331,6 +339,43 @@ fun algorithm_name(algorithm: Algorithm) view.View {
     ret view.view(nil, 0);
 }
 
+fun public_overlaps(key: PublicKey, data: *u8, len: usize) bool {
+    if (key.algorithm == ES256 || key.algorithm == EDDSA) {
+        ret memory_range.overlap(data, len, key.value.data, key.value.len);
+    }
+    if (key.algorithm == PS256) {
+        ret memory_range.overlap(data, len, key.rsa.modulus.data,
+            key.rsa.modulus.len) ||
+            memory_range.overlap(data, len, key.rsa.exponent.data,
+                key.rsa.exponent.len);
+    }
+    ret false;
+}
+
+fun private_overlaps(key: PrivateKey, data: *u8, len: usize) bool {
+    if (key.algorithm == ES256 || key.algorithm == EDDSA) { ret false; }
+    if (key.algorithm == PS256) {
+        ret memory_range.overlap(data, len, key.rsa.modulus.data,
+            key.rsa.modulus.len) ||
+            memory_range.overlap(data, len, key.rsa.public_exponent.data,
+                key.rsa.public_exponent.len);
+    }
+    ret false;
+}
+
+pub fun signing_inputs_overlap(signer_value: Signer, private_key: PrivateKey,
+    data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    ret public_overlaps(signer_value.public_key, data, len) ||
+        private_overlaps(private_key, data, len);
+}
+
+fun protected_overlaps(value: Protected, data: *u8, len: usize) bool {
+    ret memory_range.overlap(data, len, value.nonce.data, value.nonce.len) ||
+        memory_range.overlap(data, len, value.url.data, value.url.len) ||
+        memory_range.overlap(data, len, value.kid.data, value.kid.len);
+}
+
 fun write_jwk(key: PublicKey, writer: *Writer) problem.Error {
     if (!public_key_valid(key)) {
         ret problem.local_code(problem.SIGNING, problem.INVALID_KEY,
@@ -368,8 +413,10 @@ fun write_jwk(key: PublicKey, writer: *Writer) problem.Error {
 }
 
 pub fun key_encode_jwk(key: PublicKey, output: contracts.Buffer) Operation {
-    if (output.data == nil) {
-        ret failed(problem.PROTOCOL, problem.INVALID_INPUT, "jwk output is nil");
+    if (output.data == nil || !memory_range.valid(output.data, output.capacity) ||
+        public_overlaps(key, output.data, output.capacity)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "jwk output range is invalid or aliases the key");
     }
     var encoded: [1536]u8;
     var writer: Writer = Writer{data: ?encoded[0], cap: MAX_JWK_BYTES, pos: 0};
@@ -387,8 +434,10 @@ pub fun key_encode_jwk(key: PublicKey, output: contracts.Buffer) Operation {
 }
 
 pub fun key_thumbprint(key: PublicKey, output: contracts.Buffer) Operation {
-    if (output.data == nil) {
-        ret failed(problem.PROTOCOL, problem.INVALID_INPUT, "thumbprint output is nil");
+    if (output.data == nil || !memory_range.valid(output.data, output.capacity) ||
+        public_overlaps(key, output.data, output.capacity)) {
+        ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
+            "thumbprint output range is invalid or aliases the key");
     }
     if (output.capacity < THUMBPRINT_BYTES) {
         ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
@@ -466,7 +515,10 @@ pub fun key_sign(key: PrivateKey, entropy: Entropy, message: contracts.Bytes,
     if (!private_key_valid(key)) {
         ret failed(problem.SIGNING, problem.INVALID_KEY, "account key is invalid");
     }
-    if ((message.len != 0 && message.data == nil) || output.data == nil) {
+    if (!memory_range.valid(message.data, message.len) || output.data == nil ||
+        !memory_range.valid(output.data, output.capacity) ||
+        memory_range.overlap(output.data, output.capacity, message.data, message.len) ||
+        private_overlaps(key, output.data, output.capacity)) {
         ret failed(problem.PROTOCOL, problem.INVALID_INPUT, "invalid signing buffer");
     }
     if (key.algorithm == ES256) {
@@ -546,17 +598,6 @@ pub fun valid(value: Signer) bool {
         value.max_signature_bytes <= MAX_SIGNATURE_BYTES;
 }
 
-fun ranges_overlap(first: *u8, first_len: usize, second: *u8,
-    second_len: usize) bool {
-    if (first_len == 0 || second_len == 0) { ret false; }
-    val first_start: usize = first::usize;
-    val second_start: usize = second::usize;
-    if (first_start > 0xffffffffffffffff - first_len ||
-        second_start > 0xffffffffffffffff - second_len) { ret true; }
-    ret first_start < second_start + second_len &&
-        second_start < first_start + first_len;
-}
-
 fun write_protected(signer_value: Signer, value: Protected,
     jwk: view.View, writer: *Writer) bool {
     val algorithm: view.View = algorithm_name(signer_value.algorithm);
@@ -584,7 +625,13 @@ pub fun encode_jws(signer_value: Signer, private_key: PrivateKey, entropy: Entro
     output: contracts.Buffer) Operation {
     if (!valid(signer_value) || !key_pair_valid(signer_value.public_key, private_key) ||
         work.data == nil || output.data == nil ||
-        (payload.len != 0 && payload.data == nil) || payload.len > 0xbfffffffffffffff ||
+        !memory_range.valid(work.data, work.capacity) ||
+        !memory_range.valid(output.data, output.capacity) ||
+        !memory_range.valid(payload.data, payload.len) ||
+        !memory_range.valid(protected.nonce.data, protected.nonce.len) ||
+        !memory_range.valid(protected.url.data, protected.url.len) ||
+        !memory_range.valid(protected.kid.data, protected.kid.len) ||
+        payload.len > 0xbfffffffffffffff ||
         (protected.include_nonce && protected.nonce.len == 0) ||
         (!protected.include_nonce && protected.nonce.len != 0) ||
         protected.url.len == 0 ||
@@ -595,9 +642,17 @@ pub fun encode_jws(signer_value: Signer, private_key: PrivateKey, entropy: Entro
         (!protected.use_jwk && !ascii_json_value(protected.kid))) {
         ret failed(problem.PROTOCOL, problem.INVALID_INPUT, "invalid jws input");
     }
-    if (ranges_overlap(work.data, work.capacity, output.data, output.capacity)) {
+    if (memory_range.overlap(work.data, work.capacity, output.data, output.capacity) ||
+        memory_range.overlap(work.data, work.capacity, payload.data, payload.len) ||
+        memory_range.overlap(output.data, output.capacity, payload.data, payload.len) ||
+        protected_overlaps(protected, work.data, work.capacity) ||
+        protected_overlaps(protected, output.data, output.capacity) ||
+        public_overlaps(signer_value.public_key, work.data, work.capacity) ||
+        public_overlaps(signer_value.public_key, output.data, output.capacity) ||
+        private_overlaps(private_key, work.data, work.capacity) ||
+        private_overlaps(private_key, output.data, output.capacity)) {
         ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
-            "jws output overlaps work storage");
+            "jws storage overlaps an input or key");
     }
     var jwk_len: usize = 0;
     if (protected.use_jwk) {

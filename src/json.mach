@@ -13,6 +13,7 @@ use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.view;
 use std.text.utf8;
+use acme.memory_range;
 use acme.problem;
 
 pub rec Limits {
@@ -182,14 +183,16 @@ fun validate_tree(value: *J.Value, depth: usize, configured: Limits,
 
 pub fun parse(input: view.View, scratch: *u8, scratch_capacity: usize,
     configured: Limits) Document {
+    if (!memory_range.valid(input.data, input.len) || scratch == nil ||
+        scratch_capacity == 0 || !memory_range.valid(scratch, scratch_capacity) ||
+        memory_range.overlap(input.data, input.len, scratch, scratch_capacity)) {
+        ret invalid(problem.INVALID_INPUT, "json input or scratch range is invalid");
+    }
     val scan: problem.Error = prescan(input, configured);
     if (problem.failed(scan)) {
         var document: Document = invalid(scan.code, scan.detail);
         document.error.kind = scan.kind;
         ret document;
-    }
-    if (scratch == nil || scratch_capacity == 0) {
-        ret invalid(problem.INVALID_INPUT, "json scratch is invalid");
     }
     var allocator: A.Allocator;
     var state: F.FixedState;

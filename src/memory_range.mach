@@ -1,0 +1,29 @@
+# overflow-safe byte range validation
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub fun valid(data: *u8, len: usize) bool {
+    if (len == 0) { ret true; }
+    if (data == nil) { ret false; }
+    ret data::usize <= 0xffffffffffffffff - (len - 1);
+}
+
+pub fun overlap(first: *u8, first_len: usize, second: *u8,
+    second_len: usize) bool {
+    if (first_len == 0 || second_len == 0) { ret false; }
+    if (!valid(first, first_len) || !valid(second, second_len)) { ret true; }
+    val first_start: usize = first::usize;
+    val second_start: usize = second::usize;
+    ret first_start < second_start + second_len &&
+        second_start < first_start + first_len;
+}
+
+pub fun size(count: usize, item_size: usize, output: *usize) bool {
+    if (output == nil || (item_size != 0 &&
+        count > 0xffffffffffffffff / item_size)) { ret false; }
+    @output = count * item_size;
+    ret true;
+}
