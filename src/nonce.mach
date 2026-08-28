@@ -166,8 +166,10 @@ fun slot_data(memory: *Memory, index: usize) *u8 {
     ret ?memory.storage[index * memory.max_nonce_bytes];
 }
 
-fun equal_slot(memory: *Memory, index: usize, value: view.View) bool {
-    if (memory.slots[index].state != AVAILABLE || memory.slots[index].len != value.len) {
+fun equal_live_slot(memory: *Memory, index: usize, value: view.View) bool {
+    val state: u8 = memory.slots[index].state;
+    if ((state != AVAILABLE && state != RESERVED) ||
+        memory.slots[index].len != value.len) {
         ret false;
     }
     val data: *u8 = slot_data(memory, index);
@@ -239,7 +241,7 @@ fun put_locked(memory: *Memory, value: view.View) problem.Error {
     var empty_index: usize = memory.capacity;
     var i: usize = 0;
     for (i < memory.capacity) {
-        if (equal_slot(memory, i, value)) {
+        if (equal_live_slot(memory, i, value)) {
             ret problem.local_code(problem.NONCE, problem.DUPLICATE_NONCE,
                 "duplicate replay nonce");
         }
@@ -537,7 +539,9 @@ fun put_worker(arg: *u8) {
     val context: *PutContext = arg::*PutContext;
     val result: problem.Error = context.pool.put(context.pool.ctx,
         context.value);
-    if (problem.failed(result)) { atomic.store(context.result, -1); }
+    if (problem.failed(result)) {
+        atomic.store(context.result, 0 - result.code::i64);
+    }
     or { atomic.store(context.result, 1); }
 }
 
@@ -688,24 +692,39 @@ test "acme.nonce: reservation commit and release are exact transactions" {
         first.value.len != 5 || first_output[0] != 'n' ||
         problem.failed(second.error) || !second.found || second.token == 0 ||
         second.token == first.token || second_output[0] != 'o') { ret 3; }
+
+    var duplicate_result: i64 = 0;
+    var duplicate_context: PutContext = PutContext{pool: (?value),
+        value: view.view("newer", 5), result: ?duplicate_result};
+    var duplicate_thread: thread.Thread;
+    thread.spawn_with(put_worker, (?duplicate_context)::*u8, ?duplicate_thread);
+    if (duplicate_thread.tid < 0) { ret 4; }
+    thread.join(?duplicate_thread);
+    if (atomic.load(?duplicate_result) !=
+            0 - problem.DUPLICATE_NONCE::i64 ||
+        value.put(value.ctx, view.view("older", 5)).code !=
+            problem.DUPLICATE_NONCE) { ret 5; }
+
     if (problem.failed(value.release(value.ctx, first.token)) ||
         !problem.failed(value.release(value.ctx, first.token)) ||
+        value.put(value.ctx, view.view("newer", 5)).code !=
+            problem.DUPLICATE_NONCE ||
         problem.failed(value.commit(value.ctx, second.token)) ||
-        !problem.failed(value.commit(value.ctx, second.token))) { ret 4; }
+        !problem.failed(value.commit(value.ctx, second.token))) { ret 6; }
     val again: Reservation = value.reserve(value.ctx, ?first_output[0], 16);
     if (problem.failed(again.error) || !again.found ||
         again.value.len != 5 || first_output[0] != 'n' ||
-        problem.failed(value.commit(value.ctx, again.token))) { ret 5; }
+        problem.failed(value.commit(value.ctx, again.token))) { ret 7; }
     val empty: Reservation = value.reserve(value.ctx, ?first_output[0], 16);
     if (problem.failed(empty.error) || empty.found || empty.token != 0 ||
-        empty.value.data != nil || empty.value.len != 0) { ret 6; }
-    if (problem.failed(value.put(value.ctx, view.view("clear_me", 8)))) { ret 7; }
+        empty.value.data != nil || empty.value.len != 0) { ret 8; }
+    if (problem.failed(value.put(value.ctx, view.view("clear_me", 8)))) { ret 9; }
     val active: Reservation = value.reserve(value.ctx, ?first_output[0], 16);
     if (problem.failed(active.error) || !active.found ||
         problem.failed(value.clear(value.ctx)) ||
-        !problem.failed(value.commit(value.ctx, active.token))) { ret 8; }
+        !problem.failed(value.commit(value.ctx, active.token))) { ret 10; }
     if (problem.failed(value.put(value.ctx, view.view("after_clear", 11)))) {
-        ret 9;
+        ret 11;
     }
     val after_clear: Reservation = value.reserve(value.ctx,
         ?first_output[0], 16);
@@ -713,6 +732,6 @@ test "acme.nonce: reservation commit and release are exact transactions" {
         after_clear.token == active.token ||
         !problem.failed(value.commit(value.ctx, active.token)) ||
         problem.failed(value.commit(value.ctx, after_clear.token)) ||
-        take(value, ?first_output[0], 16).found) { ret 10; }
+        take(value, ?first_output[0], 16).found) { ret 12; }
     ret 0;
 }

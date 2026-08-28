@@ -81,7 +81,9 @@ select a JWK and retain a `kid`.
 
 A `nonce.Pool` owns copies of available nonces. The supplied memory implementation
 uses fixed caller storage and rejects empty, oversized, non-base64url, duplicate,
-and over-capacity values. Its `Memory`, slot array, and complete declared byte
+and over-capacity values. Duplicate detection covers every live available or
+reserved nonce, including while another thread holds a reservation. Its `Memory`,
+slot array, and complete declared byte
 store must be mathematically representable and pairwise disjoint. Put inputs and
 reservation outputs cannot alias any of those regions. Alias and range failures occur
 before a nonce is copied, consumed, or wiped.
