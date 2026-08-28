@@ -611,6 +611,18 @@ test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures"
         contracts.Buffer{data: ?output[0], capacity: 256});
     if (invalidated.error.code != problem.INVALID_INPUT ||
         invalidated.written != 0 || !filled(?output[0], 0xa5, 256)) { ret 7; }
+    val modulus_first: u8 = modulus[0];
+    hostile.mutate = ?modulus[0];
+    val key_mutated: jose.Operation = jose.key_sign(key,
+        jose.entropy_provider((?hostile)::ptr, hostile_entropy_fill,
+            hostile_entropy_aliases, entropy_aliases_no_secret,
+            entropy_still_valid),
+        contracts.Bytes{data: message, len: 32},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (key_mutated.error.code != problem.INVALID_INPUT ||
+        key_mutated.written != 0 || modulus[0] == modulus_first ||
+        !filled(?output[0], 0xa5, 256)) { ret 8; }
+    modulus[0] = modulus_first;
     ret 0;
 }
 

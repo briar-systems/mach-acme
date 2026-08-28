@@ -623,14 +623,24 @@ pub fun key_sign(key: PrivateKey, entropy: Entropy, message: contracts.Bytes,
             "rsa signing entropy is unavailable");
     }
     var message_digest: [32]u8;
+    var modulus_digest: [32]u8;
+    var exponent_digest: [32]u8;
     if (!sha256_bytes(message.data, message.len, ?message_digest[0]) ||
+        !sha256_bytes(key.rsa.modulus.data, key.rsa.modulus.len,
+            ?modulus_digest[0]) ||
+        !sha256_bytes(key.rsa.public_exponent.data,
+            key.rsa.public_exponent.len, ?exponent_digest[0]) ||
         entropy_owns(entropy, message.data, message.len) ||
         entropy_owns(entropy, output.data, output.capacity) ||
         entropy_owns(entropy, key.rsa.modulus.data, key.rsa.modulus.len) ||
         entropy_owns(entropy, key.rsa.public_exponent.data,
             key.rsa.public_exponent.len) ||
         entropy_owns_secret(entropy, ?salt[0], 32) ||
-        !sha256_unchanged(message.data, message.len, ?message_digest[0])) {
+        !sha256_unchanged(message.data, message.len, ?message_digest[0]) ||
+        !sha256_unchanged(key.rsa.modulus.data, key.rsa.modulus.len,
+            ?modulus_digest[0]) ||
+        !sha256_unchanged(key.rsa.public_exponent.data,
+            key.rsa.public_exponent.len, ?exponent_digest[0])) {
         ct.zeroize(?salt[0], 32);
         ret failed(problem.SIGNING, problem.INVALID_INPUT,
             "entropy provider aliases or mutated signing inputs");
@@ -639,7 +649,11 @@ pub fun key_sign(key: PrivateKey, entropy: Entropy, message: contracts.Bytes,
         contracts.SecretBuffer{data: ?salt[0], capacity: 32});
     val entropy_unchanged: bool = entropy.validate(entropy.validation_ctx);
     if (!entropy_unchanged || entropy_status != contracts.OK ||
-        !sha256_unchanged(message.data, message.len, ?message_digest[0])) {
+        !sha256_unchanged(message.data, message.len, ?message_digest[0]) ||
+        !sha256_unchanged(key.rsa.modulus.data, key.rsa.modulus.len,
+            ?modulus_digest[0]) ||
+        !sha256_unchanged(key.rsa.public_exponent.data,
+            key.rsa.public_exponent.len, ?exponent_digest[0])) {
         ct.zeroize(?salt[0], 32);
         if (!entropy_unchanged || entropy_status == contracts.OK) {
             ret failed(problem.SIGNING, problem.INVALID_INPUT,
