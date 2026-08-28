@@ -77,6 +77,74 @@ Outer ACME requests explicitly include a nonce. The same encoder can omit it for
 the nested JWS required by account key rollover. A protected header cannot both
 select a JWK and retain a `kid`.
 
+## Account lifecycle
+
+`account.encode` writes complete bounded payloads for account creation, existing
+account lookup, contact replacement, terms agreement, and deactivation. Creation
+may embed a complete external account binding object. Contact values must be
+nonempty ASCII URI values. Output is published only after the complete payload
+has been validated and encoded. The output cannot overlap the contact view array,
+contact bytes, or external binding bytes.
+
+`account.begin` accepts the matching successful `account.Operation`, uses the
+directory `newAccount` URL and a JWK for creation and lookup, and rejects an
+action or length mismatch. Updates require the same account URL as request
+endpoint and protected `kid`.
+`account.parse` accepts HTTP 200 or 201 and requires a strict account object with
+a known status, bounded contacts, and an HTTPS orders URL. JSON scratch, response
+storage, contact views, output, response fields, response body, and the retained
+account URL are range-checked and disjoint. Creation requires exactly one HTTPS
+`Location` field and copies it into account storage. Existing-account responses
+retain the caller's known account URL. Other parsed views point into caller-owned
+storage. Validation and capacity failures do not publish an account or change
+text storage.
+
+External account bindings are encoded internally rather than delegated to an
+unverifiable callback. `external_account.Binding` selects HS256 or HS384 and
+carries a secret-qualified MAC key plus a non-null opaque owner identity. The
+protected header binds `alg`, `kid`, and the exact `newAccount` URL. Its payload is
+the canonical JWK of the new account key. Work and output storage cannot overlap
+each other, public key bytes, the key ID, or URL. Final output is transactional.
+
+## Durable credentials and key rollover
+
+`account.Credentials` binds an account representation, public signer, opaque
+private-key owner, and nonzero generation. The opaque identity allows a secret
+provider to retain every supported private-key shape without exposing a public
+pointer to secret storage.
+
+`storage.Manager` wraps an application durable store. A replacement transaction
+checks the expected credential generation, stages the complete next credential,
+then commits or aborts by an exact provider token. Commit and abort distinguish a
+known failure from an unknown outcome. `storage.recover` returns the durable
+current credential and any pending replacement, allowing restart and ambiguous
+wire outcomes to be reconciled without guessing which key is active.
+
+`storage.begin_save` uses expected generation zero for the first account record
+and the current generation for contact, terms, status, or other account metadata
+updates. `storage.begin_replace` is reserved for key changes and requires the next
+generation while preserving the exact account representation. An interrupted
+initial save is recoverable as a pending generation-one credential even though no
+current record exists yet.
+
+Every store callback is serialized. Same-thread reentrancy is rejected before a
+nested callback can run. The callback descriptor is snapshotted, so direct
+mutation cannot redirect a later validation or cleanup call. Readiness, opaque
+secret ownership classification, complete credential digests, transaction shape,
+and load output shape are checked around callbacks. The store must own every
+returned public credential range and recognize its opaque secret owner, but it
+may not own the manager or caller's output record.
+
+`key_change.prepare` durably stages the candidate before publishing any rollover
+payload. It encodes the RFC 8555 inner payload containing the account URL and old
+JWK, then signs a nonce-free nested JWS with the new ES256, EdDSA, or PS256 key.
+The prepared value binds the exact nested JWS bytes, both endpoint URLs, the old
+key thumbprint, and the credential generation. `key_change.begin_outer` submits
+that object under the old account `kid`. Accepted responses commit, rejected
+responses abort, and ambiguous outcomes retain the pending transaction for
+explicit recovery. A local encoding or signing failure aborts before any nested
+JWS is published.
+
 ## Replay nonce ownership
 
 A `nonce.Pool` owns copies of available nonces. The supplied memory implementation
