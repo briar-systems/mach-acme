@@ -5,6 +5,8 @@ use http.core.field;
 use http.core.method;
 use http.core.status;
 use std.runtime;
+use std.sync.atomic;
+use std.sync.thread;
 use J: std.data.json;
 use std.encoding.base64;
 use std.types.bool.bool;
@@ -176,6 +178,25 @@ fun awaiting(protocol: *client.Client, request: *client.SignedRequest) {
         use_jwk: false});
     request.wire_body = view.view("prepared", 8);
     request.state = client.REQUEST_AWAITING;
+}
+
+rec AcceptContext {
+    protocol: *client.Client;
+    request:  *client.SignedRequest;
+    fields:   *field.Fields;
+    result:   *i64;
+}
+
+fun accept_worker(arg: *u8) {
+    val context: *AcceptContext = arg::*AcceptContext;
+    val decision: client.Decision = client.accept_signed_response(
+        context.protocol, context.request,
+        response(status.OK, context.fields, view.view(nil, 0)), nil, 0,
+        client.ProblemStorage{data: nil, capacity: 0,
+            subproblems: nil, subproblem_capacity: 0});
+    if (decision.action == client.ACTION_COMPLETE) {
+        atomic.store(context.result, 1);
+    } or { atomic.store(context.result, -1); }
 }
 
 val HOSTILE_NORMAL:        u8 = 0;
@@ -1694,7 +1715,8 @@ test "client: provider transactions fail closed before wire publication" {
         jose.no_entropy(), contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     if (problem.failed(reentrant.error) || reentrant_context.reentered ||
-        !reentrant_client.initialized || reentrant_client.callback_active ||
+        !reentrant_client.initialized ||
+        atomic.load(?reentrant_client.callback_owner) != 0 ||
         reentrant_request.state != client.REQUEST_AWAITING ||
         reentrant_context.commit_count != 1) { ret 3; }
 
@@ -1815,6 +1837,64 @@ test "client: provider transactions fail closed before wire publication" {
         changed.cause.code != problem.INVALID_STATE ||
         mutation_request.state != client.REQUEST_FAILED ||
         mutation_request.wire_body.data != nil) { ret 14; }
+    ret 0;
+}
+
+test "client: callback boundaries serialize concurrent requests" {
+    var slots: [4]nonce.Slot;
+    var nonce_storage: [256]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 4,
+        ?nonce_storage[0], 256, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool,
+        client.limits_default()))) { ret 2; }
+    var first: client.SignedRequest;
+    var second: client.SignedRequest;
+    awaiting(?protocol, ?first);
+    awaiting(?protocol, ?second);
+    var first_item: [1]field.Field;
+    var second_item: [1]field.Field;
+    var first_fields: field.Fields = field.init(?first_item[0], 1,
+        field.limits(1, 128, 32, 64));
+    var second_fields: field.Fields = field.init(?second_item[0], 1,
+        field.limits(1, 128, 32, 64));
+    if (field.append(?first_fields, field.Field{
+            name: view.view("Replay-Nonce", 12),
+            value: view.view("concurrent_one", 14), sensitive: false}) !=
+            field.ADD_OK ||
+        field.append(?second_fields, field.Field{
+            name: view.view("Replay-Nonce", 12),
+            value: view.view("concurrent_two", 14), sensitive: false}) !=
+            field.ADD_OK) { ret 3; }
+    var first_result: i64 = 0;
+    var second_result: i64 = 0;
+    var first_context: AcceptContext = AcceptContext{protocol: ?protocol,
+        request: ?first, fields: ?first_fields, result: ?first_result};
+    var second_context: AcceptContext = AcceptContext{protocol: ?protocol,
+        request: ?second, fields: ?second_fields, result: ?second_result};
+    var first_thread: thread.Thread;
+    var second_thread: thread.Thread;
+    thread.spawn_with(accept_worker, (?first_context)::*u8, ?first_thread);
+    if (first_thread.tid < 0) { ret 4; }
+    thread.spawn_with(accept_worker, (?second_context)::*u8, ?second_thread);
+    if (second_thread.tid < 0) {
+        thread.join(?first_thread);
+        ret 5;
+    }
+    thread.join(?first_thread);
+    thread.join(?second_thread);
+    if (atomic.load(?first_result) != 1 || atomic.load(?second_result) != 1 ||
+        first.state != client.REQUEST_COMPLETE ||
+        second.state != client.REQUEST_COMPLETE ||
+        atomic.load(?protocol.callback_owner) != 0) { ret 6; }
+    var output: [64]u8;
+    val newest: nonce.Taken = nonce.take(pool, ?output[0], 64);
+    val older: nonce.Taken = nonce.take(pool, ?output[0], 64);
+    if (problem.failed(newest.error) || !newest.found ||
+        problem.failed(older.error) || !older.found ||
+        nonce.take(pool, ?output[0], 64).found) { ret 7; }
     ret 0;
 }
 

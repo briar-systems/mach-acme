@@ -8,6 +8,8 @@ use http.core.field;
 use http.core.method;
 use http.core.status;
 use std.net.ip;
+use std.sync.atomic;
+use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -94,7 +96,7 @@ pub rec Client {
     nonces:      nonce.Pool;
     limits:      Limits;
     generation:  u64;
-    callback_active: bool;
+    callback_owner: i64;
     initialized: bool;
 }
 
@@ -315,22 +317,45 @@ fun client_same(first: Client, second: *Client) bool {
     ret second != nil && nonce.same(first.nonces, second.nonces) &&
         limits_same(first.limits, second.limits) &&
         first.generation == second.generation &&
-        first.callback_active == second.callback_active &&
+        first.callback_owner == atomic.load(?second.callback_owner) &&
         first.initialized == second.initialized;
 }
 
 fun callback_begin(client: *Client) bool {
-    if (client == nil || client.callback_active) { ret false; }
-    client.callback_active = true;
-    ret true;
+    if (client == nil) { ret false; }
+    val owner: i64 = os.thread_current_id();
+    if (owner <= 0) { ret false; }
+    for (true) {
+        var expected: i64 = atomic.load(?client.callback_owner);
+        if (expected == owner) { ret false; }
+        if (expected == 0 && atomic.cas(?client.callback_owner,
+                ?expected, owner)) { ret true; }
+        if (expected != 0) {
+            os.thread_wait(?client.callback_owner, expected);
+        }
+    }
 }
 
 fun callback_end(client: *Client, before: Client,
     request: *SignedRequest, request_before: SignedRequest) bool {
     val intact: bool = client_same(before, client) &&
         request_same(request_before, request) && spec_intact(request);
-    client.callback_active = false;
+    atomic.store(?client.callback_owner, 0);
+    os.thread_wake(?client.callback_owner);
     ret intact;
+}
+
+fun callback_end_client(client: *Client, before: Client) bool {
+    val intact: bool = client_same(before, client);
+    atomic.store(?client.callback_owner, 0);
+    os.thread_wake(?client.callback_owner);
+    ret intact;
+}
+
+fun callback_reentrant(client: *Client) bool {
+    if (client == nil) { ret true; }
+    val owner: i64 = atomic.load(?client.callback_owner);
+    ret owner != 0 && owner == os.thread_current_id();
 }
 
 fun request_same(first: SignedRequest, second: *SignedRequest) bool {
@@ -686,7 +711,7 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
         !memory_range.valid(nonces::*u8, $size_of(nonce.Pool)) ||
         memory_range.overlap(client::*u8, $size_of(Client),
             nonces::*u8, $size_of(nonce.Pool)) ||
-        client.initialized || client.callback_active ||
+        client.initialized || atomic.load(?client.callback_owner) != 0 ||
         client.generation == 18446744073709551615 ||
         !limits_valid(configured)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
@@ -698,21 +723,25 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid acme nonce pool configuration");
     }
-    client.callback_active = true;
+    if (!callback_begin(client)) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "nonce ownership callback is reentrant");
+    }
     val before: Client = @client;
     val owned: bool = snapshot.aliases(snapshot.ctx, client::*u8,
         $size_of(Client));
-    val alias_intact: bool = client_same(before, client);
-    client.callback_active = false;
+    val alias_intact: bool = callback_end_client(client, before);
     if (!alias_intact || !nonce.same(snapshot, @nonces) || owned) {
         ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
             "nonce ownership callback rejected or mutated client state");
     }
-    client.callback_active = true;
+    if (!callback_begin(client)) {
+        ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
+            "nonce readiness callback is reentrant");
+    }
     val ready_before: Client = @client;
     val ready: bool = snapshot.ready(snapshot.ctx);
-    val ready_intact: bool = client_same(ready_before, client);
-    client.callback_active = false;
+    val ready_intact: bool = callback_end_client(client, ready_before);
     if (!ready_intact || !nonce.same(snapshot, @nonces) || !ready) {
         ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
             "acme nonce pool is not ready or mutated client state");
@@ -720,17 +749,19 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
     client.nonces = snapshot;
     client.limits = configured;
     client.generation = client.generation + 1;
-    client.callback_active = false;
+    atomic.store(?client.callback_owner, 0);
     client.initialized = true;
     ret problem.none();
 }
 
 pub fun release(client: *Client) bool {
     if (client == nil || !memory_range.valid(client::*u8, $size_of(Client)) ||
-        !client.initialized || client.callback_active) { ret false; }
+        !client.initialized || atomic.load(?client.callback_owner) != 0) {
+        ret false;
+    }
     client.nonces = nonce.Pool{};
     client.limits = Limits{};
-    client.callback_active = false;
+    atomic.store(?client.callback_owner, 0);
     client.initialized = false;
     ret true;
 }
@@ -1398,7 +1429,7 @@ pub fun discovery_request(directory_url: view.View,
 
 pub fun nonce_request(client: *Client, directory: Directory) WireRequest {
     if (client == nil || !memory_range.valid(client::*u8, $size_of(Client)) ||
-        !client.initialized || client.callback_active ||
+        !client.initialized || callback_reentrant(client) ||
         !memory_range.valid(directory.new_nonce_url.data,
             directory.new_nonce_url.len) ||
         directory.new_nonce_url.len == 0 ||
@@ -1432,7 +1463,7 @@ pub fun begin_signed(client: *Client, request: *SignedRequest,
         !memory_range.valid(spec.url.data, spec.url.len) ||
         !memory_range.valid(spec.payload.data, spec.payload.len) ||
         !memory_range.valid(spec.kid.data, spec.kid.len) ||
-        !client.initialized || client.callback_active ||
+        !client.initialized || callback_reentrant(client) ||
         (request.state != REQUEST_EMPTY && request.state != REQUEST_COMPLETE &&
             request.state != REQUEST_FAILED) ||
         spec.url.data == nil ||
@@ -1480,7 +1511,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
     if (client == nil || request == nil ||
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
-        !client.initialized || client.callback_active ||
+        !client.initialized || callback_reentrant(client) ||
         request.client_owner != client::ptr ||
         request.client_generation != client.generation ||
         !spec_intact(request) ||
@@ -1735,7 +1766,7 @@ pub fun signed_wire(client: *Client, request: *SignedRequest) WireRequest {
     if (client == nil || request == nil ||
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
-        !client.initialized || client.callback_active ||
+        !client.initialized || callback_reentrant(client) ||
         request.client_owner != client::ptr ||
         request.client_generation != client.generation ||
         request.state != REQUEST_AWAITING || request.wire_body.data == nil ||
@@ -1790,7 +1821,7 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
     if (client == nil || request == nil ||
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
-        !client.initialized || client.callback_active ||
+        !client.initialized || callback_reentrant(client) ||
         request.client_owner != client::ptr ||
         request.client_generation != client.generation ||
         request.state != REQUEST_AWAITING || request.wire_body.data == nil ||
@@ -1901,7 +1932,7 @@ pub fun accept_nonce_response(client: *Client, request: *SignedRequest,
     if (client == nil || request == nil ||
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
-        !client.initialized || client.callback_active ||
+        !client.initialized || callback_reentrant(client) ||
         request.client_owner != client::ptr ||
         request.client_generation != client.generation ||
         request.state != REQUEST_NEEDS_NONCE || !status.is_final(response.status)) {

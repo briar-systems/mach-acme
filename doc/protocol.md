@@ -119,8 +119,9 @@ is accepted only when it has a nonzero token, identifies the exact supplied outp
 buffer, has a bounded nonzero base64url length, and is internally consistent with
 its error and `found` fields. Readiness, ownership, reserve, commit, release, put,
 and clear callbacks must not mutate the bound `Client` or `SignedRequest`.
-`Client.callback_active` rejects reentrant client operations before they can change
-protocol state. Post-callback validation still rejects direct mutation. Such
+`Client.callback_owner` rejects same-thread reentrant client operations before they
+can change protocol state and serializes callback boundaries across threads.
+Post-callback validation still rejects direct mutation. Such
 mutation fails closed and is never overwritten by the protocol layer.
 
 `client.prepare_signed` reserves a normal pool nonce before signing. A local
