@@ -38,6 +38,7 @@ pub val SIGNATURE_FAILED:      Code = 12;
 pub val UNSUPPORTED_ALGORITHM: Code = 13;
 pub val INVALID_KEY:           Code = 14;
 pub val INVALID_STATE:         Code = 15;
+pub val ENTROPY_UNAVAILABLE:   Code = 16;
 
 pub rec Problem {
     typ:      view.View;
