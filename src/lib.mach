@@ -10,6 +10,7 @@ fwd acme.nonce;
 fwd acme.identifier;
 fwd acme.account;
 fwd acme.order;
+fwd acme.poll;
 fwd acme.challenge;
 fwd acme.certificate;
 fwd acme.storage;
