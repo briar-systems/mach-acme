@@ -2,6 +2,7 @@ use crypto.contracts;
 use crypto.group.p256;
 use crypto.signature;
 use http.core.field;
+use http.core.method;
 use http.core.status;
 use std.runtime;
 use std.encoding.base64;
@@ -97,6 +98,13 @@ fun response(code: u16, fields: *field.Fields, body: view.View) client.Response 
         retry_after_seconds: 0};
 }
 
+fun awaiting(protocol: *client.Client, request: *client.SignedRequest) {
+    request.client_owner = protocol::ptr;
+    request.client_generation = protocol.generation;
+    request.wire_body = view.view("prepared", 8);
+    request.state = client.REQUEST_AWAITING;
+}
+
 test "jose: rfc 7638 rsa jwk and sha-256 thumbprint are exact" {
     val modulus_text: *u8 = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw";
     var modulus: [256]u8;
@@ -134,48 +142,66 @@ test "jose: rfc 8555 protected fields are canonical and output is transactional"
         nonce: view.view("Q_s3MWoqT05TrdkM2MTDcw", 22),
         url: view.view("https://example.com/acme/chall/prV_B7yEyA4", 42),
         kid: view.view("https://example.com/acme/acct/evOfKhNU60wg", 42),
-        use_jwk: false};
+        use_jwk: false, include_nonce: true};
     var work: [2048]u8;
     var output: [512]u8;
+    var forged: jose.Signer = signer;
+    forged.algorithm = jose.PS256;
+    fill(?output[0], 0xa5, 512);
+    val rejected_signer: jose.Operation = jose.encode_jws(forged, private_key,
+        jose.no_entropy(), protected, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (rejected_signer.error.code != problem.INVALID_INPUT ||
+        !filled(?output[0], 0xa5, 512)) { ret 2; }
     fill(?output[0], 0xa5, 512);
     val too_small: jose.Operation = jose.encode_jws(signer, private_key,
-        jose.Entropy{available: false}, protected, view.view("{}", 2),
+        jose.no_entropy(), protected, view.view("{}", 2),
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 8});
     if (too_small.error.code != problem.OUTPUT_TOO_SMALL ||
-        !filled(?output[0], 0xa5, 512)) { ret 2; }
+        !filled(?output[0], 0xa5, 512)) { ret 3; }
     fill(?work[0], 0x6d, 2048);
     val overlap: jose.Operation = jose.encode_jws(signer, private_key,
-        jose.Entropy{available: false}, protected, view.view("{}", 2),
+        jose.no_entropy(), protected, view.view("{}", 2),
         contracts.Buffer{data: ?work[0], capacity: 512},
         contracts.Buffer{data: ?work[0], capacity: 512});
     if (overlap.error.code != problem.INVALID_INPUT ||
-        !filled(?work[0], 0x6d, 2048)) { ret 3; }
+        !filled(?work[0], 0x6d, 2048)) { ret 4; }
     fill(?output[0], 0xa5, 512);
     var invalid_nonce: jose.Protected = protected;
     invalid_nonce.nonce = view.view("bad+nonce", 9);
     val rejected_nonce: jose.Operation = jose.encode_jws(signer, private_key,
-        jose.Entropy{available: false}, invalid_nonce, view.view("{}", 2),
+        jose.no_entropy(), invalid_nonce, view.view("{}", 2),
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     if (rejected_nonce.error.code != problem.INVALID_INPUT ||
-        !filled(?output[0], 0xa5, 512)) { ret 4; }
+        !filled(?output[0], 0xa5, 512)) { ret 5; }
     val encoded: jose.Operation = jose.encode_jws(signer, private_key,
-        jose.Entropy{available: false}, protected, view.view("{}", 2),
+        jose.no_entropy(), protected, view.view("{}", 2),
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     val expected: *u8 = "{\"protected\":\"eyJhbGciOiJFUzI1NiIsImtpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vYWNtZS9hY2N0L2V2T2ZLaE5VNjB3ZyIsIm5vbmNlIjoiUV9zM01Xb3FUMDVUcmRrTTJNVERjdyIsInVybCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vYWNtZS9jaGFsbC9wclZfQjd5RXlBNCJ9\",\"payload\":\"e30\",\"signature\":\"";
-    if (problem.failed(encoded.error)) { ret 5; }
-    if (encoded.written != length(expected) + 88) { ret 6; }
-    if (!equal(?output[0], expected, length(expected))) { ret 7; }
-    if (output[encoded.written - 2] != '"' || output[encoded.written - 1] != '}') { ret 8; }
+    if (problem.failed(encoded.error)) { ret 6; }
+    if (encoded.written != length(expected) + 88) { ret 7; }
+    if (!equal(?output[0], expected, length(expected))) { ret 8; }
+    if (output[encoded.written - 2] != '"' || output[encoded.written - 1] != '}') { ret 9; }
     var i: usize = length(expected);
     for (i < encoded.written - 2) {
         val byte: u8 = output[i];
         if (!((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
-            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_')) { ret 9; }
+            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_')) { ret 10; }
         i = i + 1;
     }
+    val nested: jose.Protected = jose.Protected{
+        nonce: view.view(nil, 0),
+        url: view.view("https://example.com/acme/key-change", 35),
+        kid: view.view(nil, 0), use_jwk: true, include_nonce: false};
+    val nested_encoded: jose.Operation = jose.encode_jws(signer, private_key,
+        jose.no_entropy(), nested, view.view("{}", 2),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(nested_encoded.error) || nested_encoded.written == 0) { ret 11; }
     ret 0;
 }
 
@@ -215,7 +241,7 @@ test "jose: rfc 8032 ed25519 account signing vector is exact" {
         !equal(?jwk[0], expected_jwk, 79)) { ret 1; }
     var output: [64]u8;
     val signed: jose.Operation = jose.key_sign(private_key,
-        jose.Entropy{available: false}, contracts.Bytes{data: nil, len: 0},
+        jose.no_entropy(), contracts.Bytes{data: nil, len: 0},
         contracts.Buffer{data: ?output[0], capacity: 64});
     if (problem.failed(signed.error) || signed.written != 64 ||
         !equal(?output[0], (?expected[0]):~*u8, 64)) { ret 2; }
@@ -252,7 +278,7 @@ test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures"
     var output: [256]u8;
     val message: *u8 = "mach-acme openssl rsa-pss vector";
     val signed: jose.Operation = jose.key_sign(key,
-        jose.Entropy{ctx: nil, fill: deterministic_entropy, available: true},
+        jose.entropy_provider(nil, deterministic_entropy),
         contracts.Bytes{data: message, len: length(message)},
         contracts.Buffer{data: ?output[0], capacity: 256});
     if (problem.failed(signed.error) || signed.written != 256 ||
@@ -261,11 +287,159 @@ test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures"
             contracts.Bytes{data: ?output[0], len: 256}) != contracts.OK) { ret 2; }
     fill(?output[0], 0xa5, 256);
     val unavailable: jose.Operation = jose.key_sign(key,
-        jose.Entropy{ctx: nil, fill: unavailable_entropy, available: true},
+        jose.entropy_provider(nil, unavailable_entropy),
         contracts.Bytes{data: message, len: length(message)},
         contracts.Buffer{data: ?output[0], capacity: 256});
     if (unavailable.error.code != problem.ENTROPY_UNAVAILABLE || unavailable.written != 0 ||
         !filled(?output[0], 0xa5, 256)) { ret 3; }
+    val missing: jose.Operation = jose.key_sign(key,
+        jose.Entropy{ctx: nil, fill: nil, available: true},
+        contracts.Bytes{data: message, len: length(message)},
+        contracts.Buffer{data: ?output[0], capacity: 256});
+    if (missing.error.code != problem.ENTROPY_UNAVAILABLE || missing.written != 0 ||
+        !filled(?output[0], 0xa5, 256)) { ret 4; }
+    ret 0;
+}
+
+test "client: wire requests bind exact body and transport policy" {
+    var configured: client.Limits = client.limits_default();
+    configured.request_timeout_ns = 123456789;
+    val directory_url: view.View = view.view("https://example.com/acme/directory", 34);
+    val discovery: client.WireRequest = client.discovery_request(directory_url,
+        configured);
+    if (problem.failed(discovery.error) || discovery.method.kind != method.GET ||
+        discovery.url.data != directory_url.data || discovery.url.len != 34 ||
+        discovery.timeout_ns != configured.request_timeout_ns ||
+        discovery.max_response_bytes != configured.max_response_bytes ||
+        !discovery.replay_safe) { ret 1; }
+    val fragment: *u8 = "https://example.com/acme/directory#fragment";
+    if (client.discovery_request(view.view(fragment, length(fragment)),
+        configured).error.code != problem.INVALID_INPUT) { ret 2; }
+    val spaced: *u8 = "https://exa mple.com/acme/directory";
+    if (client.discovery_request(view.view(spaced, length(spaced)),
+        configured).error.code != problem.INVALID_INPUT) { ret 3; }
+    val escaped: *u8 = "https://example.com/acme/%zz";
+    if (client.discovery_request(view.view(escaped, length(escaped)),
+        configured).error.code != problem.INVALID_INPUT) { ret 4; }
+
+    var slots: [1]nonce.Slot;
+    var nonce_storage: [64]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1,
+        ?nonce_storage[0], 64, 64))) { ret 5; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, configured))) { ret 6; }
+    var directory: client.Directory;
+    directory.new_nonce_url = view.view("https://example.com/acme/nonce", 30);
+    val nonce_wire: client.WireRequest = client.nonce_request(?protocol, directory);
+    if (problem.failed(nonce_wire.error) || nonce_wire.method.kind != method.HEAD ||
+        nonce_wire.timeout_ns != configured.request_timeout_ns ||
+        nonce_wire.max_response_bytes != configured.max_response_bytes ||
+        !nonce_wire.replay_safe) { ret 7; }
+
+    var request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?protocol, ?request, client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31), use_jwk: false})) ||
+        problem.failed(pool.put(pool.ctx,
+            view.view("wire_nonce", 10)))) { ret 8; }
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 9; }
+    var work: [2048]u8;
+    var output: [512]u8;
+    val signed: jose.Operation = client.prepare_signed(?protocol, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    val wire: client.WireRequest = client.signed_wire(?protocol, ?request);
+    if (problem.failed(signed.error) || problem.failed(wire.error) ||
+        wire.method.kind != method.POST || wire.body.data != ?output[0] ||
+        wire.body.len != signed.written || wire.timeout_ns != configured.request_timeout_ns ||
+        wire.max_response_bytes != configured.max_response_bytes || wire.replay_safe) { ret 10; }
+
+    var small_slots: [1]nonce.Slot;
+    var small_nonce_storage: [64]u8;
+    var small_memory: nonce.Memory;
+    var small_configured: client.Limits = configured;
+    small_configured.max_request_bytes = 64;
+    if (problem.failed(nonce.init_memory(?small_memory, ?small_slots[0], 1,
+        ?small_nonce_storage[0], 64, 64))) { ret 11; }
+    var small_pool: nonce.Pool = nonce.pool(?small_memory);
+    var small_protocol: client.Client;
+    var small_request: client.SignedRequest;
+    if (problem.failed(client.init(?small_protocol, ?small_pool, small_configured)) ||
+        problem.failed(small_pool.put(small_pool.ctx, view.view("small_nonce", 11))) ||
+        problem.failed(client.begin_signed(?small_protocol, ?small_request,
+            request.spec))) { ret 12; }
+    fill(?output[0], 0xa5, 512);
+    val limited: jose.Operation = client.prepare_signed(?small_protocol,
+        ?small_request, jose.signer(public_key), private_key,
+        jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (limited.error.code != problem.OUTPUT_TOO_SMALL || limited.written != 0 ||
+        small_request.state != client.REQUEST_READY ||
+        !filled(?output[0], 0xa5, 512) ||
+        !problem.failed(client.signed_wire(?small_protocol,
+            ?small_request).error)) { ret 13; }
+    ret 0;
+}
+
+test "client: ownership generations reject foreign and stale request handles" {
+    var slots: [2]nonce.Slot;
+    var nonce_storage: [128]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 2,
+        ?nonce_storage[0], 128, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var first: client.Client;
+    var second: client.Client;
+    val configured: client.Limits = client.limits_default();
+    if (problem.failed(client.init(?first, ?pool, configured)) ||
+        problem.failed(client.init(?second, ?pool, configured)) ||
+        problem.failed(pool.put(pool.ctx, view.view("owner_nonce", 11)))) { ret 2; }
+    val generation: u64 = first.generation;
+    if (!problem.failed(client.init(?first, ?pool, configured)) ||
+        first.generation != generation) { ret 3; }
+
+    var request: client.SignedRequest;
+    if (problem.failed(client.begin_signed(?first, ?request, client.SignedSpec{
+        url: view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid: view.view("https://example.com/acme/acct/1", 31), use_jwk: false}))) {
+        ret 4;
+    }
+    var private_bytes: [32]^u8;
+    var public_bytes: [65]u8;
+    var public_key: jose.PublicKey;
+    var private_key: jose.PrivateKey;
+    if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
+        ?public_bytes[0])) { ret 5; }
+    var work: [2048]u8;
+    var output: [512]u8;
+    val signed: jose.Operation = client.prepare_signed(?first, ?request,
+        jose.signer(public_key), private_key, jose.no_entropy(),
+        contracts.Buffer{data: ?work[0], capacity: 2048},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (problem.failed(signed.error) ||
+        !problem.failed(client.signed_wire(?second, ?request).error)) { ret 6; }
+
+    if (!client.release(?first) ||
+        !problem.failed(client.signed_wire(?first, ?request).error) ||
+        problem.failed(client.init(?first, ?pool, configured)) ||
+        first.generation != generation + 1 ||
+        !problem.failed(client.signed_wire(?first, ?request).error)) { ret 7; }
+
+    if (!client.release(?first) || !client.release(?second) ||
+        problem.failed(nonce.release_memory(?memory)) || nonce.valid(?pool)) { ret 8; }
+    var stale: client.Client;
+    if (!problem.failed(client.init(?stale, ?pool, configured))) { ret 9; }
     ret 0;
 }
 
@@ -331,6 +505,50 @@ test "client: hostile directory inputs preserve caller outputs" {
     ret 0;
 }
 
+test "client: directory response policy rejects and sanitizes hostile shapes" {
+    var fields: field.Fields;
+    empty_fields(?fields);
+    var configured: client.Limits = client.limits_default();
+    configured.max_response_bytes = 64;
+    configured.max_problem_bytes = 64;
+    var scratch: [256]u8;
+    var text: [256]u8;
+    var caa: [1]view.View;
+    var directory: client.Directory;
+    directory.new_nonce_url = view.view("sentinel", 8);
+
+    val invalid_view: problem.Error = client.parse_directory(
+        response(status.BAD_GATEWAY, ?fields, view.view(nil, 1)), configured,
+        ?scratch[0], 256, client.DirectoryStorage{data: ?text[0], capacity: 256,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (invalid_view.kind != problem.PROTOCOL ||
+        invalid_view.code != problem.INVALID_INPUT ||
+        invalid_view.http.status != status.BAD_GATEWAY ||
+        invalid_view.http.body.data != nil || invalid_view.http.body.len != 0 ||
+        directory.new_nonce_url.len != 8) { ret 1; }
+
+    val oversized: problem.Error = client.parse_directory(
+        response(status.BAD_GATEWAY, ?fields, view.view("x", 65)), configured,
+        ?scratch[0], 256, client.DirectoryStorage{data: ?text[0], capacity: 256,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (oversized.kind != problem.LIMIT ||
+        oversized.code != problem.OUTPUT_TOO_SMALL ||
+        oversized.http.status != status.BAD_GATEWAY ||
+        oversized.http.body.data != nil || oversized.http.body.len != 0 ||
+        directory.new_nonce_url.len != 8) { ret 2; }
+
+    val invalid_fields: problem.Error = client.parse_directory(
+        response(status.BAD_GATEWAY, nil, view.view("failure", 7)), configured,
+        ?scratch[0], 256, client.DirectoryStorage{data: ?text[0], capacity: 256,
+            caa_items: ?caa[0], caa_capacity: 1}, ?directory);
+    if (invalid_fields.kind != problem.PROTOCOL ||
+        invalid_fields.code != problem.INVALID_INPUT ||
+        invalid_fields.http.status != status.BAD_GATEWAY ||
+        invalid_fields.http.body.len != 7 ||
+        directory.new_nonce_url.len != 8) { ret 3; }
+    ret 0;
+}
+
 test "client: badNonce consumes stale state and retries with the fresh response nonce" {
     var slots: [3]nonce.Slot;
     var nonce_storage: [192]u8;
@@ -344,11 +562,10 @@ test "client: badNonce consumes stale state and retries with the fresh response 
         problem.failed(pool.put(pool.ctx, view.view("stale_nonce", 11))) ||
         problem.failed(pool.put(pool.ctx, view.view("first_nonce", 11)))) { ret 2; }
     var request: client.SignedRequest;
-    if (problem.failed(client.begin_signed(?request, client.SignedSpec{
+    if (problem.failed(client.begin_signed(?protocol, ?request, client.SignedSpec{
         url: view.view("https://example.com/acme/order", 30),
         payload: view.view("{}", 2),
-        kid: view.view("https://example.com/acme/acct/1", 31), use_jwk: false},
-        configured))) { ret 3; }
+        kid: view.view("https://example.com/acme/acct/1", 31), use_jwk: false}))) { ret 3; }
     var private_bytes: [32]^u8;
     var public_bytes: [65]u8;
     var public_key: jose.PublicKey;
@@ -357,7 +574,7 @@ test "client: badNonce consumes stale state and retries with the fresh response 
     var work: [2048]u8;
     var output: [512]u8;
     val first: jose.Operation = client.prepare_signed(?protocol, ?request,
-        jose.signer(public_key), private_key, jose.Entropy{available: false},
+        jose.signer(public_key), private_key, jose.no_entropy(),
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     if (problem.failed(first.error) || request.state != client.REQUEST_AWAITING ||
@@ -380,7 +597,7 @@ test "client: badNonce consumes stale state and retries with the fresh response 
         decision.cause.http.status != status.BAD_REQUEST ||
         request.state != client.REQUEST_RETRY || request.bad_nonce_retries != 1) { ret 7; }
     val retry: jose.Operation = client.prepare_signed(?protocol, ?request,
-        jose.signer(public_key), private_key, jose.Entropy{available: false},
+        jose.signer(public_key), private_key, jose.no_entropy(),
         contracts.Buffer{data: ?work[0], capacity: 2048},
         contracts.Buffer{data: ?output[0], capacity: 512});
     if (problem.failed(retry.error) || request.attempts != 2 ||
@@ -404,7 +621,7 @@ test "client: badNonce acquisition and retry exhaustion preserve protocol causes
     if (problem.failed(client.init(?protocol, ?pool, configured)) ||
         problem.failed(pool.put(pool.ctx, view.view("stale_nonce", 11)))) { ret 2; }
     var request: client.SignedRequest;
-    request.state = client.REQUEST_AWAITING;
+    awaiting(?protocol, ?request);
     val body: *u8 = "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"title\":\"bad nonce\",\"status\":400}";
     var empty: field.Fields;
     empty_fields(?empty);
@@ -430,7 +647,7 @@ test "client: badNonce acquisition and retry exhaustion preserve protocol causes
         response(status.NO_CONTENT, ?fresh_fields, view.view(nil, 0)));
     if (problem.failed(accepted) || request.state != client.REQUEST_RETRY) { ret 6; }
 
-    request.state = client.REQUEST_AWAITING;
+    awaiting(?protocol, ?request);
     var limit_items: [1]field.Field;
     var limit_fields: field.Fields = field.init(?limit_items[0], 1,
         field.limits(1, 128, 32, 64));
@@ -458,7 +675,7 @@ test "client: malformed acme problems retain their http cause transactionally" {
     var protocol: client.Client;
     if (problem.failed(client.init(?protocol, ?pool, client.limits_default()))) { ret 2; }
     var request: client.SignedRequest;
-    request.state = client.REQUEST_AWAITING;
+    awaiting(?protocol, ?request);
     var fields: field.Fields;
     empty_fields(?fields);
     var scratch: [4096]u8;
@@ -473,7 +690,7 @@ test "client: malformed acme problems retain their http cause transactionally" {
         decision.cause.http.status != status.BAD_REQUEST ||
         decision.cause.http.body.len != length(body) ||
         !filled(?storage[0], 0xb7, 64)) { ret 3; }
-    request.state = client.REQUEST_AWAITING;
+    awaiting(?protocol, ?request);
     val valid: *u8 = "{\"type\":\"urn:ietf:params:acme:error:rejectedIdentifier\",\"detail\":\"policy\"}";
     val too_small: client.Decision = client.accept_signed_response(?protocol, ?request,
         response(status.BAD_REQUEST, ?fields, view.view(valid, length(valid))),
@@ -482,6 +699,80 @@ test "client: malformed acme problems retain their http cause transactionally" {
         too_small.cause.code != problem.OUTPUT_TOO_SMALL ||
         too_small.cause.http.status != status.BAD_REQUEST ||
         !filled(?storage[0], 0xb7, 64)) { ret 4; }
+
+    awaiting(?protocol, ?request);
+    val compound: *u8 = "{\"type\":\"urn:ietf:params:acme:error:rejectedIdentifier\",\"detail\":\"order failed\",\"subproblems\":[{\"type\":\"urn:ietf:params:acme:error:dns\",\"detail\":\"dns failed\",\"identifier\":{\"type\":\"dns\",\"value\":\"bad.example\"}}]}";
+    var compound_storage: [512]u8;
+    var subproblems: [2]problem.Subproblem;
+    val structured: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.BAD_REQUEST, ?fields,
+            view.view(compound, length(compound))), ?scratch[0], 4096,
+        client.ProblemStorage{data: ?compound_storage[0], capacity: 512,
+            subproblems: ?subproblems[0], subproblem_capacity: 2});
+    if (structured.action != client.ACTION_FAILED ||
+        structured.cause.code != problem.ACME_PROBLEM ||
+        structured.cause.problem.subproblem_len != 1 ||
+        structured.cause.problem.subproblems != ?subproblems[0] ||
+        !equal(subproblems[0].identifier.typ.data, "dns", 3) ||
+        !equal(subproblems[0].identifier.value.data, "bad.example", 11) ||
+        !equal(subproblems[0].detail.data, "dns failed", 10)) { ret 5; }
+    ret 0;
+}
+
+test "client: invalid and excess response nonces are ignored" {
+    var slots: [1]nonce.Slot;
+    var nonce_storage: [64]u8;
+    var memory: nonce.Memory;
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1,
+        ?nonce_storage[0], 64, 64))) { ret 1; }
+    var pool: nonce.Pool = nonce.pool(?memory);
+    var protocol: client.Client;
+    if (problem.failed(client.init(?protocol, ?pool, client.limits_default())) ||
+        problem.failed(pool.put(pool.ctx, view.view("existing_nonce", 14)))) { ret 2; }
+    var items: [2]field.Field;
+    var fields: field.Fields = field.init(?items[0], 2,
+        field.limits(2, 256, 32, 64));
+    if (field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("bad+nonce", 9), sensitive: false}) != field.ADD_OK) { ret 3; }
+    var request: client.SignedRequest;
+    awaiting(?protocol, ?request);
+    var scratch: [256]u8;
+    var storage: [256]u8;
+    val invalid: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.OK, ?fields, view.view(nil, 0)),
+        ?scratch[0], 256,
+        client.ProblemStorage{data: ?storage[0], capacity: 256});
+    if (invalid.action != client.ACTION_COMPLETE ||
+        request.state != client.REQUEST_COMPLETE) { ret 4; }
+
+    if (!field.reset(?fields) ||
+        field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("fresh_nonce", 11), sensitive: false}) != field.ADD_OK) { ret 5; }
+    awaiting(?protocol, ?request);
+    val full: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.OK, ?fields, view.view(nil, 0)),
+        ?scratch[0], 256,
+        client.ProblemStorage{data: ?storage[0], capacity: 256});
+    if (full.action != client.ACTION_COMPLETE ||
+        request.state != client.REQUEST_COMPLETE) { ret 6; }
+    var output: [64]u8;
+    val retained: nonce.Taken = pool.take(pool.ctx, ?output[0], 64);
+    if (problem.failed(retained.error) || !retained.found || retained.value.len != 14 ||
+        !equal(retained.value.data, "existing_nonce", 14)) { ret 7; }
+
+    if (!field.reset(?fields) ||
+        field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+        value: view.view("first_nonce", 11), sensitive: false}) != field.ADD_OK ||
+        field.append(?fields, field.Field{name: view.view("Replay-Nonce", 12),
+            value: view.view("second_nonce", 12), sensitive: false}) != field.ADD_OK) { ret 8; }
+    awaiting(?protocol, ?request);
+    val multiple: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.OK, ?fields, view.view(nil, 0)),
+        ?scratch[0], 256,
+        client.ProblemStorage{data: ?storage[0], capacity: 256});
+    if (multiple.action != client.ACTION_COMPLETE ||
+        request.state != client.REQUEST_COMPLETE ||
+        pool.take(pool.ctx, ?output[0], 64).found) { ret 9; }
     ret 0;
 }
 

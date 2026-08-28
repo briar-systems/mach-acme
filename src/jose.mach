@@ -35,6 +35,14 @@ pub rec Entropy {
     available: bool;
 }
 
+pub fun no_entropy() Entropy {
+    ret Entropy{ctx: nil, fill: nil, available: false};
+}
+
+pub fun entropy_provider(ctx: ptr, fill: FillEntropyFun) Entropy {
+    ret Entropy{ctx: ctx, fill: fill, available: fill:^ != nil};
+}
+
 pub rec PublicKey {
     algorithm: Algorithm;
     value:     contracts.Bytes;
@@ -56,10 +64,11 @@ pub rec Signer {
 }
 
 pub rec Protected {
-    nonce:   view.View;
-    url:     view.View;
-    kid:     view.View;
-    use_jwk: bool;
+    nonce:         view.View;
+    url:           view.View;
+    kid:           view.View;
+    use_jwk:       bool;
+    include_nonce: bool;
 }
 
 rec Writer {
@@ -498,7 +507,7 @@ pub fun key_sign(key: PrivateKey, entropy: Entropy, message: contracts.Bytes,
     }
     var salt: [32]^u8;
     ct.zeroize(?salt[0], 32);
-    if (!entropy.available) {
+    if (!entropy.available || entropy.fill:^ == nil) {
         ct.zeroize(?salt[0], 32);
         ret failed(problem.SIGNING, problem.ENTROPY_UNAVAILABLE,
             "rsa signing entropy is unavailable");
@@ -526,9 +535,15 @@ pub fun signer(key: PublicKey) Signer {
 
 pub fun valid(value: Signer) bool {
     ret public_key_valid(value.public_key) &&
+        value.algorithm == value.public_key.algorithm &&
         (value.algorithm == ES256 || value.algorithm == EDDSA || value.algorithm == PS256) &&
-        value.max_jwk_bytes != 0 && value.max_thumb_bytes == THUMBPRINT_BYTES &&
-        value.max_signature_bytes != 0 && value.max_signature_bytes <= MAX_SIGNATURE_BYTES;
+        value.max_jwk_bytes == MAX_JWK_BYTES &&
+        value.max_thumb_bytes == THUMBPRINT_BYTES &&
+        ((value.algorithm == ES256 && value.max_signature_bytes == 64) ||
+        (value.algorithm == EDDSA && value.max_signature_bytes == 64) ||
+        (value.algorithm == PS256 &&
+            value.max_signature_bytes == value.public_key.rsa.modulus.len)) &&
+        value.max_signature_bytes <= MAX_SIGNATURE_BYTES;
 }
 
 fun ranges_overlap(first: *u8, first_len: usize, second: *u8,
@@ -555,8 +570,11 @@ fun write_protected(signer_value: Signer, value: Protected,
             ret false;
         }
     }
-    ret literal(writer, ",\"nonce\":", 9) && json_string(writer, value.nonce) &&
-        literal(writer, ",\"url\":", 7) && json_string(writer, value.url) &&
+    if (value.include_nonce &&
+        (!literal(writer, ",\"nonce\":", 9) || !json_string(writer, value.nonce))) {
+        ret false;
+    }
+    ret literal(writer, ",\"url\":", 7) && json_string(writer, value.url) &&
         write_byte(writer, '}');
 }
 
@@ -567,9 +585,13 @@ pub fun encode_jws(signer_value: Signer, private_key: PrivateKey, entropy: Entro
     if (!valid(signer_value) || !key_pair_valid(signer_value.public_key, private_key) ||
         work.data == nil || output.data == nil ||
         (payload.len != 0 && payload.data == nil) || payload.len > 0xbfffffffffffffff ||
-        protected.nonce.len == 0 ||
-        protected.url.len == 0 || (!protected.use_jwk && protected.kid.len == 0) ||
-        !base64url_value(protected.nonce) || !ascii_json_value(protected.url) ||
+        (protected.include_nonce && protected.nonce.len == 0) ||
+        (!protected.include_nonce && protected.nonce.len != 0) ||
+        protected.url.len == 0 ||
+        (protected.use_jwk && protected.kid.len != 0) ||
+        (!protected.use_jwk && protected.kid.len == 0) ||
+        (protected.include_nonce && !base64url_value(protected.nonce)) ||
+        !ascii_json_value(protected.url) ||
         (!protected.use_jwk && !ascii_json_value(protected.kid))) {
         ret failed(problem.PROTOCOL, problem.INVALID_INPUT, "invalid jws input");
     }

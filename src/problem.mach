@@ -3,6 +3,7 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
 
@@ -41,11 +42,24 @@ pub val INVALID_STATE:         Code = 15;
 pub val ENTROPY_UNAVAILABLE:   Code = 16;
 
 pub rec Problem {
-    typ:      view.View;
-    title:    view.View;
-    detail:   view.View;
-    status:   u16;
-    instance: view.View;
+    typ:            view.View;
+    title:          view.View;
+    detail:         view.View;
+    status:         u16;
+    instance:       view.View;
+    subproblems:    *Subproblem;
+    subproblem_len: usize;
+}
+
+pub rec ProblemIdentifier {
+    typ:   view.View;
+    value: view.View;
+}
+
+pub rec Subproblem {
+    typ:        view.View;
+    detail:     view.View;
+    identifier: ProblemIdentifier;
 }
 
 pub rec HttpCause {
