@@ -9,6 +9,10 @@ bin="$tools/gopath/bin"
 run="$tools/run"
 mkdir -p "$run"
 
+# the binaries live outside version control, so a clean checkout builds them
+# on first use rather than failing with a missing file
+"$(dirname -- "$0")/build.sh"
+
 "$0.stop" 2>/dev/null || true
 
 # challtestsrv answers pebble's http-01, dns-01, and tls-alpn-01 validation and
