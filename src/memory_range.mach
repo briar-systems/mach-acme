@@ -23,7 +23,8 @@ pub fun overlap(first: *u8, first_len: usize, second: *u8,
 }
 
 pub fun size(count: usize, item_size: usize, output: *usize) bool {
-    if (output == nil || (item_size != 0 &&
+    if (output == nil || !valid(output::*u8, $size_of(usize)) ||
+        (item_size != 0 &&
         count > 0xffffffffffffffff / item_size)) { ret false; }
     @output = count * item_size;
     ret true;
@@ -37,5 +38,9 @@ test "acme.memory_range: overlap is safe at the address-space boundary" {
         !overlap(high, 1, low, 0xffffffffffffffff)) { ret 2; }
     if (overlap(low, 1, high, 1)) { ret 3; }
     if (!overlap(high, 2, low, 1)) { ret 4; }
+    var result: usize = 0;
+    if (!size(3, 7, ?result) || result != 21 ||
+        size(1, 1, 0xffffffffffffffff::*usize) ||
+        size(0xffffffffffffffff, 2, ?result) || result != 21) { ret 5; }
     ret 0;
 }

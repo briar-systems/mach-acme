@@ -297,7 +297,9 @@ pub fun parse(input: view.View, scratch: *u8, scratch_capacity: usize,
 }
 
 fun key_equals(object: *J.Value, index: usize, expected: str) bool {
-    if (object == nil || object.kind != J.OBJECT ||
+    if (object == nil ||
+        !memory_range.valid(object::*u8, $size_of(J.Value)) ||
+        object.kind != J.OBJECT ||
         index >= J.value_count(object) || expected == nil) { ret false; }
     var key: J.Value = key_value(object, index);
     var bytes: [128]u8;
@@ -313,11 +315,18 @@ fun key_equals(object: *J.Value, index: usize, expected: str) bool {
 }
 
 pub fun find(object: *J.Value, expected: str) *J.Value {
-    if (object == nil || object.kind != J.OBJECT || expected == nil) { ret nil; }
+    if (object == nil ||
+        !memory_range.valid(object::*u8, $size_of(J.Value)) ||
+        object.kind != J.OBJECT || expected == nil) { ret nil; }
     var i: usize = 0;
     for (i < J.value_count(object)) {
         if (key_equals(object, i, expected)) { ret J.value_get(object, i); }
         i = i + 1;
     }
     ret nil;
+}
+
+test "acme.json: find rejects wrapping object records" {
+    if (find(0xffffffffffffffff::*J.Value, "key") != nil) { ret 1; }
+    ret 0;
 }
