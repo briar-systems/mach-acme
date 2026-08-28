@@ -24,6 +24,7 @@ pub def TakeFun: fun(ptr, *u8, usize) Taken;
 pub def PutFun: fun(ptr, view.View) problem.Error;
 pub def ClearFun: fun(ptr) problem.Error;
 pub def ReadyFun: fun(ptr) bool;
+pub def AliasesFun: fun(ptr, *u8, usize) bool;
 
 pub rec Pool {
     ctx:             ptr;
@@ -31,6 +32,7 @@ pub rec Pool {
     put:             PutFun;
     clear:           ClearFun;
     ready:           ReadyFun;
+    aliases:         AliasesFun;
     max_nonce_bytes: usize;
     capacity:        usize;
 }
@@ -124,6 +126,10 @@ fun aliases_memory(memory: *Memory, data: *u8, len: usize) bool {
         memory_range.overlap(data, len, memory.slots::*u8, slot_bytes) ||
         memory_range.overlap(data, len, memory.storage,
             memory.storage_capacity);
+}
+
+pub fun memory_aliases(ctx: ptr, data: *u8, len: usize) bool {
+    ret aliases_memory(ctx::*Memory, data, len);
 }
 
 fun slot_data(memory: *Memory, index: usize) *u8 {
@@ -363,10 +369,11 @@ pub fun memory_ready(ctx: ptr) bool {
 pub fun pool(memory: *Memory) Pool {
     if (!layout(memory, true) || !memory_ready(memory::ptr)) {
         ret Pool{ctx: nil, take: memory_take, put: memory_put, clear: memory_clear,
-            ready: memory_ready, max_nonce_bytes: 0, capacity: 0};
+            ready: memory_ready, aliases: memory_aliases,
+            max_nonce_bytes: 0, capacity: 0};
     }
     ret Pool{ctx: memory::ptr, take: memory_take, put: memory_put,
-        clear: memory_clear, ready: memory_ready,
+        clear: memory_clear, ready: memory_ready, aliases: memory_aliases,
         max_nonce_bytes: memory.max_nonce_bytes,
         capacity: memory.capacity};
 }
@@ -374,7 +381,8 @@ pub fun pool(memory: *Memory) Pool {
 pub fun descriptor_valid(value: Pool) bool {
     ret value.ctx != nil && value.take::usize != 0 &&
         value.put::usize != 0 && value.clear::usize != 0 &&
-        value.ready::usize != 0 && value.max_nonce_bytes != 0 &&
+        value.ready::usize != 0 && value.aliases::usize != 0 &&
+        value.max_nonce_bytes != 0 &&
         value.capacity != 0;
 }
 
@@ -383,6 +391,7 @@ pub fun same(first: Pool, second: Pool) bool {
         first.put::usize == second.put::usize &&
         first.clear::usize == second.clear::usize &&
         first.ready::usize == second.ready::usize &&
+        first.aliases::usize == second.aliases::usize &&
         first.max_nonce_bytes == second.max_nonce_bytes &&
         first.capacity == second.capacity;
 }

@@ -29,19 +29,53 @@ pub rec Operation {
 }
 
 pub def FillEntropyFun: fun(ptr, contracts.SecretBuffer) contracts.Error;
+pub def EntropyAliasesFun: fun(ptr, *u8, usize) bool;
+pub def EntropyAliasesSecretFun: fun(ptr, *^u8, usize) bool;
+pub def EntropyValidateFun: fun(ptr) bool;
 
 pub rec Entropy {
     ctx:       ptr;
     fill:      FillEntropyFun;
+    aliases:   EntropyAliasesFun;
+    aliases_secret: EntropyAliasesSecretFun;
+    validation_ctx: ptr;
+    validate:  EntropyValidateFun;
     available: bool;
 }
 
 pub fun no_entropy() Entropy {
-    ret Entropy{ctx: nil, fill: nil, available: false};
+    ret Entropy{ctx: nil, fill: nil, aliases: nil, aliases_secret: nil,
+        validation_ctx: nil, validate: nil, available: false};
 }
 
-pub fun entropy_provider(ctx: ptr, fill: FillEntropyFun) Entropy {
-    ret Entropy{ctx: ctx, fill: fill, available: fill:^ != nil};
+pub fun entropy_provider(ctx: ptr, fill: FillEntropyFun,
+    aliases: EntropyAliasesFun, aliases_secret: EntropyAliasesSecretFun,
+    validate: EntropyValidateFun) Entropy {
+    ret Entropy{ctx: ctx, fill: fill, aliases: aliases,
+        aliases_secret: aliases_secret, validation_ctx: ctx, validate: validate,
+        available: fill:^ != nil && aliases:^ != nil &&
+            aliases_secret:^ != nil && validate:^ != nil};
+}
+
+pub fun entropy_valid(value: Entropy) bool {
+    if (!value.available) {
+        ret value.ctx == nil && value.fill:^ == nil && value.aliases:^ == nil &&
+            value.aliases_secret:^ == nil && value.validation_ctx == nil &&
+            value.validate:^ == nil;
+    }
+    ret value.fill:^ != nil && value.aliases:^ != nil &&
+        value.aliases_secret:^ != nil && value.validate:^ != nil;
+}
+
+pub fun entropy_owns_secret(value: Entropy, data: *^u8, len: usize) bool {
+    if (!entropy_valid(value) || !value.available || data == nil) { ret true; }
+    ret value.aliases_secret(value.ctx, data, len);
+}
+
+pub fun entropy_owns(value: Entropy, data: *u8, len: usize) bool {
+    if (!entropy_valid(value) || !value.available ||
+        !memory_range.valid(data, len)) { ret true; }
+    ret value.aliases(value.ctx, data, len);
 }
 
 pub rec PublicKey {
@@ -307,6 +341,30 @@ fun equal_bytes(first: *u8, second: *u8, len: usize) bool {
     ret true;
 }
 
+fun sha256_bytes(data: *u8, len: usize, output: *u8) bool {
+    if (!memory_range.valid(data, len) || output == nil ||
+        !memory_range.valid(output, 32)) { ret false; }
+    var context: hash.Sha256 = hash.empty_sha256();
+    var status: contracts.Error = hash.init_sha256(?context);
+    if (status == contracts.OK) {
+        status = hash.update_sha256(?context,
+            contracts.Bytes{data: data, len: len});
+    }
+    if (status != contracts.OK) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    val result: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: output, capacity: 32});
+    ret result.error == contracts.OK && result.written == 32;
+}
+
+fun sha256_unchanged(data: *u8, len: usize, expected: *u8) bool {
+    var actual: [32]u8;
+    ret sha256_bytes(data, len, ?actual[0]) &&
+        equal_bytes(?actual[0], expected, 32);
+}
+
 pub fun key_pair_valid(public_key: PublicKey, private_key: PrivateKey) bool {
     if (!public_key_valid(public_key) || !private_key_valid(private_key) ||
         public_key.algorithm != private_key.algorithm) { ret false; }
@@ -559,21 +617,51 @@ pub fun key_sign(key: PrivateKey, entropy: Entropy, message: contracts.Bytes,
     }
     var salt: [32]^u8;
     ct.zeroize(?salt[0], 32);
-    if (!entropy.available || entropy.fill:^ == nil) {
+    if (!entropy_valid(entropy) || !entropy.available) {
         ct.zeroize(?salt[0], 32);
         ret failed(problem.SIGNING, problem.ENTROPY_UNAVAILABLE,
             "rsa signing entropy is unavailable");
     }
+    var message_digest: [32]u8;
+    if (!sha256_bytes(message.data, message.len, ?message_digest[0]) ||
+        entropy_owns(entropy, message.data, message.len) ||
+        entropy_owns(entropy, output.data, output.capacity) ||
+        entropy_owns(entropy, key.rsa.modulus.data, key.rsa.modulus.len) ||
+        entropy_owns(entropy, key.rsa.public_exponent.data,
+            key.rsa.public_exponent.len) ||
+        entropy_owns_secret(entropy, ?salt[0], 32) ||
+        !sha256_unchanged(message.data, message.len, ?message_digest[0])) {
+        ct.zeroize(?salt[0], 32);
+        ret failed(problem.SIGNING, problem.INVALID_INPUT,
+            "entropy provider aliases or mutated signing inputs");
+    }
     val entropy_status: contracts.Error = entropy.fill(entropy.ctx,
         contracts.SecretBuffer{data: ?salt[0], capacity: 32});
-    if (entropy_status != contracts.OK) {
+    val entropy_unchanged: bool = entropy.validate(entropy.validation_ctx);
+    if (!entropy_unchanged || entropy_status != contracts.OK ||
+        !sha256_unchanged(message.data, message.len, ?message_digest[0])) {
         ct.zeroize(?salt[0], 32);
+        if (!entropy_unchanged || entropy_status == contracts.OK) {
+            ret failed(problem.SIGNING, problem.INVALID_INPUT,
+                "entropy callback mutated signing inputs");
+        }
         ret Operation{error: crypto_error(entropy_status), written: 0};
     }
+    var signature_bytes: [512]u8;
     val signed: contracts.Operation = signature.sign_rsa_pss_sha256(key.rsa,
-        message, contracts.SecretBytes{data: ?salt[0], len: 32}, output);
+        message, contracts.SecretBytes{data: ?salt[0], len: 32},
+        contracts.Buffer{data: ?signature_bytes[0],
+            capacity: key.rsa.modulus.len});
     ct.zeroize(?salt[0], 32);
-    ret Operation{error: crypto_error(signed.error), written: signed.written};
+    if (signed.error != contracts.OK) {
+        ret Operation{error: crypto_error(signed.error), written: 0};
+    }
+    var i: usize = 0;
+    for (i < signed.written) {
+        output.data[i] = signature_bytes[i];
+        i = i + 1;
+    }
+    ret Operation{error: problem.none(), written: signed.written};
 }
 
 pub fun signer(key: PublicKey) Signer {
@@ -679,11 +767,31 @@ pub fun encode_jws(signer_value: Signer, private_key: PrivateKey, entropy: Entro
     }
     val signing_len: usize = signing.pos - signing_start;
     val signature_start: usize = signing.pos;
+    var nonce_digest: [32]u8;
+    var url_digest: [32]u8;
+    var kid_digest: [32]u8;
+    var payload_digest: [32]u8;
+    if (!sha256_bytes(protected.nonce.data, protected.nonce.len,
+            ?nonce_digest[0]) ||
+        !sha256_bytes(protected.url.data, protected.url.len, ?url_digest[0]) ||
+        !sha256_bytes(protected.kid.data, protected.kid.len, ?kid_digest[0]) ||
+        !sha256_bytes(payload.data, payload.len, ?payload_digest[0])) {
+        ret failed(problem.STATE, problem.INVALID_STATE,
+            "jws input binding failed");
+    }
     val signed: Operation = key_sign(private_key, entropy,
         contracts.Bytes{data: ?work.data[signing_start], len: signing_len},
         contracts.Buffer{data: ?work.data[signature_start],
             capacity: work.capacity - signature_start});
     if (problem.failed(signed.error)) { ret signed; }
+    if (!sha256_unchanged(protected.nonce.data, protected.nonce.len,
+            ?nonce_digest[0]) ||
+        !sha256_unchanged(protected.url.data, protected.url.len, ?url_digest[0]) ||
+        !sha256_unchanged(protected.kid.data, protected.kid.len, ?kid_digest[0]) ||
+        !sha256_unchanged(payload.data, payload.len, ?payload_digest[0])) {
+        ret failed(problem.SIGNING, problem.INVALID_INPUT,
+            "jws inputs changed during signing");
+    }
     val protected_encoded_len: usize = base64url_len(protected_len);
     val payload_encoded_len: usize = base64url_len(payload.len);
     val signature_encoded_len: usize = base64url_len(signed.written);
