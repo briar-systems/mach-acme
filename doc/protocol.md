@@ -81,30 +81,40 @@ select a JWK and retain a `kid`.
 
 `account.encode` writes complete bounded payloads for account creation, existing
 account lookup, contact replacement, terms agreement, and deactivation. Creation
-may embed a complete external account binding object. Contact values must be
-nonempty ASCII URI values. Output is published only after the complete payload
-has been validated and encoded. The output cannot overlap the contact view array,
-contact bytes, or external binding bytes.
+may embed a successful `external_account.Operation`. Raw external-binding JSON is
+not accepted. The returned `account.Operation` binds the exact output view and
+SHA-256 payload digest, so it cannot authorize changed bytes. Contact values must
+be nonempty ASCII URI values. A `mailto` contact contains exactly one address and
+cannot contain a second address, header fields, or a fragment. Output is published
+only after the complete payload has been validated and encoded. The output cannot
+overlap the contact view array, contact bytes, or external binding bytes.
 
-`account.begin` accepts the matching successful `account.Operation`, uses the
-directory `newAccount` URL and a JWK for creation and lookup, and rejects an
-action or length mismatch. Updates require the same account URL as request
-endpoint and protected `kid`.
+`account.begin` accepts the matching successful `account.Operation` and exact
+signer, uses the directory `newAccount` URL and a JWK for creation and lookup, and
+rejects an action, payload, external-binding identity, or signer mismatch. Updates
+require the same account URL as request endpoint and protected `kid`.
 `account.parse` accepts HTTP 200 or 201 and requires a strict account object with
 a known status, bounded contacts, and an HTTPS orders URL. JSON scratch, response
 storage, contact views, output, response fields, response body, and the retained
 account URL are range-checked and disjoint. Creation requires exactly one HTTPS
 `Location` field and copies it into account storage. Existing-account responses
 retain the caller's known account URL. Other parsed views point into caller-owned
-storage. Validation and capacity failures do not publish an account or change
-text storage.
+storage. Creation, contact update, and terms agreement require a `valid` account.
+Deactivation requires `deactivated`. Lookup may recover any defined account
+status. Validation and capacity failures do not publish an account or change text
+storage.
 
 External account bindings are encoded internally rather than delegated to an
 unverifiable callback. `external_account.Binding` selects HS256 or HS384 and
-carries a secret-qualified MAC key plus a non-null opaque owner identity. The
+carries a secret-qualified MAC key bounded by `MAX_MAC_KEY_BYTES`. Its
+`secret_owner` is a secret-qualified pointer and must equal the exact MAC-key
+pointer. The
 protected header binds `alg`, `kid`, and the exact `newAccount` URL. Its payload is
 the canonical JWK of the new account key. Work and output storage cannot overlap
-each other, public key bytes, the key ID, or URL. Final output is transactional.
+each other, public key bytes, the key ID, or URL. HMAC tag-capacity failures map to
+`OUTPUT_TOO_SMALL`, not a signing failure. Final output is transactional. The
+returned operation binds the output digest, MAC algorithm, URL digest, and account
+key thumbprint for the enclosing account request.
 
 ## Durable credentials and key rollover
 
@@ -115,10 +125,14 @@ pointer to secret storage.
 
 `storage.Manager` wraps an application durable store. A replacement transaction
 checks the expected credential generation, stages the complete next credential,
-then commits or aborts by an exact provider token. Commit and abort distinguish a
-known failure from an unknown outcome. `storage.recover` returns the durable
-current credential and any pending replacement, allowing restart and ambiguous
-wire outcomes to be reconciled without guessing which key is active.
+then commits or aborts by an exact provider token and credential digest. The
+manager admits one active transaction and rejects forged, stale, or reused writes.
+Commit and abort distinguish `STORAGE_CONFLICT`, `STORAGE_FAILED`, and
+`STORAGE_UNKNOWN`. `storage.recover` returns the durable current credential and
+any pending replacement, registers that exact transaction in a fresh manager, and
+allows restart and ambiguous wire outcomes to be reconciled without guessing
+which key is active. `storage.resume` converts a validated pending snapshot to the
+write accepted by commit or abort.
 
 `storage.begin_save` uses expected generation zero for the first account record
 and the current generation for contact, terms, status, or other account metadata
@@ -127,23 +141,39 @@ generation while preserving the exact account representation. An interrupted
 initial save is recoverable as a pending generation-one credential even though no
 current record exists yet.
 
+Each `storage.Store` declares the complete representable provider context through
+`context_anchor` and `context_size`, with `ctx` located inside that range. The
+provider must classify that complete range as owned and must never classify the
+manager, caller outputs, rollover work, or rollover output as owned. Transaction
+tokens are nonzero, globally monotonic for the lifetime of the durable store, and
+persist across commits, aborts, and process restarts. A successful `begin` creates
+an active transaction. `abort` must accept it before or after staging. Only
+`SUCCESS` proves rollback. Any other status leaves recovery responsible for the
+transaction.
+
 Every store callback is serialized. Same-thread reentrancy is rejected before a
 nested callback can run. The callback descriptor is snapshotted, so direct
 mutation cannot redirect a later validation or cleanup call. Readiness, opaque
-secret ownership classification, complete credential digests, transaction shape,
-and load output shape are checked around callbacks. The store must own every
-returned public credential range and recognize its opaque secret owner, but it
-may not own the manager or caller's output record.
+secret ownership classification, exact credential descriptors and digests,
+transaction shape, and load output shape are checked around callbacks. The store
+must own every returned public credential range and recognize its opaque secret
+owner, but it may not own the manager, caller's output record, or transient load
+record. Ownership and readiness callbacks must not mutate returned snapshot
+metadata or child descriptors.
 
 `key_change.prepare` durably stages the candidate before publishing any rollover
 payload. It encodes the RFC 8555 inner payload containing the account URL and old
 JWK, then signs a nonce-free nested JWS with the new ES256, EdDSA, or PS256 key.
-The prepared value binds the exact nested JWS bytes, both endpoint URLs, the old
-key thumbprint, and the credential generation. `key_change.begin_outer` submits
-that object under the old account `kid`. Accepted responses commit, rejected
-responses abort, and ambiguous outcomes retain the pending transaction for
-explicit recovery. A local encoding or signing failure aborts before any nested
-JWS is published.
+The prepared value binds the exact nested JWS bytes, both endpoint URLs, both old
+and replacement key thumbprints, the complete replacement credential, and the
+credential generation. Identical old and replacement keys are rejected.
+`key_change.begin_outer` submits that object under the old account `kid` and binds
+the outer request to the old signer. Accepted responses commit, rejected responses
+abort, and ambiguous outcomes retain the pending transaction for explicit
+recovery. Work and output are proven disjoint from the complete store context and
+manager before and after staging. A local encoding or signing failure requests an
+abort before any nested JWS is published. If rollback is not proven successful,
+the exact transaction remains recoverable.
 
 ## Replay nonce ownership
 
@@ -240,6 +270,11 @@ through completion or failure. Preparation checks the bindings before and after
 nonce and entropy callbacks. `signed_wire` checks them again, so changing any
 borrowed input before preparation or after a body is prepared fails closed. The
 transport URL can never diverge from the URL protected by the JWS.
+
+`begin_signed_bound` additionally records the exact signer thumbprint. Account
+and key-rollover request constructors use this path. `prepare_signed` rejects a
+different signer before consuming a nonce and checks the thumbprint again after
+signing callbacks before publishing a body.
 
 Both signed-response and nonce-response acceptance check those bindings before
 parsing or invoking a provider. Once a final signed response is admitted, every

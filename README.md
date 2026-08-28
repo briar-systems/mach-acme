@@ -25,16 +25,16 @@ ownership contract.
 - immutable nonce callback descriptors, public ranges, and opaque secret-owner
   domains with fail-closed result, alias, reentrancy, and state validation
 - signed-request state and bounded per-request `badNonce` recovery
-- exact URL, payload, `kid`, and prepared-body binding with timeout and response
-  bounds on every wire request
+- exact URL, payload, `kid`, signer thumbprint, and prepared-body binding with
+  timeout and response bounds on every wire request
 - structured local, HTTP, and ACME problem causes
 - bounded structured ACME subproblems for multi-identifier failures
 - caller-owned JSON scratch, output storage, signing work, and wire buffers
 - strict numeric grammar and an explicit duplicate-key comparison-work bound
 - bounded account creation, lookup, contact replacement, terms agreement,
   deactivation, and strict account response decoding
-- deterministic HS256 and HS384 external account binding with explicit secret
-  ownership
+- deterministic HS256 and HS384 external account binding with exact secret-key
+  ownership, bounded MAC keys, and provenance-carrying output operations
 - nested account key rollover for ES256, EdDSA, and PS256 credentials
 - durable credential prepare, commit, abort, and recovery with explicit conflict,
   failure, and unknown outcomes
@@ -69,9 +69,9 @@ buffer requirements.
 
 The repository pins exact released Git tags:
 
-- `mach-std` v0.29.0
-- `mach-http` v0.3.0
-- `mach-crypto` v0.4.0
+- `mach-std` v0.33.0
+- `mach-http` v0.4.1
+- `mach-crypto` v0.6.0
 
 Build output uses Mach's repository-local `out/` path. Run the root tests and the
 protocol vector project with:
@@ -94,15 +94,18 @@ account metadata update through the durable transaction boundary.
 
 `external_account.encode` creates the nested flattened JWS required by a CA's
 external account binding policy. A binding selects HS256 or HS384 and carries a
-secret-qualified key plus its opaque owner identity.
+bounded secret-qualified key whose owner pointer must be that exact key pointer.
+The returned operation binds the encoded bytes, algorithm, account-key
+thumbprint, and `newAccount` URL. `account.encode` accepts that operation, not
+untrusted JSON, and `account.begin` binds the outer request to the same signer.
 
 Key rollover starts with `key_change.prepare`. It durably stages the replacement
 through `storage.Manager`, signs the inner JWS with the new key, and returns the
 nested payload for an outer request signed by the old account key. An accepted
 response commits the staged credential. A rejected response aborts it. An
 ambiguous transport outcome retains the pending credential so `storage.recover`
-can reconcile the server's active key before `key_change.resolve` commits or
-aborts it.
+can reconcile the server's active key after restart. `key_change.resolve` accepts
+that recovered snapshot and commits or aborts its resumed exact transaction.
 
 ## Remaining scope
 
