@@ -676,9 +676,13 @@ test "acme.challenge: rfc 8555 and rfc 8737 challenge data are exact" {
 
     # rfc 8555 section 8.3: the path the authority fetches
     var path: [256]u8;
-    val http: Operation = http_path(Challenge{typ: HTTP_01,
-        url: view.view(nil, 0), token: view.view(token, 43), status: PENDING,
-        validated: view.view(nil, 0)},
+    var pending: Challenge;
+    pending.typ = HTTP_01;
+    pending.url = view.view(nil, 0);
+    pending.token = view.view(token, 43);
+    pending.status = PENDING;
+    pending.validated = view.view(nil, 0);
+    val http: Operation = http_path(pending,
         contracts.Buffer{data: ?path[0], capacity: 256});
     val expected_path: str = "/.well-known/acme-challenge/LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
     if (problem.failed(http.error) || http.written != 71 ||
@@ -733,9 +737,7 @@ test "acme.challenge: rfc 8555 and rfc 8737 challenge data are exact" {
         tls_alpn_extension(key_auth,
             contracts.Buffer{data: ?small[0], capacity: 8}).error.code !=
             problem.OUTPUT_TOO_SMALL ||
-        http_path(Challenge{typ: HTTP_01, url: view.view(nil, 0),
-            token: view.view(token, 43), status: PENDING,
-            validated: view.view(nil, 0)},
+        http_path(pending,
             contracts.Buffer{data: ?small[0], capacity: 8}).error.code !=
             problem.OUTPUT_TOO_SMALL) { ret 7; }
 

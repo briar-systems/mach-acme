@@ -339,11 +339,13 @@ pub fun prepare(manager: *storage.Manager, current: account.Credentials,
         output.data[i] = nested[i];
         i = i + 1;
     }
-    var result: Prepared = Prepared{error: problem.none(),
-        replacement: transaction,
-        nested_jws: view.view(output.data, encoded.written),
-        account_url: current.account.url, key_change_url: key_change_url,
-        generation: current.generation};
+    var result: Prepared;
+    result.error = problem.none();
+    result.replacement = transaction;
+    result.nested_jws = view.view(output.data, encoded.written);
+    result.account_url = current.account.url;
+    result.key_change_url = key_change_url;
+    result.generation = current.generation;
     i = 0;
     for (i < 32) {
         result.account_digest[i] = account_digest[i];

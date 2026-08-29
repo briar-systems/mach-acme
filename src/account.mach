@@ -545,10 +545,12 @@ pub fun encode(action: Action, request: Request,
         ret failed(problem.STATE, problem.INVALID_STATE,
             "account request binding failed");
     }
-    var result: Operation = Operation{error: problem.none(),
-        written: writer.pos, action: action,
-        payload: view.view(output.data, writer.pos),
-        external_binding: request.external_account_binding};
+    var result: Operation;
+    result.error = problem.none();
+    result.written = writer.pos;
+    result.action = action;
+    result.payload = view.view(output.data, writer.pos);
+    result.external_binding = request.external_account_binding;
     var i: usize = 0;
     for (i < 32) {
         result.payload_digest[i] = payload_digest[i];
