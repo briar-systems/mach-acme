@@ -417,9 +417,12 @@ pub fun encode(value: Binding, account_key: jose.PublicKey, url: view.View,
         ret failed(problem.STATE, problem.INVALID_STATE,
             "external account binding could not be bound");
     }
-    var operation: Operation = Operation{error: problem.none(),
-        written: result.pos, output: view.view(output.data, result.pos),
-        algorithm: value.algorithm, bound: true};
+    var operation: Operation;
+    operation.error = problem.none();
+    operation.written = result.pos;
+    operation.output = view.view(output.data, result.pos);
+    operation.algorithm = value.algorithm;
+    operation.bound = true;
     var i: usize = 0;
     for (i < 32) {
         operation.output_digest[i] = output_digest[i];

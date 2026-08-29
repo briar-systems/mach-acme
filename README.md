@@ -328,3 +328,21 @@ terminal.
 `select_next` picks the certificate closest to expiry among those actually
 ready, so expiring certificates get priority without a backing-off one being
 selected before its delay elapses.
+
+## Record literals
+
+A record literal leaves every field it does not name holding the previous stack
+frame's contents rather than zero, which covers `T{}` as well as any partial
+form (briar-systems/mach#3108). Clearing a record that holds callbacks or
+pointers with a literal therefore does not clear it.
+
+Name every field of every literal. A record containing an array cannot satisfy
+that, because an array field cannot be named in a literal at all, so those are
+built by declaring `var value: T;` — which does zero the whole record including
+its arrays — and assigning each field. `nonce.no_pool` and `client.no_limits`
+return a value cleared by declaration, and `client.release` copies from them
+rather than assigning a literal.
+
+`briar-systems/mach-tls` carries `tools/partial_literal_sweep.py`, which
+enumerates any literal that breaks the rule; it reports zero for this
+repository.
