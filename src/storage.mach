@@ -379,11 +379,14 @@ fun gate_state_valid(manager: *Manager) bool {
 }
 
 fun guard(manager: *Manager) ManagerGuard {
-    var result: ManagerGuard = ManagerGuard{store: manager.store,
-        gate: manager.gate, last_token: manager.gate.last_token,
-        active_transaction: manager.gate.active_transaction,
-        active_state: manager.gate.active_state,
-        active_kind: manager.gate.active_kind, initialized: manager.initialized};
+    var result: ManagerGuard;
+    result.store = manager.store;
+    result.gate = manager.gate;
+    result.last_token = manager.gate.last_token;
+    result.active_transaction = manager.gate.active_transaction;
+    result.active_state = manager.gate.active_state;
+    result.active_kind = manager.gate.active_kind;
+    result.initialized = manager.initialized;
     digest_copy(?manager.gate.active_digest[0], ?result.active_digest[0]);
     ret result;
 }

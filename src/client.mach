@@ -688,6 +688,19 @@ fun pool_prepare_disjoint(client: *Client, request: *SignedRequest,
     ret result;
 }
 
+# a value cleared by declaration rather than by an empty literal: a record
+# literal leaves every field it does not name holding the previous stack
+# frame's contents (briar-systems/mach#3108)
+pub fun no_limits() Limits {
+    var value: Limits;
+    ret value;
+}
+
+fun no_field_limits() field.Limits {
+    var value: field.Limits;
+    ret value;
+}
+
 pub fun limits_default() Limits {
     ret Limits{
         max_request_bytes: 1048576,
@@ -783,8 +796,8 @@ pub fun release(client: *Client) bool {
         !client.initialized || atomic.load(?client.callback_owner) != 0) {
         ret false;
     }
-    client.nonces = nonce.Pool{};
-    client.limits = Limits{};
+    client.nonces = nonce.no_pool();
+    client.limits = no_limits();
     atomic.store(?client.callback_owner, 0);
     client.initialized = false;
     ret true;
@@ -1479,7 +1492,7 @@ fun invalid_wire(detail: str) WireRequest {
         problem.INVALID_INPUT, detail), method: method.from_kind(0),
         url: view.view(nil, 0), content_type: view.view(nil, 0),
         body: view.view(nil, 0), timeout_ns: 0, max_response_bytes: 0,
-        response_fields: field.Limits{},
+        response_fields: no_field_limits(),
         replay_safe: false};
 }
 
@@ -1698,9 +1711,10 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
                 "entropy provider aliases or mutated protocol storage"),
                 written: 0};
         }
-        entropy_guard = EntropyGuard{source_validate: entropy.validate,
-            source_ctx: entropy.validation_ctx, client: client,
-            request: request};
+        entropy_guard.source_validate = entropy.validate;
+        entropy_guard.source_ctx = entropy.validation_ctx;
+        entropy_guard.client = client;
+        entropy_guard.request = request;
         guarded_entropy.validation_ctx = (?entropy_guard)::ptr;
         guarded_entropy.validate = guarded_entropy_validate;
         entropy_guarded = true;
