@@ -1,6 +1,6 @@
 [project]
 id = "acme"
-version = "0.1.3"
+version = "0.1.4"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -62,4 +62,4 @@ ref = "tag/v0.7.0"
 
 [dep.mach-crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.6.0"
+ref = "tag/v0.7.0"
