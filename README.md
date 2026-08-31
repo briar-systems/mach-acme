@@ -99,7 +99,7 @@ The repository pins exact released Git tags:
 
 - `mach-std` v0.33.0
 - `mach-http` v0.7.0
-- `mach-crypto` v0.6.0
+- `mach-crypto` v0.7.0
 
 Build output uses Mach's repository-local `out/` path. Run the root tests and the
 protocol vector project with:
