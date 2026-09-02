@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8] - 2026-09-02
+
+### Changed
+
+- `mach-http` advances to `v0.7.5`, adopting the HTTP/3 DATA frame fix so
+  every consumer in hedge's graph shares one release.
+
 ## [0.1.7] - 2026-09-02
 
 ### Changed
