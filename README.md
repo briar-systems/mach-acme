@@ -98,7 +98,7 @@ buffer requirements.
 The repository pins exact released Git tags:
 
 - `mach-std` v0.34.0
-- `mach-http` v0.7.4
+- `mach-http` v0.7.5
 - `mach-crypto` v0.8.1
 
 Build output uses Mach's repository-local `out/` path. Run the root tests and the
