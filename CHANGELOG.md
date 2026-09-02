@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- `mach-http` advances to `v0.7.4`, adopting the HTTP/3 teardown fix so
+  every consumer in hedge's graph shares one release.
+
 ## [0.1.6] - 2026-09-01
 
 ### Changed
