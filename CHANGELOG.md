@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- The record-literal section no longer points at `mach-tls`'s partial literal
+  sweep. That script is removed: enumerating the violations was a workaround
+  for briar-systems/mach#3108, which is being fixed in the compiler. The rule
+  itself is unchanged and still stated here.
+
 ## [0.1.8] - 2026-09-02
 
 ### Changed

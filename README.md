@@ -343,6 +343,6 @@ its arrays — and assigning each field. `nonce.no_pool` and `client.no_limits`
 return a value cleared by declaration, and `client.release` copies from them
 rather than assigning a literal.
 
-`briar-systems/mach-tls` carries `tools/partial_literal_sweep.py`, which
-enumerates any literal that breaks the rule; it reports zero for this
-repository.
+Nothing enforces this automatically. Enumerating the violations was a
+workaround for briar-systems/mach#3108, and that defect is being fixed in the
+compiler, so the constructors above are what keep the rule.
