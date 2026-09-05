@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.9] - 2026-09-05
+
+### Changed
+
+- Dependencies: mach-http v0.7.6, mach-crypto v0.8.2.
+- The record-literal section no longer points at `mach-tls`'s partial literal
+  sweep. That script is removed: enumerating the violations was a workaround
+  for briar-systems/mach#3108, which is being fixed in the compiler. The rule
+  itself is unchanged and still stated here.
+
+### Added
+
+- GitHub Actions CI: every pull request builds the library, runs the suite and the protocol vector project in both profiles, brings up the live ACME stack and runs the live suite against it, and verifies IR across all six targets.
+
 ## [0.1.8] - 2026-09-02
 
 ### Changed
