@@ -1,7 +1,8 @@
 # bounded transport-independent acme protocol state
 
 use J: std.data.json;
-use R: std.types.result;
+use std.types.result.res;
+use std.types.option.opt;
 use crypto.contracts;
 use crypto.hash;
 use http.core.field;
@@ -22,6 +23,17 @@ use acme.memory_range;
 use acme.nonce;
 use acme.problem;
 
+
+
+# an element by index, nil when absent, as std 1.x returned it
+fun element(value: *J.Value, index: usize) *J.Value {
+    val got: opt[*J.Value] = J.value_get(value, index);
+    if (sel got.some) { ret got.some; }
+    ret nil;
+}
+fun is_err_ip_ipv6_parse(outcome: res[ip.IPv6, ip.ParseError]) bool {
+    ret sel outcome.err;
+}
 pub val DIRECTORY_CONTENT_TYPE: str = "application/json";
 pub val JWS_CONTENT_TYPE:       str = "application/jose+json";
 pub val PROBLEM_CONTENT_TYPE:   str = "application/problem+json";
@@ -814,9 +826,9 @@ fun json_limits(configured: Limits, maximum: usize) json.Limits {
 
 fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
     if (value == nil || value.kind != J.STRING) { ret false; }
-    val result: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
-    if (R.is_err[usize, str](result)) { ret false; }
-    @output = R.unwrap_ok[usize, str](result);
+    val result: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+    if (sel result.err) { ret false; }
+    @output = result.ok;
     ret @output <= maximum;
 }
 
@@ -917,7 +929,7 @@ fun authority_valid(data: *u8, start: usize, finish: usize) bool {
             i = i + 1;
         }
         literal[close - start - 1] = 0;
-        if (R.is_err[ip.IPv6, str](ip.ipv6_parse(?literal[0]))) { ret false; }
+        if (is_err_ip_ipv6_parse(ip.ipv6_parse(?literal[0]))) { ret false; }
         if (close + 1 == finish) { ret true; }
         ret data[close + 1] == ':' && port_valid(data, close + 2, finish);
     }
@@ -976,8 +988,8 @@ fun https_value(value: *J.Value, maximum: usize) bool {
     var len: usize = 0;
     if (!decoded_len(value, maximum, ?len) || len < 9) { ret false; }
     var decoded: [4096]u8;
-    val result: R.Result[usize, str] = J.value_string_decode(value, ?decoded[0], 4096);
-    ret !R.is_err[usize, str](result) && https_bytes(?decoded[0], len);
+    val result: res[usize, J.JsonError] = J.value_string_decode(value, ?decoded[0], 4096);
+    ret (sel result.ok) && https_bytes(?decoded[0], len);
 }
 
 # rfc 8555 section 9.7.6 states terms and website as plain uris. they are
@@ -1018,8 +1030,8 @@ fun metadata_uri_value(value: *J.Value, maximum: usize) bool {
     var len: usize = 0;
     if (!decoded_len(value, maximum, ?len)) { ret false; }
     var decoded: [4096]u8;
-    val result: R.Result[usize, str] = J.value_string_decode(value, ?decoded[0], 4096);
-    ret !R.is_err[usize, str](result) && metadata_uri_bytes(?decoded[0], len);
+    val result: res[usize, J.JsonError] = J.value_string_decode(value, ?decoded[0], 4096);
+    ret (sel result.ok) && metadata_uri_bytes(?decoded[0], len);
 }
 
 fun add_size(total: *usize, value: *J.Value, maximum: usize) bool {
@@ -1040,11 +1052,10 @@ fun copy_string(cursor: *Cursor, value: *J.Value, output: *view.View) bool {
     var len: usize = 0;
     if (!decoded_len(value, cursor.cap - cursor.pos, ?len)) { ret false; }
     val start: usize = cursor.pos;
-    val result: R.Result[usize, str] = J.value_string_decode(value,
+    val result: res[usize, J.JsonError] = J.value_string_decode(value,
         ?cursor.data[start], cursor.cap - start);
-    if (R.is_err[usize, str](result) || R.unwrap_ok[usize, str](result) != len) {
-        ret false;
-    }
+    if (sel result.err) { ret false; }
+    if (result.ok != len) { ret false; }
     cursor.pos = cursor.pos + len;
     @output = view.view(?cursor.data[start], len);
     ret true;
@@ -1162,16 +1173,16 @@ pub fun parse_directory(response: Response, configured: Limits, scratch: *u8,
     }
     var i: usize = 0;
     for (i < caa_len) {
-        val item: *J.Value = J.value_get(caa, i);
+        val item: *J.Value = element(caa, i);
         var item_len: usize = 0;
         if (!decoded_len(item, 255, ?item_len) || item_len == 0 ||
             item_len > 0xffffffffffffffff - required) {
             ret directory_error("directory caa identity is invalid");
         }
         var decoded: [255]u8;
-        val decoded_result: R.Result[usize, str] = J.value_string_decode(item,
+        val decoded_result: res[usize, J.JsonError] = J.value_string_decode(item,
             ?decoded[0], 255);
-        if (R.is_err[usize, str](decoded_result) ||
+        if ((sel decoded_result.err) ||
             !caa_identity(?decoded[0], item_len)) {
             ret directory_error("directory caa identity is invalid");
         }
@@ -1198,7 +1209,7 @@ pub fun parse_directory(response: Response, configured: Limits, scratch: *u8,
     }
     i = 0;
     for (i < caa_len) {
-        if (!copy_string(?cursor, J.value_get(caa, i), ?storage.caa_items[i])) {
+        if (!copy_string(?cursor, element(caa, i), ?storage.caa_items[i])) {
             ret problem.local_code(problem.STATE, problem.INVALID_STATE,
                 "validated directory caa copy failed");
         }
@@ -1309,7 +1320,7 @@ fun parse_problem(response: Response, configured: Limits, scratch: *u8,
     }
     var i: usize = 0;
     for (i < subproblem_len) {
-        val item: *J.Value = J.value_get(subproblems, i);
+        val item: *J.Value = element(subproblems, i);
         if (item == nil || item.kind != J.OBJECT) {
             fallback.kind = problem.PROTOCOL;
             fallback.code = problem.MALFORMED_JSON;
@@ -1382,7 +1393,7 @@ fun parse_problem(response: Response, configured: Limits, scratch: *u8,
     value.status = parsed_status;
     i = 0;
     for (i < subproblem_len) {
-        val item: *J.Value = J.value_get(subproblems, i);
+        val item: *J.Value = element(subproblems, i);
         val item_identifier: *J.Value = json.find(item, "identifier");
         var parsed: problem.Subproblem = problem.Subproblem{
             typ: view.view(nil, 0), detail: view.view(nil, 0),

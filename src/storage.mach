@@ -181,21 +181,21 @@ fun store_shape(value: Store) bool {
             value.context_size) && value.gate != nil &&
         memory_range.valid(value.gate::*u8, $size_of(Gate)) &&
         memory_range.overlap(value.gate::*u8, $size_of(Gate),
-            value.context_anchor, value.context_size) && value.ready:^ != nil &&
-        value.aliases:^ != nil &&
-        value.owns_secret:^ != nil && value.begin:^ != nil &&
-        value.stage:^ != nil && value.commit:^ != nil &&
-        value.abort:^ != nil && value.load:^ != nil &&
+            value.context_anchor, value.context_size) && value.ready != nil &&
+        value.aliases != nil &&
+        value.owns_secret != nil && value.begin != nil &&
+        value.stage != nil && value.commit != nil &&
+        value.abort != nil && value.load != nil &&
         # a store either supports certificate records or declares neither
         # callback. a half-declared record kind is a configuration error.
-        ((value.stage_certificate:^ == nil &&
-            value.load_certificate:^ == nil) ||
-        (value.stage_certificate:^ != nil &&
-            value.load_certificate:^ != nil));
+        ((value.stage_certificate == nil &&
+            value.load_certificate == nil) ||
+        (value.stage_certificate != nil &&
+            value.load_certificate != nil));
 }
 
 pub fun supports_certificates(value: Store) bool {
-    ret value.stage_certificate:^ != nil && value.load_certificate:^ != nil;
+    ret value.stage_certificate != nil && value.load_certificate != nil;
 }
 
 fun store_same(first: Store, second: Store) bool {
@@ -203,27 +203,27 @@ fun store_same(first: Store, second: Store) bool {
         first.context_anchor == second.context_anchor &&
         first.context_size == second.context_size &&
         first.gate == second.gate &&
-        first.ready:^ == second.ready:^ &&
-        first.aliases:^ == second.aliases:^ &&
-        first.owns_secret:^ == second.owns_secret:^ &&
-        first.begin:^ == second.begin:^ && first.stage:^ == second.stage:^ &&
-        first.commit:^ == second.commit:^ && first.abort:^ == second.abort:^ &&
-        first.load:^ == second.load:^ &&
-        first.stage_certificate:^ == second.stage_certificate:^ &&
-        first.load_certificate:^ == second.load_certificate:^;
+        first.ready == second.ready &&
+        first.aliases == second.aliases &&
+        first.owns_secret == second.owns_secret &&
+        first.begin == second.begin && first.stage == second.stage &&
+        first.commit == second.commit && first.abort == second.abort &&
+        first.load == second.load &&
+        first.stage_certificate == second.stage_certificate &&
+        first.load_certificate == second.load_certificate;
 }
 
 fun gate_same(value: *Gate, store: Store) bool {
     ret value != nil && value.initialized && value.ctx == store.ctx &&
         value.context_anchor == store.context_anchor &&
         value.context_size == store.context_size &&
-        value.ready:^ == store.ready:^ && value.aliases:^ == store.aliases:^ &&
-        value.owns_secret:^ == store.owns_secret:^ &&
-        value.begin:^ == store.begin:^ && value.stage:^ == store.stage:^ &&
-        value.commit:^ == store.commit:^ && value.abort:^ == store.abort:^ &&
-        value.load:^ == store.load:^ &&
-        value.stage_certificate:^ == store.stage_certificate:^ &&
-        value.load_certificate:^ == store.load_certificate:^;
+        value.ready == store.ready && value.aliases == store.aliases &&
+        value.owns_secret == store.owns_secret &&
+        value.begin == store.begin && value.stage == store.stage &&
+        value.commit == store.commit && value.abort == store.abort &&
+        value.load == store.load &&
+        value.stage_certificate == store.stage_certificate &&
+        value.load_certificate == store.load_certificate;
 }
 
 fun status_valid(value: Status) bool {

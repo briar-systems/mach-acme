@@ -3,7 +3,8 @@
 use http.core.field;
 use http.core.status;
 use J: std.data.json;
-use R: std.types.result;
+use std.types.result.res;
+use std.types.option.opt;
 use crypto.contracts;
 use crypto.hash;
 use std.types.bool.bool;
@@ -21,6 +22,13 @@ use acme.memory_range;
 use acme.poll;
 use acme.problem;
 
+
+# an element by index, nil when absent, as std 1.x returned it
+fun element(value: *J.Value, index: usize) *J.Value {
+    val got: opt[*J.Value] = J.value_get(value, index);
+    if (sel got.some) { ret got.some; }
+    ret nil;
+}
 pub val PENDING:    u8 = 1;
 pub val READY:      u8 = 2;
 pub val PROCESSING: u8 = 3;
@@ -389,9 +397,9 @@ rec Cursor {
 
 fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
     if (value == nil || value.kind != J.STRING || output == nil) { ret false; }
-    val result: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
-    if (R.is_err[usize, str](result)) { ret false; }
-    val len: usize = R.unwrap_ok[usize, str](result);
+    val result: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+    if (sel result.err) { ret false; }
+    val len: usize = result.ok;
     if (len > maximum) { ret false; }
     @output = len;
     ret true;
@@ -412,10 +420,10 @@ fun copy_string(cursor: *Cursor, value: *J.Value, maximum: usize,
         ret false;
     }
     val start: usize = cursor.pos;
-    val result: R.Result[usize, str] = J.value_string_decode(value,
+    val result: res[usize, J.JsonError] = J.value_string_decode(value,
         ?cursor.data[start], cursor.cap - start);
-    if (R.is_err[usize, str](result) ||
-        R.unwrap_ok[usize, str](result) != len) { ret false; }
+    if (sel result.err) { ret false; }
+    if (result.ok != len) { ret false; }
     cursor.pos = cursor.pos + len;
     @output = view.view(?cursor.data[start], len);
     ret true;
@@ -425,9 +433,9 @@ fun value_equals(value: *J.Value, expected: *u8) bool {
     var decoded: [32]u8;
     var len: usize = 0;
     if (!decoded_len(value, 31, ?len)) { ret false; }
-    val result: R.Result[usize, str] = J.value_string_decode(value,
+    val result: res[usize, J.JsonError] = J.value_string_decode(value,
         ?decoded[0], 32);
-    if (R.is_err[usize, str](result)) { ret false; }
+    if (sel result.err) { ret false; }
     var i: usize = 0;
     for (i < len) {
         if (expected[i] == 0 || decoded[i] != expected[i]) { ret false; }
@@ -728,7 +736,7 @@ pub fun parse(response: client.Response, order_url: view.View,
     }
     var i: usize = 0;
     for (i < identifier_len) {
-        val item: *J.Value = J.value_get(identifiers, i);
+        val item: *J.Value = element(identifiers, i);
         if (item == nil || item.kind != J.OBJECT) {
             ret parse_error(problem.MALFORMED_JSON,
                 "order identifier is not an object");
@@ -749,7 +757,7 @@ pub fun parse(response: client.Response, order_url: view.View,
     }
     i = 0;
     for (i < authorization_len) {
-        if (!copy_string(?cursor, J.value_get(authorizations, i),
+        if (!copy_string(?cursor, element(authorizations, i),
                 configured.max_url_bytes, ?storage.authorizations[i]) ||
             !client.url_valid(storage.authorizations[i],
                 configured.max_url_bytes)) {
@@ -857,7 +865,7 @@ pub fun parse_authorization(response: client.Response,
     }
     var i: usize = 0;
     for (i < challenge_len) {
-        val item: *J.Value = J.value_get(challenges, i);
+        val item: *J.Value = element(challenges, i);
         if (item == nil || item.kind != J.OBJECT) {
             ret parse_error(problem.MALFORMED_JSON,
                 "authorization challenge is not an object");

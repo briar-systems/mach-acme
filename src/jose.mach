@@ -53,18 +53,18 @@ pub fun entropy_provider(ctx: ptr, fill: FillEntropyFun,
     validate: EntropyValidateFun) Entropy {
     ret Entropy{ctx: ctx, fill: fill, aliases: aliases,
         aliases_secret: aliases_secret, validation_ctx: ctx, validate: validate,
-        available: fill:^ != nil && aliases:^ != nil &&
-            aliases_secret:^ != nil && validate:^ != nil};
+        available: fill != nil && aliases != nil &&
+            aliases_secret != nil && validate != nil};
 }
 
 pub fun entropy_valid(value: Entropy) bool {
     if (!value.available) {
-        ret value.ctx == nil && value.fill:^ == nil && value.aliases:^ == nil &&
-            value.aliases_secret:^ == nil && value.validation_ctx == nil &&
-            value.validate:^ == nil;
+        ret value.ctx == nil && value.fill == nil && value.aliases == nil &&
+            value.aliases_secret == nil && value.validation_ctx == nil &&
+            value.validate == nil;
     }
-    ret value.fill:^ != nil && value.aliases:^ != nil &&
-        value.aliases_secret:^ != nil && value.validate:^ != nil;
+    ret value.fill != nil && value.aliases != nil &&
+        value.aliases_secret != nil && value.validate != nil;
 }
 
 pub fun entropy_owns_secret(value: Entropy, data: *^u8, len: usize) bool {

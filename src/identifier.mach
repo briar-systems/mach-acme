@@ -1,6 +1,6 @@
 # certificate identifier model and explicit wildcard and ip policy
 
-use R: std.types.result;
+use std.types.result.res;
 use std.net.ip;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -10,6 +10,14 @@ use std.types.string.str;
 use std.types.view;
 use acme.memory_range;
 
+
+fun is_ok_ip_ipv4_parse(outcome: res[ip.IPv4, ip.ParseError]) bool {
+    ret sel outcome.ok;
+}
+
+fun is_ok_ip_ipv6_parse(outcome: res[ip.IPv6, ip.ParseError]) bool {
+    ret sel outcome.ok;
+}
 pub val DNS: u8 = 1;
 pub val IP:  u8 = 2;
 
@@ -99,8 +107,8 @@ fun ip_valid(value: view.View) bool {
         i = i + 1;
     }
     text[value.len] = 0;
-    ret !R.is_err[ip.IPv4, str](ip.ipv4_parse(?text[0])) ||
-        !R.is_err[ip.IPv6, str](ip.ipv6_parse(?text[0]));
+    ret is_ok_ip_ipv4_parse(ip.ipv4_parse(?text[0])) ||
+        is_ok_ip_ipv6_parse(ip.ipv6_parse(?text[0]));
 }
 
 pub fun valid(value: Identifier, policy: Policy) bool {

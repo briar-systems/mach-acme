@@ -11,8 +11,9 @@ use crypto.contracts;
 use crypto.hash;
 use fs: std.filesystem;
 use IO: std.io.error;
-use O: std.types.option;
-use R: std.types.result;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.error.err;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -28,6 +29,7 @@ use acme.storage;
 
 # "MACHACME" then a schema version. a reader that does not recognize the
 # version refuses the document rather than guessing at its layout.
+
 pub val MAGIC_BYTES:    usize = 8;
 pub val HEADER_BYTES:   usize = 56;
 pub val SCHEMA_VERSION: u32   = 1;
@@ -163,14 +165,15 @@ pub fun write_document(path: str, kind: DocumentKind, payload: view.View,
     }
     var allocator: A.Allocator;
     var state: F.FixedState;
-    if (O.is_some[*u8](F.make(?allocator, ?state, ?scratch[encoded],
-            scratch_capacity - encoded))) {
+    val made: err[A.Error] = F.make(?allocator, ?state, ?scratch[encoded],
+        scratch_capacity - encoded);
+    if (sel made.err) {
         ret storage_error(problem.INVALID_INPUT,
             "durable document allocator is invalid");
     }
-    val replaced: O.Option[str] = fs.replace_bytes_atomic(?allocator, path,
+    val replaced: err[fs.FsError] = fs.replace_bytes_atomic(?allocator, path,
         scratch, encoded, FILE_MODE, DIR_MODE);
-    if (O.is_some[str](replaced)) {
+    if (sel replaced.err) {
         # the previous committed document is untouched
         ret storage_error(problem.STORAGE_FAILED,
             "durable document could not be replaced");
@@ -190,23 +193,23 @@ pub fun read_document(path: str, kind: DocumentKind, buffer: *u8,
         ret storage_error(problem.INVALID_INPUT,
             "invalid durable document read");
     }
-    val opened: R.Result[fs.File, IO.Error] = fs.open(path);
-    if (R.is_err[fs.File, IO.Error](opened)) {
+    val opened: res[fs.File, IO.Error] = fs.open(path);
+    if (sel opened.err) {
         ret storage_error(problem.STORAGE_FAILED,
             "durable document could not be opened");
     }
-    var file: fs.File = R.unwrap_ok[fs.File, IO.Error](opened);
+    var file: fs.File = opened.ok;
     var total: usize = 0;
     var reading: bool = true;
     for (reading) {
-        val received: R.Result[usize, IO.Error] = fs.read(file,
+        val received: res[usize, IO.Error] = fs.read(file,
             ?buffer[total], capacity - total);
-        if (R.is_err[usize, IO.Error](received)) {
+        if (sel received.err) {
             fs.close(?file);
             ret storage_error(problem.STORAGE_FAILED,
                 "durable document could not be read");
         }
-        val count: usize = R.unwrap_ok[usize, IO.Error](received);
+        val count: usize = received.ok;
         if (count == 0) { reading = false; }
         or {
             total = total + count;
@@ -737,7 +740,10 @@ fun load_kind(store: *Store, kind: DocumentKind) problem.Error {
     if (problem.failed(read)) {
         # a document that has never been written is not a failure. one that
         # exists but does not validate is.
-        if (!fs.exists(path)) { ret problem.none(); }
+        val present: res[bool, IO.Error] = fs.exists(path);
+        if (sel present.ok) {
+            if (!present.ok) { ret problem.none(); }
+        }
         ret read;
     }
     var cursor: Cursor = Cursor{data: document.payload.data,
