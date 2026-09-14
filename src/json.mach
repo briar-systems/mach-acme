@@ -1,20 +1,35 @@
 # strict bounded json tree over caller-owned scratch
 
+use acme.memory_range;
+use acme.problem;
 use A: std.allocator;
 use F: std.allocator.fixed;
 use J: std.data.json;
-use O: std.types.option;
-use R: std.types.result;
+use std.text.utf8;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.view;
-use std.text.utf8;
-use acme.memory_range;
-use acme.problem;
+
+# an element by index, nil when absent, as std 1.x returned it
+fun element(value: *J.Value, index: usize) *J.Value {
+    val got: opt[*J.Value] = J.value_get(value, index);
+    if (sel got.some) { ret got.some; }
+    ret nil;
+}
+
+# a key by index, nil when absent, as std 1.x returned it
+fun key_at(value: *J.Value, index: usize) str {
+    val got: opt[str] = J.value_key(value, index);
+    if (sel got.some) { ret got.some; }
+    ret nil;
+}
 
 pub rec Limits {
     max_bytes:           usize;
@@ -66,7 +81,8 @@ fun scan_number(input: view.View, start: usize, finish: *usize) problem.Error {
             ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
                 "json number has a leading zero");
         }
-    } or {
+    }
+    or {
         for (i < input.len && digit(input.data[i])) {
             val value: u64 = (input.data[i] - '0')::u64;
             if (magnitude > (9223372036854775807 - value) / 10) {
@@ -74,7 +90,7 @@ fun scan_number(input: view.View, start: usize, finish: *usize) problem.Error {
                     "json integer magnitude exceeds the parser range");
             }
             magnitude = magnitude * 10 + value;
-            i = i + 1;
+            i         = i + 1;
         }
     }
     if (i < input.len && input.data[i] == '.') {
@@ -112,9 +128,9 @@ fun prescan(input: view.View, configured: Limits) problem.Error {
         ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
             "json input is not valid utf-8");
     }
-    var depth: usize = 0;
-    var in_string: bool = false;
-    var i: usize = 0;
+    var depth:     usize = 0;
+    var in_string: bool  = false;
+    var i:         usize = 0;
     for (i < input.len) {
         val byte: u8 = input.data[i];
         if (in_string) {
@@ -136,7 +152,8 @@ fun prescan(input: view.View, configured: Limits) problem.Error {
                             "json unicode escape is invalid");
                     }
                     i = i + 5;
-                } or {
+                }
+                or {
                     if (escaped != '"' && escaped != '\\' && escaped != '/' &&
                         escaped != 'b' && escaped != 'f' && escaped != 'n' &&
                         escaped != 'r' && escaped != 't') {
@@ -145,10 +162,12 @@ fun prescan(input: view.View, configured: Limits) problem.Error {
                     }
                     i = i + 1;
                 }
-            } or (byte == '"') {
+            }
+            or (byte == '"') {
                 in_string = false;
             }
-        } or {
+        }
+        or {
             if (byte == '"') { in_string = true; }
             or (byte == '{' || byte == '[') {
                 depth = depth + 1;
@@ -156,14 +175,16 @@ fun prescan(input: view.View, configured: Limits) problem.Error {
                     ret problem.local_code(problem.LIMIT, problem.MALFORMED_JSON,
                         "json nesting limit exceeded");
                 }
-            } or (byte == '}' || byte == ']') {
+            }
+            or (byte == '}' || byte == ']') {
                 if (depth == 0) {
                     ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
                         "json delimiter is unmatched");
                 }
                 depth = depth - 1;
-            } or (byte == '-' || digit(byte)) {
-                var finish: usize = 0;
+            }
+            or (byte == '-' || digit(byte)) {
+                var finish:  usize         = 0;
                 val numeric: problem.Error = scan_number(input, i, ?finish);
                 if (problem.failed(numeric)) { ret numeric; }
                 i = finish - 1;
@@ -179,30 +200,29 @@ fun prescan(input: view.View, configured: Limits) problem.Error {
 }
 
 fun decoded_string_valid(value: *J.Value, maximum: usize) bool {
-    val decoded: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
-    ret !R.is_err[usize, str](decoded) && R.unwrap_ok[usize, str](decoded) <= maximum;
+    val decoded: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+    ret (sel decoded.ok) && decoded.ok <= maximum;
 }
 
 fun key_value(object: *J.Value, index: usize) J.Value {
     var value: J.Value;
-    value.kind = J.STRING;
-    value.str_val = J.value_key(object, index);
+    value.kind    = J.STRING;
+    value.str_val = key_at(object, index);
     value.str_len = J.value_key_len(object, index);
     ret value;
 }
 
 fun decoded_key_equal(first: *J.Value, second: *J.Value) bool {
-    var first_bytes: [128]u8;
+    var first_bytes:  [128]u8;
     var second_bytes: [128]u8;
-    val first_result: R.Result[usize, str] = J.value_string_decode(first,
+    val first_result: res[usize, J.JsonError] = J.value_string_decode(first,
         ?first_bytes[0], 128);
-    val second_result: R.Result[usize, str] = J.value_string_decode(second,
+    val second_result: res[usize, J.JsonError] = J.value_string_decode(second,
         ?second_bytes[0], 128);
-    if (R.is_err[usize, str](first_result) || R.is_err[usize, str](second_result)) {
-        ret false;
-    }
-    val len: usize = R.unwrap_ok[usize, str](first_result);
-    if (len != R.unwrap_ok[usize, str](second_result)) { ret false; }
+    if (sel first_result.err)  { ret false; }
+    if (sel second_result.err) { ret false; }
+    val len: usize = first_result.ok;
+    if (len != second_result.ok) { ret false; }
     var i: usize = 0;
     for (i < len) {
         if (first_bytes[i] != second_bytes[i]) { ret false; }
@@ -243,7 +263,7 @@ fun validate_tree(value: *J.Value, depth: usize, configured: Limits,
     }
     i = 0;
     for (i < J.value_count(value)) {
-        if (!validate_tree(J.value_get(value, i), depth + 1, configured, count,
+        if (!validate_tree(element(value, i), depth + 1, configured, count,
             comparisons, comparison_limit)) {
             ret false;
         }
@@ -266,22 +286,25 @@ pub fun parse(input: view.View, scratch: *u8, scratch_capacity: usize,
         ret document;
     }
     var allocator: A.Allocator;
-    var state: F.FixedState;
-    if (O.is_some[*u8](F.make(?allocator, ?state, scratch, scratch_capacity))) {
+    var state:     F.FixedState;
+    val made:      err[A.Error] = F.make(?allocator, ?state, scratch, scratch_capacity);
+    if (sel made.err) {
         ret invalid(problem.INVALID_INPUT, "json scratch allocator is invalid");
     }
-    val parsed: R.Result[J.Value, str] = J.parse(input.data, input.len, ?allocator);
-    if (R.is_err[J.Value, str](parsed)) {
-        val detail: str = R.unwrap_err[J.Value, str](parsed);
-        if (str_equals(detail, "out of memory")) {
+    val parsed: res[J.Value, J.JsonError] = J.parse(input.data, input.len, ?allocator);
+    if (sel parsed.err) {
+        if (sel parsed.err.alloc) {
             ret invalid(problem.OUTPUT_TOO_SMALL, "json scratch is too small");
         }
-        ret invalid(problem.MALFORMED_JSON, detail);
+        if (sel parsed.err.depth) {
+            ret invalid(problem.MALFORMED_JSON, "json nesting is too deep");
+        }
+        ret invalid(problem.MALFORMED_JSON, "json syntax error");
     }
-    var root: J.Value = R.unwrap_ok[J.Value, str](parsed);
-    var count: usize = 0;
-    var comparisons: usize = 0;
-    var comparison_limit: bool = false;
+    var root:             J.Value = parsed.ok;
+    var count:            usize   = 0;
+    var comparisons:      usize   = 0;
+    var comparison_limit: bool    = false;
     if (!validate_tree(?root, 1, configured, ?count, ?comparisons,
         ?comparison_limit)) {
         if (comparison_limit) {
@@ -301,12 +324,12 @@ fun key_equals(object: *J.Value, index: usize, expected: str) bool {
         !memory_range.valid(object::*u8, $size_of(J.Value)) ||
         object.kind != J.OBJECT ||
         index >= J.value_count(object) || expected == nil) { ret false; }
-    var key: J.Value = key_value(object, index);
-    var bytes: [128]u8;
-    val decoded: R.Result[usize, str] = J.value_string_decode(?key, ?bytes[0], 128);
-    if (R.is_err[usize, str](decoded)) { ret false; }
-    val len: usize = R.unwrap_ok[usize, str](decoded);
-    var i: usize = 0;
+    var key:     J.Value                 = key_value(object, index);
+    var bytes:   [128]u8;
+    val decoded: res[usize, J.JsonError] = J.value_string_decode(?key, ?bytes[0], 128);
+    if (sel decoded.err) { ret false; }
+    val len: usize = decoded.ok;
+    var i:   usize = 0;
     for (i < len) {
         if (expected[i] == 0 || expected[i] != bytes[i]) { ret false; }
         i = i + 1;
@@ -320,7 +343,7 @@ pub fun find(object: *J.Value, expected: str) *J.Value {
         object.kind != J.OBJECT || expected == nil) { ret nil; }
     var i: usize = 0;
     for (i < J.value_count(object)) {
-        if (key_equals(object, i, expected)) { ret J.value_get(object, i); }
+        if (key_equals(object, i, expected)) { ret element(object, i); }
         i = i + 1;
     }
     ret nil;

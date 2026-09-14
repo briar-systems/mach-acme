@@ -10,7 +10,7 @@ use std.runtime;
 use http.core.field;
 use http.core.method;
 use http.core.status;
-use R: std.types.result;
+use std.types.result.res;
 use T: std.chrono.time;
 use std.net.ip;
 use std.net.tcp;
@@ -287,10 +287,10 @@ fun dechunk(exchange: *Exchange, body_at: usize, output: *usize) bool {
 fun send_all(stream: *tcp.Stream, data: *u8, len: usize) bool {
     var sent: usize = 0;
     for (sent < len) {
-        val written: R.Result[usize, IO.Error] = tcp.stream_write(stream,
+        val written: res[usize, IO.Error] = tcp.stream_write(stream,
             ?data[sent], len - sent);
-        if (R.is_err[usize, IO.Error](written)) { ret false; }
-        val count: usize = R.unwrap_ok[usize, IO.Error](written);
+        if (sel written.err) { ret false; }
+        val count: usize = written.ok;
         if (count == 0) { ret false; }
         sent = sent + count;
     }
@@ -326,10 +326,10 @@ pub fun execute(request: client.WireRequest, exchange: *Exchange) bool {
         !put_text(?writer, "\r\n"))) { ret false; }
     if (!put_text(?writer, "\r\n")) { ret false; }
 
-    val connected: R.Result[tcp.Stream, IO.Error] = tcp.connect(
+    val connected: res[tcp.Stream, IO.Error] = tcp.connect(
         ip.endpoint(127, 0, 0, 1, ACME_PORT));
-    if (R.is_err[tcp.Stream, IO.Error](connected)) { ret false; }
-    var stream: tcp.Stream = R.unwrap_ok[tcp.Stream, IO.Error](connected);
+    if (sel connected.err) { ret false; }
+    var stream: tcp.Stream = connected.ok;
     tcp.stream_set_read_timeout(?stream, 30000);
     var ok: bool = send_all(?stream, ?head[0], writer.pos);
     if (ok && request.body.len != 0) {
@@ -337,11 +337,11 @@ pub fun execute(request: client.WireRequest, exchange: *Exchange) bool {
     }
     exchange.len = 0;
     for (ok) {
-        val received: R.Result[usize, IO.Error] = tcp.stream_read(?stream,
+        val received: res[usize, IO.Error] = tcp.stream_read(?stream,
             ?exchange.storage[exchange.len], MAX_BODY_BYTES - exchange.len);
-        if (R.is_err[usize, IO.Error](received)) { ok = false; }
-        or {
-            val count: usize = R.unwrap_ok[usize, IO.Error](received);
+        if (sel received.err) { ok = false; }
+        if (sel received.ok) {
+            val count: usize = received.ok;
             if (count == 0) { brk; }
             exchange.len = exchange.len + count;
             if (exchange.len == MAX_BODY_BYTES) { ok = false; }
@@ -912,21 +912,21 @@ fun manage(path: *u8, body: *u8, len: usize) bool {
         !put_number(?writer, len) || !put_text(?writer, "\r\n\r\n")) {
         ret false;
     }
-    val connected: R.Result[tcp.Stream, IO.Error] = tcp.connect(
+    val connected: res[tcp.Stream, IO.Error] = tcp.connect(
         ip.endpoint(127, 0, 0, 1, MANAGE_PORT));
-    if (R.is_err[tcp.Stream, IO.Error](connected)) { ret false; }
-    var stream: tcp.Stream = R.unwrap_ok[tcp.Stream, IO.Error](connected);
+    if (sel connected.err) { ret false; }
+    var stream: tcp.Stream = connected.ok;
     tcp.stream_set_read_timeout(?stream, 10000);
     var ok: bool = send_all(?stream, ?head[0], writer.pos) &&
         send_all(?stream, body, len);
     var reply: [4096]u8;
     var total: usize = 0;
     for (ok) {
-        val received: R.Result[usize, IO.Error] = tcp.stream_read(?stream,
+        val received: res[usize, IO.Error] = tcp.stream_read(?stream,
             ?reply[total], 4096 - total);
-        if (R.is_err[usize, IO.Error](received)) { ok = false; }
-        or {
-            val count: usize = R.unwrap_ok[usize, IO.Error](received);
+        if (sel received.err) { ok = false; }
+        if (sel received.ok) {
+            val count: usize = received.ok;
             if (count == 0) { brk; }
             total = total + count;
             if (total == 4096) { brk; }
@@ -968,7 +968,7 @@ fun live_supports(ctx: ptr, subject: identifier.Identifier, kind: u8) bool {
 
 fun live_present(ctx: ptr, subject: identifier.Identifier,
     value: challenge.Challenge,
-    key_auth: view.View) R.Result[challenge.Presentation, problem.Error] {
+    key_auth: view.View) res[challenge.Presentation, problem.Error] {
     val state: *LiveProvider = ctx::*LiveProvider;
     state.kind = value.typ;
     state.token = value.token;
@@ -989,7 +989,7 @@ fun live_present(ctx: ptr, subject: identifier.Identifier,
         val valued: challenge.Operation = challenge.dns_value(key_auth,
             contracts.Buffer{data: ?state.dns_value[0], capacity: 64});
         if (problem.failed(named.error) || problem.failed(valued.error)) {
-            ret R.err[challenge.Presentation, problem.Error](named.error);
+            ret res[challenge.Presentation, problem.Error].err{named.error};
         }
         state.dns_name_len = named.written;
         ok = put_text(?writer, "{\"host\":") &&
@@ -1008,19 +1008,17 @@ fun live_present(ctx: ptr, subject: identifier.Identifier,
             manage("/add-tlsalpn01", ?body[0], writer.pos);
     }
     if (!ok) {
-        ret R.err[challenge.Presentation, problem.Error](
-            problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
-                "challenge test server rejected the presentation"));
+        ret res[challenge.Presentation, problem.Error].err{problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
+                "challenge test server rejected the presentation")};
     }
     state.subject = subject;
     state.key_auth = key_auth;
     state.published = true;
-    ret R.ok[challenge.Presentation, problem.Error](
-        challenge.Presentation{ctx: ctx});
+    ret res[challenge.Presentation, problem.Error].ok{challenge.Presentation{ctx: ctx}};
 }
 
 fun live_cleanup(ctx: ptr,
-    presentation: challenge.Presentation) R.Result[bool, problem.Error] {
+    presentation: challenge.Presentation) res[bool, problem.Error] {
     val state: *LiveProvider = ctx::*LiveProvider;
     var body: [1024]u8;
     var writer: Writer = Writer{data: ?body[0], cap: 1024, pos: 0};
@@ -1043,11 +1041,10 @@ fun live_cleanup(ctx: ptr,
     }
     state.published = false;
     if (!ok) {
-        ret R.err[bool, problem.Error](
-            problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
-                "challenge test server rejected the cleanup"));
+        ret res[bool, problem.Error].err{problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
+                "challenge test server rejected the cleanup")};
     }
-    ret R.ok[bool, problem.Error](true);
+    ret res[bool, problem.Error].ok{true};
 }
 
 fun live_provider(state: *LiveProvider) challenge.Provider {
@@ -1070,8 +1067,9 @@ rec ReadyOrder {
 }
 
 fun monotonic_ns() i64 {
-    val current: T.Time = T.monotonic();
-    ret current.sec * 1000000000 + current.nsec;
+    val clock: T.Clock = T.monotonic();
+    if (sel clock.err) { ret 0; }
+    ret clock.ok.sec * 1000000000 + clock.ok.nsec;
 }
 
 # drives one identifier all the way through one challenge type against the

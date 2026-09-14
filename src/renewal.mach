@@ -5,16 +5,16 @@
 # own lifetime, the authority's renewal advice, and an injected random source,
 # so a deployment and a test see identical behaviour.
 
+use acme.certificate;
+use acme.memory_range;
+use acme.problem;
+use acme.renewal_info;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
-use acme.certificate;
-use acme.memory_range;
-use acme.problem;
-use acme.renewal_info;
 
 pub def State: u8;
 
@@ -44,7 +44,7 @@ pub rec Policy {
 # spread of a day keep a fleet from renewing in lockstep
 pub fun policy_default() Policy {
     ret Policy{renew_before_seconds: 2592000, min_retry_seconds: 300,
-        max_retry_seconds: 86400, jitter_seconds: 86400, max_attempts: 12,
+        max_retry_seconds:      86400, jitter_seconds: 86400, max_attempts: 12,
         max_clock_skew_seconds: 300};
 }
 
@@ -96,15 +96,15 @@ pub fun no_observer() Observer {
 # certificate record plus the policy, so a restart reconstructs it rather than
 # needing its own durable copy.
 pub rec Schedule {
-    policy:            Policy;
-    storage_key:       view.View;
-    not_before_unix:   u64;
-    not_after_unix:    u64;
-    next_run_unix:     u64;
-    last_seen_unix:    u64;
-    attempts:          usize;
-    state:             State;
-    started:           bool;
+    policy:          Policy;
+    storage_key:     view.View;
+    not_before_unix: u64;
+    not_after_unix:  u64;
+    next_run_unix:   u64;
+    last_seen_unix:  u64;
+    attempts:        usize;
+    state:           State;
+    started:         bool;
 }
 
 fun renewal_error(code: problem.Code, detail: str) problem.Error {
@@ -121,7 +121,7 @@ fun emit(observer: Observer, value: *Schedule, previous: State,
     cause: problem.Error) {
     if (observer.on_transition == nil) { ret; }
     observer.on_transition(observer.ctx, Event{storage_key: value.storage_key,
-        previous: previous, current: value.state, attempt: value.attempts,
+        previous:      previous, current: value.state, attempt: value.attempts,
         next_run_unix: value.next_run_unix, cause: cause});
 }
 
@@ -155,7 +155,7 @@ fun add_saturating(value: u64, delta: u64) u64 {
 fun target_time(value: *Schedule, advice: renewal_info.Window,
     source: Random) u64 {
     if (renewal_info.window_valid(advice)) {
-        var start: u64 = advice.start_unix;
+        var start:  u64 = advice.start_unix;
         var finish: u64 = advice.end_unix;
         if (start < value.not_before_unix) { start = value.not_before_unix; }
         if (finish > value.not_after_unix) { finish = value.not_after_unix; }
@@ -188,15 +188,15 @@ pub fun begin(value: *Schedule, policy: Policy, storage_key: view.View,
         storage_key.len == 0 || not_after_unix <= not_before_unix) {
         ret renewal_error(problem.INVALID_INPUT, "invalid renewal schedule");
     }
-    value.policy = policy;
-    value.storage_key = storage_key;
+    value.policy          = policy;
+    value.storage_key     = storage_key;
     value.not_before_unix = not_before_unix;
-    value.not_after_unix = not_after_unix;
-    value.next_run_unix = 0;
-    value.last_seen_unix = 0;
-    value.attempts = 0;
-    value.state = IDLE;
-    value.started = true;
+    value.not_after_unix  = not_after_unix;
+    value.next_run_unix   = 0;
+    value.last_seen_unix  = 0;
+    value.attempts        = 0;
+    value.state           = IDLE;
+    value.started         = true;
     ret problem.none();
 }
 
@@ -214,10 +214,10 @@ pub fun plan(value: *Schedule, advice: renewal_info.Window, source: Random,
             "renewal schedule has already finished");
     }
     value.last_seen_unix = now_unix;
-    value.next_run_unix = target_time(value, advice, source);
+    value.next_run_unix  = target_time(value, advice, source);
     if (value.next_run_unix <= now_unix ||
         due(now_unix, value.not_after_unix,
-            value.policy.renew_before_seconds)) {
+        value.policy.renew_before_seconds)) {
         value.next_run_unix = now_unix;
         transition(observer, value, DUE, problem.none());
         ret problem.none();
@@ -231,7 +231,7 @@ pub fun plan(value: *Schedule, advice: renewal_info.Window, source: Random,
 # than firing, so a corrected clock cannot cause a renewal storm.
 pub fun clock_moved_back(value: *Schedule, now_unix: u64) bool {
     if (!schedule_ready(value) || value.last_seen_unix == 0) { ret false; }
-    if (now_unix >= value.last_seen_unix) { ret false; }
+    if (now_unix >= value.last_seen_unix)                    { ret false; }
     ret value.last_seen_unix - now_unix > value.policy.max_clock_skew_seconds;
 }
 
@@ -246,7 +246,7 @@ pub fun ready(value: *Schedule, now_unix: u64) bool {
     # failing would retry without pause.
     if (value.state != RETRYING &&
         due(now_unix, value.not_after_unix,
-            value.policy.renew_before_seconds)) { ret true; }
+        value.policy.renew_before_seconds)) { ret true; }
     ret now_unix >= value.next_run_unix;
 }
 
@@ -262,7 +262,7 @@ pub fun start(value: *Schedule, now_unix: u64,
             "renewal schedule is not due");
     }
     value.last_seen_unix = now_unix;
-    value.attempts = value.attempts + 1;
+    value.attempts       = value.attempts + 1;
     transition(observer, value, RUNNING, problem.none());
     ret problem.none();
 }
@@ -274,19 +274,19 @@ pub fun succeeded(value: *Schedule, now_unix: u64,
             "renewal schedule is not running");
     }
     value.last_seen_unix = now_unix;
-    value.next_run_unix = 0;
+    value.next_run_unix  = 0;
     transition(observer, value, RENEWED, problem.none());
     ret problem.none();
 }
 
 fun backoff(policy: Policy, attempts: usize) u64 {
-    var delay: u64 = policy.min_retry_seconds;
-    var i: usize = 1;
+    var delay: u64   = policy.min_retry_seconds;
+    var i:     usize = 1;
     for (i < attempts) {
         if (delay >= policy.max_retry_seconds ||
             delay > 0x7fffffffffffffff) { ret policy.max_retry_seconds; }
         delay = delay * 2;
-        i = i + 1;
+        i     = i + 1;
     }
     if (delay > policy.max_retry_seconds) { ret policy.max_retry_seconds; }
     ret delay;
@@ -307,11 +307,12 @@ pub fun failed(value: *Schedule, cause: problem.Error, source: Random,
         transition(observer, value, EXHAUSTED, cause);
         ret problem.none();
     }
-    var delay: u64 = backoff(value.policy, value.attempts);
+    var delay:  u64 = backoff(value.policy, value.attempts);
     val spread: u64 = bounded_random(source, value.policy.jitter_seconds);
     if (spread > value.policy.max_retry_seconds - delay) {
         delay = value.policy.max_retry_seconds;
-    } or { delay = delay + spread; }
+    }
+    or { delay = delay + spread; }
     value.next_run_unix = add_saturating(now_unix, delay);
     transition(observer, value, RETRYING, cause);
     ret problem.none();
@@ -334,7 +335,7 @@ pub fun select_next(schedules: *Schedule, len: usize,
     if (!memory_range.size(len, $size_of(Schedule), ?item_bytes) ||
         !memory_range.valid(schedules::*u8, item_bytes)) { ret nil; }
     var chosen: *Schedule = nil;
-    var i: usize = 0;
+    var i:      usize     = 0;
     for (i < len) {
         val candidate: *Schedule = ?schedules[i];
         if (ready(candidate, now_unix) &&
@@ -349,8 +350,8 @@ pub fun select_next(schedules: *Schedule, len: usize,
 
 test "acme.renewal: due avoids unsigned expiry underflow" {
     if (!due(200, 100, 30)) { ret 1; }
-    if (!due(80, 100, 20)) { ret 1; }
-    if (due(79, 100, 20)) { ret 1; }
+    if (!due(80, 100, 20))  { ret 1; }
+    if (due(79, 100, 20))   { ret 1; }
     ret 0;
 }
 
@@ -363,33 +364,33 @@ fun fixed_random(ctx: ptr) u64 {
 }
 
 rec Recorder {
-    count:     usize;
-    previous:  [16]State;
-    current:   [16]State;
+    count:    usize;
+    previous: [16]State;
+    current:  [16]State;
 }
 
 fun record(ctx: ptr, value: Event) {
     val state: *Recorder = ctx::*Recorder;
     if (state.count >= 16) { ret; }
     state.previous[state.count] = value.previous;
-    state.current[state.count] = value.current;
-    state.count = state.count + 1;
+    state.current[state.count]  = value.current;
+    state.count                 = state.count + 1;
 }
 
 test "acme.renewal: scheduling honours advice, lifetime, skew, and budgets" {
-    val day: u64 = 86400;
-    val issued: u64 = 1700000000;
-    val expires: u64 = issued + 90 * day;
-    var policy: Policy = policy_default();
-    policy.renew_before_seconds = 30 * day;
-    policy.jitter_seconds = 0;
-    policy.min_retry_seconds = 300;
-    policy.max_retry_seconds = 3600;
-    policy.max_attempts = 3;
+    val day:     u64    = 86400;
+    val issued:  u64    = 1700000000;
+    val expires: u64    = issued + 90 * day;
+    var policy:  Policy = policy_default();
+    policy.renew_before_seconds   = 30 * day;
+    policy.jitter_seconds         = 0;
+    policy.min_retry_seconds      = 300;
+    policy.max_retry_seconds      = 3600;
+    policy.max_attempts           = 3;
     policy.max_clock_skew_seconds = 300;
     var source: FixedRandom;
     source.value = 0;
-    val random: Random = Random{ctx: (?source)::ptr, next: fixed_random};
+    val random:   Random = Random{ctx: (?source)::ptr, next: fixed_random};
     var recorder: Recorder;
     recorder.count = 0;
     val observer: Observer = Observer{ctx: (?recorder)::ptr,
@@ -402,68 +403,68 @@ test "acme.renewal: scheduling honours advice, lifetime, skew, and budgets" {
         ret 1;
     }
     if (problem.failed(plan(?schedule, renewal_info.empty_window(), random,
-            issued, observer))) { ret 2; }
+        issued, observer))) { ret 2; }
     if (schedule.state != SCHEDULED ||
         schedule.next_run_unix != expires - 30 * day) { ret 3; }
 
     # jitter spreads a fleet without ever passing expiry
     var spread_policy: Policy = policy;
     spread_policy.jitter_seconds = day;
-    source.value = day - 1;
+    source.value                 = day - 1;
     var spread: Schedule;
     if (problem.failed(begin(?spread, spread_policy, key, issued, expires)) ||
         problem.failed(plan(?spread, renewal_info.empty_window(), random,
-            issued, no_observer()))) { ret 4; }
+        issued, no_observer()))) { ret 4; }
     if (spread.next_run_unix != expires - 30 * day + day - 1 ||
         spread.next_run_unix >= expires) { ret 5; }
     source.value = 0;
 
     # the authority's window wins and is sampled uniformly inside it
     var advised: Schedule;
-    var window: renewal_info.Window = renewal_info.empty_window();
-    window.present = true;
+    var window:  renewal_info.Window = renewal_info.empty_window();
+    window.present    = true;
     window.start_unix = issued + 10 * day;
-    window.end_unix = issued + 20 * day;
-    source.value = 5 * day;
+    window.end_unix   = issued + 20 * day;
+    source.value      = 5 * day;
     if (problem.failed(begin(?advised, policy, key, issued, expires)) ||
         problem.failed(plan(?advised, window, random, issued,
-            no_observer()))) { ret 6; }
+        no_observer()))) { ret 6; }
     if (advised.next_run_unix != issued + 15 * day) { ret 7; }
 
     # a window outside the certificate's own lifetime is clamped, never obeyed
     var wild: Schedule;
     window.start_unix = 1;
-    window.end_unix = expires + 100 * day;
-    source.value = 0;
+    window.end_unix   = expires + 100 * day;
+    source.value      = 0;
     if (problem.failed(begin(?wild, policy, key, issued, expires)) ||
         problem.failed(plan(?wild, window, random, issued,
-            no_observer()))) { ret 8; }
+        no_observer()))) { ret 8; }
     if (wild.next_run_unix < issued || wild.next_run_unix > expires) { ret 9; }
 
     # an inverted window is ignored and the local policy stands
     var inverted: renewal_info.Window = window;
     inverted.start_unix = issued + 20 * day;
-    inverted.end_unix = issued + 10 * day;
+    inverted.end_unix   = issued + 10 * day;
     var ignored: Schedule;
     if (problem.failed(begin(?ignored, policy, key, issued, expires)) ||
         problem.failed(plan(?ignored, inverted, random, issued,
-            no_observer()))) { ret 10; }
+        no_observer()))) { ret 10; }
     if (ignored.next_run_unix != expires - 30 * day) { ret 11; }
 
     # an expiring certificate is due immediately
     var expiring: Schedule;
     if (problem.failed(begin(?expiring, policy, key, issued, expires)) ||
         problem.failed(plan(?expiring, renewal_info.empty_window(), random,
-            expires - day, no_observer()))) { ret 12; }
+        expires - day, no_observer()))) { ret 12; }
     if (expiring.state != DUE ||
         !ready(?expiring, expires - day)) { ret 13; }
 
     # a prolonged outage retries within a ceiling and stops at the budget
     var outage: Schedule;
-    var now: u64 = expires - day;
+    var now:    u64 = expires - day;
     if (problem.failed(begin(?outage, policy, key, issued, expires)) ||
         problem.failed(plan(?outage, renewal_info.empty_window(), random, now,
-            no_observer()))) { ret 14; }
+        no_observer()))) { ret 14; }
     val cause: problem.Error = problem.local_code(problem.TRANSPORT,
         problem.INVALID_STATE, "authority unreachable");
     if (problem.failed(start(?outage, now, observer)) ||
@@ -502,7 +503,7 @@ test "acme.renewal: scheduling honours advice, lifetime, skew, and budgets" {
     var skewed: Schedule;
     if (problem.failed(begin(?skewed, policy, key, issued, expires)) ||
         problem.failed(plan(?skewed, renewal_info.empty_window(), random,
-            expires - day, no_observer()))) { ret 23; }
+        expires - day, no_observer()))) { ret 23; }
     if (!ready(?skewed, expires - day)) { ret 24; }
     if (!clock_moved_back(?skewed, expires - day - 400) ||
         ready(?skewed, expires - day - 400)) { ret 25; }
@@ -514,9 +515,9 @@ test "acme.renewal: scheduling honours advice, lifetime, skew, and budgets" {
     var cancelled_schedule: Schedule;
     recorder.count = 0;
     if (problem.failed(begin(?cancelled_schedule, policy, key, issued,
-            expires)) ||
+        expires)) ||
         problem.failed(plan(?cancelled_schedule,
-            renewal_info.empty_window(), random, issued, observer))) {
+        renewal_info.empty_window(), random, issued, observer))) {
         ret 27;
     }
     if (!cancel(?cancelled_schedule, observer) ||
@@ -525,7 +526,7 @@ test "acme.renewal: scheduling honours advice, lifetime, skew, and budgets" {
         ready(?cancelled_schedule, expires)) { ret 28; }
     if (recorder.count != 2 || recorder.current[1] != CANCELLED) { ret 29; }
     if (!problem.failed(plan(?cancelled_schedule,
-            renewal_info.empty_window(), random, issued, no_observer()))) {
+        renewal_info.empty_window(), random, issued, no_observer()))) {
         ret 30;
     }
 
@@ -533,16 +534,16 @@ test "acme.renewal: scheduling honours advice, lifetime, skew, and budgets" {
     # backing off is not selected before its delay elapses
     var fleet: [3]Schedule;
     if (problem.failed(begin(?fleet[0], policy, key, issued,
-            issued + 60 * day)) ||
+        issued + 60 * day)) ||
         problem.failed(begin(?fleet[1], policy, key, issued,
-            issued + 40 * day)) ||
+        issued + 40 * day)) ||
         problem.failed(begin(?fleet[2], policy, key, issued,
-            issued + 80 * day))) { ret 31; }
-    val fleet_now: u64 = issued + 30 * day;
-    var i: usize = 0;
+        issued + 80 * day))) { ret 31; }
+    val fleet_now: u64   = issued + 30 * day;
+    var i:         usize = 0;
     for (i < 3) {
         if (problem.failed(plan(?fleet[i], renewal_info.empty_window(),
-                random, fleet_now, no_observer()))) { ret 32; }
+            random, fleet_now, no_observer()))) { ret 32; }
         i = i + 1;
     }
     val urgent: *Schedule = select_next(?fleet[0], 3, fleet_now);
@@ -551,14 +552,14 @@ test "acme.renewal: scheduling honours advice, lifetime, skew, and budgets" {
     }
     if (problem.failed(start(urgent, fleet_now, no_observer())) ||
         problem.failed(failed(urgent, cause, random, fleet_now,
-            no_observer()))) { ret 34; }
+        no_observer()))) { ret 34; }
     # the urgent one is now backing off, so the next most urgent runs instead
     val second: *Schedule = select_next(?fleet[0], 3, fleet_now);
     if (second == nil || second.not_after_unix != issued + 60 * day) {
         ret 35;
     }
     # once its backoff elapses the urgent certificate regains priority
-    val later: u64 = fleet_now + 301;
+    val later: u64       = fleet_now + 301;
     val again: *Schedule = select_next(?fleet[0], 3, later);
     if (again == nil || again.not_after_unix != issued + 40 * day) { ret 36; }
 
@@ -566,7 +567,7 @@ test "acme.renewal: scheduling honours advice, lifetime, skew, and budgets" {
     var restarted: Schedule;
     if (problem.failed(begin(?restarted, policy, key, issued, expires)) ||
         problem.failed(plan(?restarted, renewal_info.empty_window(), random,
-            issued, no_observer()))) { ret 37; }
+        issued, no_observer()))) { ret 37; }
     if (restarted.next_run_unix != schedule.next_run_unix ||
         restarted.state != schedule.state) { ret 38; }
 

@@ -1,43 +1,55 @@
 # bounded transport-independent acme protocol state
 
-use J: std.data.json;
-use R: std.types.result;
+use acme.jose;
+use acme.json;
+use acme.memory_range;
+use acme.nonce;
+use acme.problem;
 use crypto.contracts;
 use crypto.hash;
 use http.core.field;
 use http.core.method;
 use http.core.status;
+use J: std.data.json;
 use std.net.ip;
 use std.sync.atomic;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
-use acme.jose;
-use acme.json;
-use acme.memory_range;
-use acme.nonce;
-use acme.problem;
+
+# an element by index, nil when absent, as std 1.x returned it
+fun element(value: *J.Value, index: usize) *J.Value {
+    val got: opt[*J.Value] = J.value_get(value, index);
+    if (sel got.some) { ret got.some; }
+    ret nil;
+}
+
+fun is_err_ip_ipv6_parse(outcome: res[ip.IPv6, ip.ParseError]) bool {
+    ret sel outcome.err;
+}
 
 pub val DIRECTORY_CONTENT_TYPE: str = "application/json";
 pub val JWS_CONTENT_TYPE:       str = "application/jose+json";
 pub val PROBLEM_CONTENT_TYPE:   str = "application/problem+json";
 
 pub rec Directory {
-    new_nonce_url:    view.View;
-    new_account_url:  view.View;
-    new_order_url:    view.View;
-    new_authz_url:    view.View;
-    revoke_cert_url:  view.View;
-    key_change_url:   view.View;
-    renewal_info_url: view.View;
-    terms_url:        view.View;
-    website_url:      view.View;
-    caa_identities:   *view.View;
-    caa_identity_len: usize;
+    new_nonce_url:             view.View;
+    new_account_url:           view.View;
+    new_order_url:             view.View;
+    new_authz_url:             view.View;
+    revoke_cert_url:           view.View;
+    key_change_url:            view.View;
+    renewal_info_url:          view.View;
+    terms_url:                 view.View;
+    website_url:               view.View;
+    caa_identities:            *view.View;
+    caa_identity_len:          usize;
     external_account_required: bool;
 }
 
@@ -56,21 +68,21 @@ pub rec ProblemStorage {
 }
 
 pub rec Limits {
-    max_request_bytes:       usize;
-    max_response_bytes:      usize;
-    max_problem_bytes:       usize;
-    max_nonce_bytes:         usize;
-    max_url_bytes:           usize;
-    max_json_scratch:        usize;
-    max_json_depth:          usize;
-    max_json_values:         usize;
-    max_json_key_bytes:      usize;
+    max_request_bytes:        usize;
+    max_response_bytes:       usize;
+    max_problem_bytes:        usize;
+    max_nonce_bytes:          usize;
+    max_url_bytes:            usize;
+    max_json_scratch:         usize;
+    max_json_depth:           usize;
+    max_json_values:          usize;
+    max_json_key_bytes:       usize;
     max_json_key_comparisons: usize;
-    max_caa_identities:      usize;
-    max_problem_subproblems: usize;
-    max_bad_nonce_retries:   usize;
-    request_timeout_ns:      u64;
-    response_fields:         field.Limits;
+    max_caa_identities:       usize;
+    max_problem_subproblems:  usize;
+    max_bad_nonce_retries:    usize;
+    request_timeout_ns:       u64;
+    response_fields:          field.Limits;
 }
 
 pub rec Response {
@@ -93,22 +105,22 @@ pub rec WireRequest {
 }
 
 pub rec Client {
-    nonces:      nonce.Pool;
-    limits:      Limits;
-    generation:  u64;
+    nonces:         nonce.Pool;
+    limits:         Limits;
+    generation:     u64;
     callback_owner: i64;
-    initialized: bool;
+    initialized:    bool;
 }
 
 pub def RequestState: u8;
 
-pub val REQUEST_EMPTY:         RequestState = 0;
-pub val REQUEST_READY:         RequestState = 1;
-pub val REQUEST_AWAITING:      RequestState = 2;
-pub val REQUEST_RETRY:         RequestState = 3;
-pub val REQUEST_NEEDS_NONCE:   RequestState = 4;
-pub val REQUEST_COMPLETE:      RequestState = 5;
-pub val REQUEST_FAILED:        RequestState = 6;
+pub val REQUEST_EMPTY:       RequestState = 0;
+pub val REQUEST_READY:       RequestState = 1;
+pub val REQUEST_AWAITING:    RequestState = 2;
+pub val REQUEST_RETRY:       RequestState = 3;
+pub val REQUEST_NEEDS_NONCE: RequestState = 4;
+pub val REQUEST_COMPLETE:    RequestState = 5;
+pub val REQUEST_FAILED:      RequestState = 6;
 
 pub rec SignedSpec {
     url:     view.View;
@@ -157,9 +169,9 @@ fun wipe_retry_nonce(request: *SignedRequest) {
     var i: usize = 0;
     for (i < 512) {
         request.retry_nonce[i] = 0;
-        i = i + 1;
+        i                      = i + 1;
     }
-    request.retry_nonce_len = 0;
+    request.retry_nonce_len   = 0;
     request.retry_nonce_ready = false;
 }
 
@@ -173,19 +185,19 @@ fun reserve_retry_nonce(request: *SignedRequest, value: view.View,
             "invalid reserved replay nonce");
     }
     var temporary: [512]u8;
-    var i: usize = 0;
+    var i:         usize = 0;
     for (i < value.len) {
         temporary[i] = value.data[i];
-        i = i + 1;
+        i            = i + 1;
     }
     wipe_retry_nonce(request);
     i = 0;
     for (i < value.len) {
         request.retry_nonce[i] = temporary[i];
-        temporary[i] = 0;
-        i = i + 1;
+        temporary[i]           = 0;
+        i                      = i + 1;
     }
-    request.retry_nonce_len = value.len;
+    request.retry_nonce_len   = value.len;
     request.retry_nonce_ready = true;
     ret problem.none();
 }
@@ -200,9 +212,9 @@ fun fields_ranges_valid(fields: *field.Fields) bool {
     var i: usize = 0;
     for (i < fields.len) {
         if (!memory_range.valid(fields.items[i].name.data,
-                fields.items[i].name.len) ||
+            fields.items[i].name.len) ||
             !memory_range.valid(fields.items[i].value.data,
-                fields.items[i].value.len)) { ret false; }
+            fields.items[i].value.len)) { ret false; }
         i = i + 1;
     }
     ret true;
@@ -211,17 +223,17 @@ fun fields_ranges_valid(fields: *field.Fields) bool {
 fun response_overlaps(response: Response, data: *u8, len: usize) bool {
     if (memory_range.overlap(data, len, response.body.data, response.body.len) ||
         memory_range.overlap(data, len, response.fields::*u8,
-            $size_of(field.Fields))) { ret true; }
+        $size_of(field.Fields))) { ret true; }
     var item_bytes: usize = 0;
     if (!memory_range.size(response.fields.capacity, $size_of(field.Field),
         ?item_bytes) || memory_range.overlap(data, len,
-            response.fields.items::*u8, item_bytes)) { ret true; }
+        response.fields.items::*u8, item_bytes)) { ret true; }
     var i: usize = 0;
     for (i < response.fields.len) {
         if (memory_range.overlap(data, len, response.fields.items[i].name.data,
-                response.fields.items[i].name.len) ||
+            response.fields.items[i].name.len) ||
             memory_range.overlap(data, len, response.fields.items[i].value.data,
-                response.fields.items[i].value.len)) { ret true; }
+            response.fields.items[i].value.len)) { ret true; }
         i = i + 1;
     }
     ret false;
@@ -251,15 +263,15 @@ fun wipe_bytes(data: *u8, len: usize) {
     var i: usize = 0;
     for (i < len) {
         data[i] = 0;
-        i = i + 1;
+        i       = i + 1;
     }
 }
 
 fun digest(data: *u8, len: usize, output: *u8) bool {
     if (output == nil || !memory_range.valid(data, len) ||
         !memory_range.valid(output, 32)) { ret false; }
-    var context: hash.Sha256 = hash.empty_sha256();
-    var status: contracts.Error = hash.init_sha256(?context);
+    var context: hash.Sha256     = hash.empty_sha256();
+    var status:  contracts.Error = hash.init_sha256(?context);
     if (status == contracts.OK) {
         status = hash.update_sha256(?context,
             contracts.Bytes{data: data, len: len});
@@ -301,7 +313,7 @@ fun signer_intact(request: *SignedRequest, signer: jose.Signer) bool {
 
 fun terminalize(request: *SignedRequest) {
     request.wire_body = view.view(nil, 0);
-    request.state = REQUEST_FAILED;
+    request.state     = REQUEST_FAILED;
     wipe_retry_nonce(request);
 }
 
@@ -345,7 +357,7 @@ fun callback_begin(client: *Client) bool {
         var expected: i64 = atomic.load(?client.callback_owner);
         if (expected == owner) { ret false; }
         if (expected == 0 && atomic.cas(?client.callback_owner,
-                ?expected, owner)) { ret true; }
+            ?expected, owner)) { ret true; }
         if (expected != 0) {
             os.thread_wait(?client.callback_owner, expected);
         }
@@ -412,10 +424,10 @@ fun request_same(first: SignedRequest, second: *SignedRequest) bool {
 rec EntropyGuard {
     source_validate: jose.EntropyValidateFun;
     source_ctx:      ptr;
-    client:         *Client;
-    request:        *SignedRequest;
-    client_before:  Client;
-    request_before: SignedRequest;
+    client:          *Client;
+    request:         *SignedRequest;
+    client_before:   Client;
+    request_before:  SignedRequest;
 }
 
 fun guarded_entropy_validate(ctx: ptr) bool {
@@ -443,10 +455,10 @@ fun pool_range_disjoint(snapshot: nonce.Pool, client: *Client,
     if (!callback_begin(client)) {
         ret callback_error("nonce ownership callback is reentrant");
     }
-    val client_before: Client = @client;
-    val request_before: SignedRequest = @request;
-    val owned: bool = snapshot.aliases(snapshot.ctx, data, len);
-    val callback_intact: bool = callback_end(client, client_before, request,
+    val client_before:   Client        = @client;
+    val request_before:  SignedRequest = @request;
+    val owned:           bool          = snapshot.aliases(snapshot.ctx, data, len);
+    val callback_intact: bool          = callback_end(client, client_before, request,
         request_before);
     if (!callback_intact ||
         !digest_same(view.view(data, len), ?range_before[0])) {
@@ -465,9 +477,9 @@ fun pool_secret_disjoint(snapshot: nonce.Pool, client: *Client,
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid secret range at nonce provider boundary");
     }
-    val client_before: Client = @client;
+    val client_before:  Client        = @client;
     val request_before: SignedRequest = @request;
-    val owned: bool = snapshot.owns_secret(snapshot.ctx, owner);
+    val owned:          bool          = snapshot.owns_secret(snapshot.ctx, owner);
     if (!callback_end(client, client_before, request, request_before)) {
         ret callback_error("nonce secret ownership callback mutated protocol state");
     }
@@ -484,7 +496,7 @@ fun pool_ready_snapshot(client: *Client, request: *SignedRequest,
         !nonce.descriptor_valid(client.nonces)) {
         ret callback_error("nonce pool descriptor is invalid");
     }
-    val snapshot: nonce.Pool = client.nonces;
+    val snapshot:        nonce.Pool    = client.nonces;
     val client_disjoint: problem.Error = pool_range_disjoint(snapshot, client,
         request, client::*u8, $size_of(Client));
     if (problem.failed(client_disjoint)) { ret client_disjoint; }
@@ -494,9 +506,9 @@ fun pool_ready_snapshot(client: *Client, request: *SignedRequest,
     if (!callback_begin(client)) {
         ret callback_error("nonce readiness callback is reentrant");
     }
-    val client_before: Client = @client;
+    val client_before:  Client        = @client;
     val request_before: SignedRequest = @request;
-    val ready: bool = snapshot.ready(snapshot.ctx);
+    val ready:          bool          = snapshot.ready(snapshot.ctx);
     if (!callback_end(client, client_before, request, request_before)) {
         ret callback_error("nonce readiness callback mutated protocol state");
     }
@@ -536,9 +548,9 @@ fun pool_reserve(client: *Client, request: *SignedRequest, output: *u8,
             "nonce reservation callback is reentrant"), found: false,
             token: 0, value: view.view(nil, 0)};
     }
-    val client_before: Client = @client;
-    val request_before: SignedRequest = @request;
-    val result: nonce.Reservation = snapshot.reserve(snapshot.ctx, output,
+    val client_before:  Client            = @client;
+    val request_before: SignedRequest     = @request;
+    val result:         nonce.Reservation = snapshot.reserve(snapshot.ctx, output,
         capacity);
     if (!callback_end(client, client_before, request, request_before)) {
         ret nonce.Reservation{error: callback_error(
@@ -579,11 +591,11 @@ fun pool_finish(client: *Client, request: *SignedRequest, snapshot: nonce.Pool,
         !callback_begin(client)) {
         ret callback_error("nonce reservation transaction is invalid");
     }
-    val client_before: Client = @client;
+    val client_before:  Client        = @client;
     val request_before: SignedRequest = @request;
-    var result: problem.Error;
+    var result:         problem.Error;
     if (consume) { result = snapshot.commit(snapshot.ctx, token); }
-    or { result = snapshot.release(snapshot.ctx, token); }
+    or           { result = snapshot.release(snapshot.ctx, token); }
     if (!callback_end(client, client_before, request, request_before)) {
         ret callback_error("nonce reservation finalizer mutated protocol state");
     }
@@ -608,9 +620,9 @@ fun pool_put(client: *Client, request: *SignedRequest,
     if (!callback_begin(client)) {
         ret callback_error("nonce put callback is reentrant");
     }
-    val client_before: Client = @client;
+    val client_before:  Client        = @client;
     val request_before: SignedRequest = @request;
-    val result: problem.Error = snapshot.put(snapshot.ctx, value);
+    val result:         problem.Error = snapshot.put(snapshot.ctx, value);
     if (!callback_end(client, client_before, request, request_before)) {
         ret callback_error("nonce put callback mutated protocol state");
     }
@@ -619,14 +631,14 @@ fun pool_put(client: *Client, request: *SignedRequest,
 
 fun pool_clear(client: *Client, request: *SignedRequest) problem.Error {
     var snapshot: nonce.Pool;
-    val ready: problem.Error = pool_ready_snapshot(client, request, ?snapshot);
+    val ready:    problem.Error = pool_ready_snapshot(client, request, ?snapshot);
     if (problem.failed(ready)) { ret ready; }
     if (!callback_begin(client)) {
         ret callback_error("nonce clear callback is reentrant");
     }
-    val client_before: Client = @client;
+    val client_before:  Client        = @client;
     val request_before: SignedRequest = @request;
-    val result: problem.Error = snapshot.clear(snapshot.ctx);
+    val result:         problem.Error = snapshot.clear(snapshot.ctx);
     if (!callback_end(client, client_before, request, request_before)) {
         ret callback_error("nonce clear callback mutated protocol state");
     }
@@ -636,8 +648,8 @@ fun pool_clear(client: *Client, request: *SignedRequest) problem.Error {
 fun pool_prepare_disjoint(client: *Client, request: *SignedRequest,
     signer: jose.Signer, private_key: jose.PrivateKey, work: contracts.Buffer,
     output: contracts.Buffer) problem.Error {
-    val snapshot: nonce.Pool = client.nonces;
-    var result: problem.Error = pool_range_disjoint(snapshot, client, request,
+    val snapshot: nonce.Pool    = client.nonces;
+    var result:   problem.Error = pool_range_disjoint(snapshot, client, request,
         work.data, work.capacity);
     if (problem.failed(result)) { ret result; }
     result = pool_range_disjoint(snapshot, client, request,
@@ -659,7 +671,8 @@ fun pool_prepare_disjoint(client: *Client, request: *SignedRequest,
             result = pool_secret_disjoint(snapshot, client, request,
                 private_key.secret_owner);
         }
-    } or (signer.algorithm == jose.PS256) {
+    }
+    or (signer.algorithm == jose.PS256) {
         result = pool_range_disjoint(snapshot, client, request,
             signer.public_key.rsa.modulus.data,
             signer.public_key.rsa.modulus.len);
@@ -703,21 +716,21 @@ fun no_field_limits() field.Limits {
 
 pub fun limits_default() Limits {
     ret Limits{
-        max_request_bytes: 1048576,
-        max_response_bytes: 1048576,
-        max_problem_bytes: 65536,
-        max_nonce_bytes: 512,
-        max_url_bytes: 4096,
-        max_json_scratch: 1048576,
-        max_json_depth: 16,
-        max_json_values: 4096,
-        max_json_key_bytes: 128,
+        max_request_bytes:        1048576,
+        max_response_bytes:       1048576,
+        max_problem_bytes:        65536,
+        max_nonce_bytes:          512,
+        max_url_bytes:            4096,
+        max_json_scratch:         1048576,
+        max_json_depth:           16,
+        max_json_values:          4096,
+        max_json_key_bytes:       128,
         max_json_key_comparisons: 65536,
-        max_caa_identities: 64,
-        max_problem_subproblems: 64,
-        max_bad_nonce_retries: 3,
-        request_timeout_ns: 30000000000,
-        response_fields: field.limits(128, 65536, 256, 8192),
+        max_caa_identities:       64,
+        max_problem_subproblems:  64,
+        max_bad_nonce_retries:    3,
+        request_timeout_ns:       30000000000,
+        response_fields:          field.limits(128, 65536, 256, 8192),
     };
 }
 
@@ -747,7 +760,7 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
         !memory_range.valid(client::*u8, $size_of(Client)) ||
         !memory_range.valid(nonces::*u8, $size_of(nonce.Pool)) ||
         memory_range.overlap(client::*u8, $size_of(Client),
-            nonces::*u8, $size_of(nonce.Pool)) ||
+        nonces::*u8, $size_of(nonce.Pool)) ||
         client.initialized || atomic.load(?client.callback_owner) != 0 ||
         client.generation == 18446744073709551615 ||
         !limits_valid(configured)) {
@@ -765,7 +778,7 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
             "nonce ownership callback is reentrant");
     }
     val before: Client = @client;
-    val owned: bool = snapshot.aliases(snapshot.ctx, client::*u8,
+    val owned:  bool   = snapshot.aliases(snapshot.ctx, client::*u8,
         $size_of(Client));
     val alias_intact: bool = callback_end_client(client, before);
     if (!alias_intact || !nonce.same(snapshot, @nonces) || owned) {
@@ -777,14 +790,14 @@ pub fun init(client: *Client, nonces: *nonce.Pool, configured: Limits) problem.E
             "nonce readiness callback is reentrant");
     }
     val ready_before: Client = @client;
-    val ready: bool = snapshot.ready(snapshot.ctx);
-    val ready_intact: bool = callback_end_client(client, ready_before);
+    val ready:        bool   = snapshot.ready(snapshot.ctx);
+    val ready_intact: bool   = callback_end_client(client, ready_before);
     if (!ready_intact || !nonce.same(snapshot, @nonces) || !ready) {
         ret problem.local_code(problem.NONCE, problem.INVALID_STATE,
             "acme nonce pool is not ready or mutated client state");
     }
-    client.nonces = snapshot;
-    client.limits = configured;
+    client.nonces     = snapshot;
+    client.limits     = configured;
     client.generation = client.generation + 1;
     atomic.store(?client.callback_owner, 0);
     client.initialized = true;
@@ -807,29 +820,30 @@ fun json_limits(configured: Limits, maximum: usize) json.Limits {
     var max_bytes: usize = maximum;
     if (max_bytes > configured.max_response_bytes) { max_bytes = configured.max_response_bytes; }
     ret json.Limits{max_bytes: max_bytes, max_depth: configured.max_json_depth,
-        max_values: configured.max_json_values,
-        max_key_bytes: configured.max_json_key_bytes,
+        max_values:          configured.max_json_values,
+        max_key_bytes:       configured.max_json_key_bytes,
         max_key_comparisons: configured.max_json_key_comparisons};
 }
 
 fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
     if (value == nil || value.kind != J.STRING) { ret false; }
-    val result: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
-    if (R.is_err[usize, str](result)) { ret false; }
-    @output = R.unwrap_ok[usize, str](result);
+    val result: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+    if (sel result.err) { ret false; }
+    @output = result.ok;
     ret @output <= maximum;
 }
 
 fun caa_identity(data: *u8, len: usize) bool {
     if (data == nil || len == 0 || len > 253) { ret false; }
     var label_len: usize = 0;
-    var i: usize = 0;
+    var i:         usize = 0;
     for (i < len) {
         val byte: u8 = data[i];
         if (byte == '.') {
             if (label_len == 0 || data[i - 1] == '-') { ret false; }
             label_len = 0;
-        } or {
+        }
+        or {
             if (!((byte >= 'a' && byte <= 'z') ||
                 (byte >= 'A' && byte <= 'Z') ||
                 (byte >= '0' && byte <= '9') || byte == '-') ||
@@ -880,7 +894,8 @@ fun component(data: *u8, start: usize, finish: usize,
         if (unreserved(byte) || sub_delimiter(byte) || byte == ':' ||
             byte == '@' || (slash && byte == '/') || (query && byte == '?')) {
             i = i + 1;
-        } or {
+        }
+        or {
             if (byte != '%' || i + 2 >= finish || !hex(data[i + 1]) ||
                 !hex(data[i + 2])) { ret false; }
             i = i + 3;
@@ -892,7 +907,7 @@ fun component(data: *u8, start: usize, finish: usize,
 fun port_valid(data: *u8, start: usize, finish: usize) bool {
     if (start == finish) { ret false; }
     var value: usize = 0;
-    var i: usize = start;
+    var i:     usize = start;
     for (i < finish) {
         if (data[i] < '0' || data[i] > '9') { ret false; }
         value = value * 10 + (data[i] - '0')::usize;
@@ -911,18 +926,18 @@ fun authority_valid(data: *u8, start: usize, finish: usize) bool {
             ret false;
         }
         var literal: [4097]u8;
-        var i: usize = start + 1;
+        var i:       usize = start + 1;
         for (i < close) {
             literal[i - start - 1] = data[i];
-            i = i + 1;
+            i                      = i + 1;
         }
         literal[close - start - 1] = 0;
-        if (R.is_err[ip.IPv6, str](ip.ipv6_parse(?literal[0]))) { ret false; }
-        if (close + 1 == finish) { ret true; }
+        if (is_err_ip_ipv6_parse(ip.ipv6_parse(?literal[0]))) { ret false; }
+        if (close + 1 == finish)                              { ret true; }
         ret data[close + 1] == ':' && port_valid(data, close + 2, finish);
     }
     var colon: usize = finish;
-    var i: usize = start;
+    var i:     usize = start;
     for (i < finish) {
         if (data[i] == '@' || data[i] == '[' || data[i] == ']') { ret false; }
         if (data[i] == ':') {
@@ -947,19 +962,19 @@ fun https_bytes(data: *u8, len: usize) bool {
         data[5] != ':' || data[6] != '/' || data[7] != '/' || data[8] == '/' ||
         data[8] == '?' || data[8] == '#' || data[8] == '@') { ret false; }
     var authority_end: usize = len;
-    var query_at: usize = len;
-    var i: usize = 8;
+    var query_at:      usize = len;
+    var i:             usize = 8;
     for (i < len) {
         val byte: u8 = data[i];
         if (authority_end == len && (byte == '/' || byte == '?')) {
             authority_end = i;
         }
         if (byte == '#' || byte <= ' ' || byte >= 127) { ret false; }
-        if (byte == '?' && query_at == len) { query_at = i; }
+        if (byte == '?' && query_at == len)            { query_at = i; }
         i = i + 1;
     }
     if (!authority_valid(data, 8, authority_end)) { ret false; }
-    if (authority_end == len) { ret true; }
+    if (authority_end == len)                     { ret true; }
     if (data[authority_end] == '?') {
         ret component(data, authority_end + 1, len, true, true);
     }
@@ -976,8 +991,8 @@ fun https_value(value: *J.Value, maximum: usize) bool {
     var len: usize = 0;
     if (!decoded_len(value, maximum, ?len) || len < 9) { ret false; }
     var decoded: [4096]u8;
-    val result: R.Result[usize, str] = J.value_string_decode(value, ?decoded[0], 4096);
-    ret !R.is_err[usize, str](result) && https_bytes(?decoded[0], len);
+    val result:  res[usize, J.JsonError] = J.value_string_decode(value, ?decoded[0], 4096);
+    ret (sel result.ok) && https_bytes(?decoded[0], len);
 }
 
 # rfc 8555 section 9.7.6 states terms and website as plain uris. they are
@@ -990,7 +1005,7 @@ fun metadata_uri_bytes(data: *u8, len: usize) bool {
         !((data[0] >= 'A' && data[0] <= 'Z') ||
         (data[0] >= 'a' && data[0] <= 'z'))) { ret false; }
     var colon: usize = 0;
-    var i: usize = 1;
+    var i:     usize = 1;
     for (i < len && colon == 0) {
         val byte: u8 = data[i];
         if (byte == ':') { colon = i; }
@@ -1009,7 +1024,8 @@ fun metadata_uri_bytes(data: *u8, len: usize) bool {
                 ret false;
             }
             i = i + 3;
-        } or { i = i + 1; }
+        }
+        or { i = i + 1; }
     }
     ret true;
 }
@@ -1018,8 +1034,8 @@ fun metadata_uri_value(value: *J.Value, maximum: usize) bool {
     var len: usize = 0;
     if (!decoded_len(value, maximum, ?len)) { ret false; }
     var decoded: [4096]u8;
-    val result: R.Result[usize, str] = J.value_string_decode(value, ?decoded[0], 4096);
-    ret !R.is_err[usize, str](result) && metadata_uri_bytes(?decoded[0], len);
+    val result:  res[usize, J.JsonError] = J.value_string_decode(value, ?decoded[0], 4096);
+    ret (sel result.ok) && metadata_uri_bytes(?decoded[0], len);
 }
 
 fun add_size(total: *usize, value: *J.Value, maximum: usize) bool {
@@ -1039,14 +1055,13 @@ fun copy_string(cursor: *Cursor, value: *J.Value, output: *view.View) bool {
     }
     var len: usize = 0;
     if (!decoded_len(value, cursor.cap - cursor.pos, ?len)) { ret false; }
-    val start: usize = cursor.pos;
-    val result: R.Result[usize, str] = J.value_string_decode(value,
+    val start:  usize                   = cursor.pos;
+    val result: res[usize, J.JsonError] = J.value_string_decode(value,
         ?cursor.data[start], cursor.cap - start);
-    if (R.is_err[usize, str](result) || R.unwrap_ok[usize, str](result) != len) {
-        ret false;
-    }
+    if (sel result.err)   { ret false; }
+    if (result.ok != len) { ret false; }
     cursor.pos = cursor.pos + len;
-    @output = view.view(?cursor.data[start], len);
+    @output    = view.view(?cursor.data[start], len);
     ret true;
 }
 
@@ -1078,20 +1093,20 @@ pub fun parse_directory(response: Response, configured: Limits, scratch: *u8,
     }
     var caa_bytes: usize = 0;
     if (!memory_range.size(storage.caa_capacity, $size_of(view.View),
-            ?caa_bytes) ||
+        ?caa_bytes) ||
         !memory_range.valid(output::*u8, $size_of(Directory)) ||
         mutable_regions_overlap(scratch, usable_scratch, storage.data,
-            storage.capacity) ||
+        storage.capacity) ||
         mutable_regions_overlap(scratch, usable_scratch,
-            storage.caa_items::*u8, caa_bytes) ||
+        storage.caa_items::*u8, caa_bytes) ||
         mutable_regions_overlap(scratch, usable_scratch, output::*u8,
-            $size_of(Directory)) ||
+        $size_of(Directory)) ||
         mutable_regions_overlap(storage.data, storage.capacity,
-            storage.caa_items::*u8, caa_bytes) ||
+        storage.caa_items::*u8, caa_bytes) ||
         mutable_regions_overlap(storage.data, storage.capacity, output::*u8,
-            $size_of(Directory)) ||
+        $size_of(Directory)) ||
         mutable_regions_overlap(storage.caa_items::*u8, caa_bytes,
-            output::*u8, $size_of(Directory)) ||
+        output::*u8, $size_of(Directory)) ||
         response_overlaps(response, scratch, usable_scratch) ||
         response_overlaps(response, storage.data, storage.capacity) ||
         response_overlaps(response, storage.caa_items::*u8, caa_bytes) ||
@@ -1103,12 +1118,12 @@ pub fun parse_directory(response: Response, configured: Limits, scratch: *u8,
     if (!document.valid) { ret document.error; }
     var root: J.Value = document.root;
     if (root.kind != J.OBJECT) { ret directory_error("directory is not an object"); }
-    val new_nonce: *J.Value = json.find(?root, "newNonce");
-    val new_account: *J.Value = json.find(?root, "newAccount");
-    val new_order: *J.Value = json.find(?root, "newOrder");
-    val new_authz: *J.Value = json.find(?root, "newAuthz");
-    val revoke_cert: *J.Value = json.find(?root, "revokeCert");
-    val key_change: *J.Value = json.find(?root, "keyChange");
+    val new_nonce:    *J.Value = json.find(?root, "newNonce");
+    val new_account:  *J.Value = json.find(?root, "newAccount");
+    val new_order:    *J.Value = json.find(?root, "newOrder");
+    val new_authz:    *J.Value = json.find(?root, "newAuthz");
+    val revoke_cert:  *J.Value = json.find(?root, "revokeCert");
+    val key_change:   *J.Value = json.find(?root, "keyChange");
     val renewal_info: *J.Value = json.find(?root, "renewalInfo");
     if (!https_value(new_nonce, configured.max_url_bytes) ||
         !https_value(new_account, configured.max_url_bytes) ||
@@ -1123,19 +1138,19 @@ pub fun parse_directory(response: Response, configured: Limits, scratch: *u8,
     if (meta != nil && meta.kind != J.OBJECT) {
         ret directory_error("directory meta is not an object");
     }
-    var terms: *J.Value = nil;
-    var website: *J.Value = nil;
-    var caa: *J.Value = nil;
-    var external_required: bool = false;
+    var terms:             *J.Value = nil;
+    var website:           *J.Value = nil;
+    var caa:               *J.Value = nil;
+    var external_required: bool     = false;
     if (meta != nil) {
-        terms = json.find(meta, "termsOfService");
+        terms   = json.find(meta, "termsOfService");
         website = json.find(meta, "website");
-        caa = json.find(meta, "caaIdentities");
+        caa     = json.find(meta, "caaIdentities");
         val external: *J.Value = json.find(meta, "externalAccountRequired");
         if ((terms != nil &&
-                !metadata_uri_value(terms, configured.max_url_bytes)) ||
+            !metadata_uri_value(terms, configured.max_url_bytes)) ||
             (website != nil &&
-                !metadata_uri_value(website, configured.max_url_bytes)) ||
+            !metadata_uri_value(website, configured.max_url_bytes)) ||
             (external != nil && external.kind != J.BOOL) ||
             (caa != nil && caa.kind != J.ARRAY)) {
             ret directory_error("directory meta field has the wrong type");
@@ -1162,21 +1177,21 @@ pub fun parse_directory(response: Response, configured: Limits, scratch: *u8,
     }
     var i: usize = 0;
     for (i < caa_len) {
-        val item: *J.Value = J.value_get(caa, i);
-        var item_len: usize = 0;
+        val item:     *J.Value = element(caa, i);
+        var item_len: usize    = 0;
         if (!decoded_len(item, 255, ?item_len) || item_len == 0 ||
             item_len > 0xffffffffffffffff - required) {
             ret directory_error("directory caa identity is invalid");
         }
-        var decoded: [255]u8;
-        val decoded_result: R.Result[usize, str] = J.value_string_decode(item,
+        var decoded:        [255]u8;
+        val decoded_result: res[usize, J.JsonError] = J.value_string_decode(item,
             ?decoded[0], 255);
-        if (R.is_err[usize, str](decoded_result) ||
+        if ((sel decoded_result.err) ||
             !caa_identity(?decoded[0], item_len)) {
             ret directory_error("directory caa identity is invalid");
         }
         required = required + item_len;
-        i = i + 1;
+        i        = i + 1;
     }
     if (required > storage.capacity) {
         ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
@@ -1198,16 +1213,16 @@ pub fun parse_directory(response: Response, configured: Limits, scratch: *u8,
     }
     i = 0;
     for (i < caa_len) {
-        if (!copy_string(?cursor, J.value_get(caa, i), ?storage.caa_items[i])) {
+        if (!copy_string(?cursor, element(caa, i), ?storage.caa_items[i])) {
             ret problem.local_code(problem.STATE, problem.INVALID_STATE,
                 "validated directory caa copy failed");
         }
         i = i + 1;
     }
-    result.caa_identities = storage.caa_items;
-    result.caa_identity_len = caa_len;
+    result.caa_identities            = storage.caa_items;
+    result.caa_identity_len          = caa_len;
     result.external_account_required = external_required;
-    @output = result;
+    @output                          = result;
     ret problem.none();
 }
 
@@ -1226,8 +1241,8 @@ fun parse_problem(response: Response, configured: Limits, scratch: *u8,
         response.retry_after_seconds);
     if (response.body.data == nil || response.body.len == 0) { ret fallback; }
     if (response.body.len > configured.max_problem_bytes || storage.data == nil) {
-        fallback.kind = problem.LIMIT;
-        fallback.code = problem.OUTPUT_TOO_SMALL;
+        fallback.kind   = problem.LIMIT;
+        fallback.code   = problem.OUTPUT_TOO_SMALL;
         fallback.detail = "acme problem exceeds configured storage";
         ret fallback;
     }
@@ -1237,53 +1252,53 @@ fun parse_problem(response: Response, configured: Limits, scratch: *u8,
     }
     var subproblem_bytes: usize = 0;
     if (!memory_range.size(storage.subproblem_capacity,
-            $size_of(problem.Subproblem), ?subproblem_bytes) ||
+        $size_of(problem.Subproblem), ?subproblem_bytes) ||
         !memory_range.valid(scratch, usable_scratch) ||
         !memory_range.valid(storage.data, storage.capacity) ||
         !memory_range.valid(storage.subproblems::*u8, subproblem_bytes) ||
         memory_range.overlap(scratch, usable_scratch, storage.data,
-            storage.capacity) ||
+        storage.capacity) ||
         memory_range.overlap(scratch, usable_scratch,
-            storage.subproblems::*u8, subproblem_bytes) ||
+        storage.subproblems::*u8, subproblem_bytes) ||
         memory_range.overlap(storage.data, storage.capacity,
-            storage.subproblems::*u8, subproblem_bytes) ||
+        storage.subproblems::*u8, subproblem_bytes) ||
         response_overlaps(response, scratch, usable_scratch) ||
         response_overlaps(response, storage.data, storage.capacity) ||
         response_overlaps(response, storage.subproblems::*u8,
-            subproblem_bytes)) {
-        fallback.kind = problem.PROTOCOL;
-        fallback.code = problem.INVALID_INPUT;
+        subproblem_bytes)) {
+        fallback.kind   = problem.PROTOCOL;
+        fallback.code   = problem.INVALID_INPUT;
         fallback.detail = "acme problem buffers overlap or have invalid ranges";
         ret fallback;
     }
     val document: json.Document = json.parse(response.body, scratch,
         usable_scratch, json_limits(configured, configured.max_problem_bytes));
     if (!document.valid) {
-        fallback.kind = problem.PROTOCOL;
-        fallback.code = document.error.code;
+        fallback.kind   = problem.PROTOCOL;
+        fallback.code   = document.error.code;
         fallback.detail = document.error.detail;
         ret fallback;
     }
     var root: J.Value = document.root;
     if (root.kind != J.OBJECT) {
-        fallback.kind = problem.PROTOCOL;
-        fallback.code = problem.MALFORMED_JSON;
+        fallback.kind   = problem.PROTOCOL;
+        fallback.code   = problem.MALFORMED_JSON;
         fallback.detail = "acme problem is not an object";
         ret fallback;
     }
-    val typ: *J.Value = json.find(?root, "type");
-    val title: *J.Value = json.find(?root, "title");
-    val detail: *J.Value = json.find(?root, "detail");
-    val instance: *J.Value = json.find(?root, "instance");
+    val typ:            *J.Value = json.find(?root, "type");
+    val title:          *J.Value = json.find(?root, "title");
+    val detail:         *J.Value = json.find(?root, "detail");
+    val instance:       *J.Value = json.find(?root, "instance");
     val problem_status: *J.Value = json.find(?root, "status");
-    val subproblems: *J.Value = json.find(?root, "subproblems");
+    val subproblems:    *J.Value = json.find(?root, "subproblems");
     if (typ == nil || typ.kind != J.STRING ||
         (title != nil && title.kind != J.STRING) ||
         (detail != nil && detail.kind != J.STRING) ||
         (instance != nil && instance.kind != J.STRING) ||
         (subproblems != nil && subproblems.kind != J.ARRAY)) {
-        fallback.kind = problem.PROTOCOL;
-        fallback.code = problem.MALFORMED_JSON;
+        fallback.kind   = problem.PROTOCOL;
+        fallback.code   = problem.MALFORMED_JSON;
         fallback.detail = "acme problem fields have invalid types";
         ret fallback;
     }
@@ -1292,8 +1307,8 @@ fun parse_problem(response: Response, configured: Limits, scratch: *u8,
         !add_size(?required, title, configured.max_problem_bytes) ||
         !add_size(?required, detail, configured.max_problem_bytes) ||
         !add_size(?required, instance, configured.max_problem_bytes)) {
-        fallback.kind = problem.LIMIT;
-        fallback.code = problem.OUTPUT_TOO_SMALL;
+        fallback.kind   = problem.LIMIT;
+        fallback.code   = problem.OUTPUT_TOO_SMALL;
         fallback.detail = "acme problem fields exceed configured limits";
         ret fallback;
     }
@@ -1302,40 +1317,40 @@ fun parse_problem(response: Response, configured: Limits, scratch: *u8,
     if (subproblem_len > configured.max_problem_subproblems ||
         subproblem_len > storage.subproblem_capacity ||
         (subproblem_len != 0 && storage.subproblems == nil)) {
-        fallback.kind = problem.LIMIT;
-        fallback.code = problem.OUTPUT_TOO_SMALL;
+        fallback.kind   = problem.LIMIT;
+        fallback.code   = problem.OUTPUT_TOO_SMALL;
         fallback.detail = "acme subproblem storage is too small";
         ret fallback;
     }
     var i: usize = 0;
     for (i < subproblem_len) {
-        val item: *J.Value = J.value_get(subproblems, i);
+        val item: *J.Value = element(subproblems, i);
         if (item == nil || item.kind != J.OBJECT) {
-            fallback.kind = problem.PROTOCOL;
-            fallback.code = problem.MALFORMED_JSON;
+            fallback.kind   = problem.PROTOCOL;
+            fallback.code   = problem.MALFORMED_JSON;
             fallback.detail = "acme subproblem is not an object";
             ret fallback;
         }
-        val item_type: *J.Value = json.find(item, "type");
-        val item_detail: *J.Value = json.find(item, "detail");
+        val item_type:       *J.Value = json.find(item, "type");
+        val item_detail:     *J.Value = json.find(item, "detail");
         val item_identifier: *J.Value = json.find(item, "identifier");
         if (item_type == nil || item_type.kind != J.STRING ||
             (item_detail != nil && item_detail.kind != J.STRING) ||
             (item_identifier != nil && item_identifier.kind != J.OBJECT)) {
-            fallback.kind = problem.PROTOCOL;
-            fallback.code = problem.MALFORMED_JSON;
+            fallback.kind   = problem.PROTOCOL;
+            fallback.code   = problem.MALFORMED_JSON;
             fallback.detail = "acme subproblem fields have invalid types";
             ret fallback;
         }
-        var identifier_type: *J.Value = nil;
+        var identifier_type:  *J.Value = nil;
         var identifier_value: *J.Value = nil;
         if (item_identifier != nil) {
-            identifier_type = json.find(item_identifier, "type");
+            identifier_type  = json.find(item_identifier, "type");
             identifier_value = json.find(item_identifier, "value");
             if (identifier_type == nil || identifier_type.kind != J.STRING ||
                 identifier_value == nil || identifier_value.kind != J.STRING) {
-                fallback.kind = problem.PROTOCOL;
-                fallback.code = problem.MALFORMED_JSON;
+                fallback.kind   = problem.PROTOCOL;
+                fallback.code   = problem.MALFORMED_JSON;
                 fallback.detail = "acme subproblem identifier is invalid";
                 ret fallback;
             }
@@ -1344,16 +1359,16 @@ fun parse_problem(response: Response, configured: Limits, scratch: *u8,
             !add_size(?required, item_detail, configured.max_problem_bytes) ||
             !add_size(?required, identifier_type, configured.max_problem_bytes) ||
             !add_size(?required, identifier_value, configured.max_problem_bytes)) {
-            fallback.kind = problem.LIMIT;
-            fallback.code = problem.OUTPUT_TOO_SMALL;
+            fallback.kind   = problem.LIMIT;
+            fallback.code   = problem.OUTPUT_TOO_SMALL;
             fallback.detail = "acme subproblem fields exceed configured limits";
             ret fallback;
         }
         i = i + 1;
     }
     if (required > storage.capacity) {
-        fallback.kind = problem.LIMIT;
-        fallback.code = problem.OUTPUT_TOO_SMALL;
+        fallback.kind   = problem.LIMIT;
+        fallback.code   = problem.OUTPUT_TOO_SMALL;
         fallback.detail = "acme problem storage is too small";
         ret fallback;
     }
@@ -1361,48 +1376,49 @@ fun parse_problem(response: Response, configured: Limits, scratch: *u8,
     if (problem_status != nil) {
         if (problem_status.kind != J.NUMBER || J.value_is_float(problem_status) ||
             J.value_number(problem_status) < 100 || J.value_number(problem_status) > 599) {
-            fallback.kind = problem.PROTOCOL;
-            fallback.code = problem.MALFORMED_JSON;
+            fallback.kind   = problem.PROTOCOL;
+            fallback.code   = problem.MALFORMED_JSON;
             fallback.detail = "acme problem status is invalid";
             ret fallback;
         }
         parsed_status = J.value_number(problem_status)::u16;
     }
-    var value: problem.Problem;
+    var value:  problem.Problem;
     var cursor: Cursor = Cursor{data: storage.data, cap: storage.capacity, pos: 0};
     if (!copy_string(?cursor, typ, ?value.typ) ||
         !copy_string(?cursor, title, ?value.title) ||
         !copy_string(?cursor, detail, ?value.detail) ||
         !copy_string(?cursor, instance, ?value.instance)) {
-        fallback.kind = problem.STATE;
-        fallback.code = problem.INVALID_STATE;
+        fallback.kind   = problem.STATE;
+        fallback.code   = problem.INVALID_STATE;
         fallback.detail = "validated acme problem copy failed";
         ret fallback;
     }
     value.status = parsed_status;
-    i = 0;
+    i            = 0;
     for (i < subproblem_len) {
-        val item: *J.Value = J.value_get(subproblems, i);
-        val item_identifier: *J.Value = json.find(item, "identifier");
-        var parsed: problem.Subproblem = problem.Subproblem{
-            typ: view.view(nil, 0), detail: view.view(nil, 0),
+        val item:            *J.Value           = element(subproblems, i);
+        val item_identifier: *J.Value           = json.find(item, "identifier");
+        var parsed:          problem.Subproblem = problem.Subproblem{
+            typ:        view.view(nil, 0), detail: view.view(nil, 0),
             identifier: problem.ProblemIdentifier{
-                typ: view.view(nil, 0), value: view.view(nil, 0)},
+                typ: view.view(nil, 0), value: view.view(nil, 0)
+            },
         };
         if (!copy_string(?cursor, json.find(item, "type"), ?parsed.typ) ||
             !copy_string(?cursor, json.find(item, "detail"), ?parsed.detail) ||
             (item_identifier != nil &&
-                (!copy_string(?cursor, json.find(item_identifier, "type"),
-                    ?parsed.identifier.typ) ||
-                !copy_string(?cursor, json.find(item_identifier, "value"),
-                    ?parsed.identifier.value)))) {
-            fallback.kind = problem.STATE;
-            fallback.code = problem.INVALID_STATE;
+            (!copy_string(?cursor, json.find(item_identifier, "type"),
+            ?parsed.identifier.typ) ||
+            !copy_string(?cursor, json.find(item_identifier, "value"),
+            ?parsed.identifier.value)))) {
+            fallback.kind   = problem.STATE;
+            fallback.code   = problem.INVALID_STATE;
             fallback.detail = "validated acme subproblem copy failed";
             ret fallback;
         }
         storage.subproblems[i] = parsed;
-        i = i + 1;
+        i                      = i + 1;
     }
     value.subproblems = nil;
     if (subproblem_len != 0) { value.subproblems = storage.subproblems; }
@@ -1420,8 +1436,8 @@ fun replay_nonce(response: Response, configured: Limits,
             "http response fields are invalid");
     }
     var found: *field.Field = nil;
-    var i: usize = 0;
-    val name: view.View = view.view("Replay-Nonce", 12);
+    var i:     usize        = 0;
+    val name:  view.View    = view.view("Replay-Nonce", 12);
     for (i < response.fields.len) {
         if (field.name_equal(response.fields.items[i].name, name)) {
             if (found != nil) {
@@ -1447,7 +1463,7 @@ fun replay_nonce(response: Response, configured: Limits,
 
 fun store_response_nonce(client: *Client, response: Response,
     request: *SignedRequest, stored: *bool) problem.Error {
-    var value: view.View;
+    var value:  view.View;
     val parsed: problem.Error = replay_nonce(response, client.limits,
         ?value);
     if (problem.failed(parsed)) { ret parsed; }
@@ -1468,7 +1484,7 @@ fun store_response_nonce(client: *Client, response: Response,
 
 fun bind_response_nonce(client: *Client, request: *SignedRequest,
     response: Response, required: bool, bound: *bool) problem.Error {
-    var value: view.View;
+    var value:  view.View;
     val parsed: problem.Error = replay_nonce(response, client.limits, ?value);
     if (problem.failed(parsed)) { ret parsed; }
     @bound = false;
@@ -1490,10 +1506,10 @@ fun bind_response_nonce(client: *Client, request: *SignedRequest,
 fun invalid_wire(detail: str) WireRequest {
     ret WireRequest{error: problem.local_code(problem.PROTOCOL,
         problem.INVALID_INPUT, detail), method: method.from_kind(0),
-        url: view.view(nil, 0), content_type: view.view(nil, 0),
-        body: view.view(nil, 0), timeout_ns: 0, max_response_bytes: 0,
+        url:             view.view(nil, 0), content_type: view.view(nil, 0),
+        body:            view.view(nil, 0), timeout_ns: 0, max_response_bytes: 0,
         response_fields: no_field_limits(),
-        replay_safe: false};
+        replay_safe:     false};
 }
 
 pub fun discovery_request(directory_url: view.View,
@@ -1505,30 +1521,30 @@ pub fun discovery_request(directory_url: view.View,
         ret invalid_wire("invalid directory url or request policy");
     }
     ret WireRequest{error: problem.none(),
-        method: method.from_kind(method.GET), url: directory_url,
-        content_type: view.view(DIRECTORY_CONTENT_TYPE, 16),
-        body: view.view(nil, 0), timeout_ns: configured.request_timeout_ns,
+        method:             method.from_kind(method.GET), url: directory_url,
+        content_type:       view.view(DIRECTORY_CONTENT_TYPE, 16),
+        body:               view.view(nil, 0), timeout_ns: configured.request_timeout_ns,
         max_response_bytes: configured.max_response_bytes,
-        response_fields: configured.response_fields, replay_safe: true};
+        response_fields:    configured.response_fields, replay_safe: true};
 }
 
 pub fun nonce_request(client: *Client, directory: Directory) WireRequest {
     if (client == nil || !memory_range.valid(client::*u8, $size_of(Client)) ||
         !client.initialized || callback_reentrant(client) ||
         !memory_range.valid(directory.new_nonce_url.data,
-            directory.new_nonce_url.len) ||
+        directory.new_nonce_url.len) ||
         directory.new_nonce_url.len == 0 ||
         directory.new_nonce_url.len > client.limits.max_url_bytes ||
         !https_bytes(directory.new_nonce_url.data, directory.new_nonce_url.len)) {
         ret invalid_wire("invalid nonce url or client state");
     }
     ret WireRequest{error: problem.none(),
-        method: method.from_kind(method.HEAD), url: directory.new_nonce_url,
-        content_type: view.view(nil, 0), body: view.view(nil, 0),
-        timeout_ns: client.limits.request_timeout_ns,
+        method:             method.from_kind(method.HEAD), url: directory.new_nonce_url,
+        content_type:       view.view(nil, 0), body: view.view(nil, 0),
+        timeout_ns:         client.limits.request_timeout_ns,
         max_response_bytes: client.limits.max_response_bytes,
-        response_fields: client.limits.response_fields,
-        replay_safe: true};
+        response_fields:    client.limits.response_fields,
+        replay_safe:        true};
 }
 
 pub fun begin_signed(client: *Client, request: *SignedRequest,
@@ -1538,19 +1554,19 @@ pub fun begin_signed(client: *Client, request: *SignedRequest,
         !memory_range.valid(request::*u8, $size_of(SignedRequest)) ||
         !nonce.descriptor_valid(client.nonces) ||
         memory_range.overlap(request::*u8, $size_of(SignedRequest),
-            client::*u8, $size_of(Client)) ||
+        client::*u8, $size_of(Client)) ||
         memory_range.overlap(request::*u8, $size_of(SignedRequest),
-            spec.url.data, spec.url.len) ||
+        spec.url.data, spec.url.len) ||
         memory_range.overlap(request::*u8, $size_of(SignedRequest),
-            spec.payload.data, spec.payload.len) ||
+        spec.payload.data, spec.payload.len) ||
         memory_range.overlap(request::*u8, $size_of(SignedRequest),
-            spec.kid.data, spec.kid.len) ||
+        spec.kid.data, spec.kid.len) ||
         !memory_range.valid(spec.url.data, spec.url.len) ||
         !memory_range.valid(spec.payload.data, spec.payload.len) ||
         !memory_range.valid(spec.kid.data, spec.kid.len) ||
         !client.initialized || callback_reentrant(client) ||
         (request.state != REQUEST_EMPTY && request.state != REQUEST_COMPLETE &&
-            request.state != REQUEST_FAILED) ||
+        request.state != REQUEST_FAILED) ||
         spec.url.data == nil ||
         spec.url.len == 0 || spec.url.len > client.limits.max_url_bytes ||
         !https_bytes(spec.url.data, spec.url.len) ||
@@ -1558,40 +1574,40 @@ pub fun begin_signed(client: *Client, request: *SignedRequest,
         (spec.payload.len != 0 && spec.payload.data == nil) ||
         (spec.use_jwk && spec.kid.len != 0) ||
         (!spec.use_jwk && (spec.kid.data == nil || spec.kid.len == 0 ||
-            spec.kid.len > client.limits.max_url_bytes ||
-            !https_bytes(spec.kid.data, spec.kid.len)))) {
+        spec.kid.len > client.limits.max_url_bytes ||
+        !https_bytes(spec.kid.data, spec.kid.len)))) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid signed request specification");
     }
-    var url_digest: [32]u8;
+    var url_digest:     [32]u8;
     var payload_digest: [32]u8;
-    var kid_digest: [32]u8;
+    var kid_digest:     [32]u8;
     if (!digest(spec.url.data, spec.url.len, ?url_digest[0]) ||
         !digest(spec.payload.data, spec.payload.len, ?payload_digest[0]) ||
         !digest(spec.kid.data, spec.kid.len, ?kid_digest[0])) {
         ret problem.local_code(problem.STATE, problem.INVALID_STATE,
             "signed request binding could not be initialized");
     }
-    request.spec = spec;
-    request.wire_body = view.view(nil, 0);
-    request.client_owner = client::ptr;
+    request.spec              = spec;
+    request.wire_body         = view.view(nil, 0);
+    request.client_owner      = client::ptr;
     request.client_generation = client.generation;
-    request.state = REQUEST_READY;
-    request.attempts = 0;
+    request.state             = REQUEST_READY;
+    request.attempts          = 0;
     request.bad_nonce_retries = 0;
-    request.signer_bound = false;
+    request.signer_bound      = false;
     wipe_retry_nonce(request);
     var i: usize = 0;
     for (i < 32) {
-        request.url_digest[i] = url_digest[i];
+        request.url_digest[i]     = url_digest[i];
         request.payload_digest[i] = payload_digest[i];
-        request.kid_digest[i] = kid_digest[i];
-        i = i + 1;
+        request.kid_digest[i]     = kid_digest[i];
+        i                         = i + 1;
     }
     i = 0;
     for (i < 43) {
         request.signer_thumbprint[i] = 0;
-        i = i + 1;
+        i                            = i + 1;
     }
     ret problem.none();
 }
@@ -1600,9 +1616,9 @@ pub fun begin_signed_bound(client: *Client, request: *SignedRequest,
     spec: SignedSpec, signer: jose.Signer) problem.Error {
     var thumbprint: [43]u8;
     if (request == nil || !memory_range.valid(request::*u8,
-            $size_of(SignedRequest)) ||
+        $size_of(SignedRequest)) ||
         jose.public_key_overlaps(signer.public_key, request::*u8,
-            $size_of(SignedRequest)) ||
+        $size_of(SignedRequest)) ||
         !signer_thumbprint(signer, ?thumbprint[0])) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid bound request signer");
@@ -1612,7 +1628,7 @@ pub fun begin_signed_bound(client: *Client, request: *SignedRequest,
     var i: usize = 0;
     for (i < 43) {
         request.signer_thumbprint[i] = thumbprint[i];
-        i = i + 1;
+        i                            = i + 1;
     }
     request.signer_bound = true;
     ret problem.none();
@@ -1632,10 +1648,10 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
         (request.state != REQUEST_READY && request.state != REQUEST_RETRY) ||
         request.attempts == 18446744073709551615 ||
         (request.state == REQUEST_RETRY &&
-            (!request.retry_nonce_ready || request.retry_nonce_len == 0 ||
-                request.retry_nonce_len > client.limits.max_nonce_bytes ||
-                !replay_nonce_bytes(?request.retry_nonce[0],
-                    request.retry_nonce_len)))) {
+        (!request.retry_nonce_ready || request.retry_nonce_len == 0 ||
+        request.retry_nonce_len > client.limits.max_nonce_bytes ||
+        !replay_nonce_bytes(?request.retry_nonce[0],
+        request.retry_nonce_len)))) {
         ret jose.Operation{error: problem.local_code(problem.STATE,
             problem.INVALID_STATE, "signed request is not ready"), written: 0};
     }
@@ -1647,22 +1663,22 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
         !memory_range.valid(bounded_output.data, bounded_output.capacity) ||
         !nonce.descriptor_valid(client.nonces) ||
         memory_range.overlap(work.data, work.capacity,
-            bounded_output.data, bounded_output.capacity) ||
+        bounded_output.data, bounded_output.capacity) ||
         memory_range.overlap(work.data, work.capacity, client::*u8,
-            $size_of(Client)) ||
+        $size_of(Client)) ||
         memory_range.overlap(work.data, work.capacity, request::*u8,
-            $size_of(SignedRequest)) ||
+        $size_of(SignedRequest)) ||
         memory_range.overlap(bounded_output.data, bounded_output.capacity,
-            client::*u8, $size_of(Client)) ||
+        client::*u8, $size_of(Client)) ||
         memory_range.overlap(bounded_output.data, bounded_output.capacity,
-            request::*u8, $size_of(SignedRequest))) {
+        request::*u8, $size_of(SignedRequest))) {
         ret jose.Operation{error: problem.local_code(problem.PROTOCOL,
             problem.INVALID_INPUT, "signed request buffers overlap state"), written: 0};
     }
     if (jose.signing_inputs_overlap(signer, private_key,
-            request::*u8, $size_of(SignedRequest)) ||
+        request::*u8, $size_of(SignedRequest)) ||
         jose.signing_inputs_overlap(signer, private_key,
-            client::*u8, $size_of(Client))) {
+        client::*u8, $size_of(Client))) {
         ret jose.Operation{error: problem.local_code(problem.PROTOCOL,
             problem.INVALID_INPUT, "signing inputs alias protocol state"), written: 0};
     }
@@ -1675,28 +1691,28 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
         ret jose.Operation{error: pool_storage, written: 0};
     }
     var guarded_entropy: jose.Entropy = entropy;
-    var entropy_guard: EntropyGuard;
-    var entropy_guarded: bool = false;
+    var entropy_guard:   EntropyGuard;
+    var entropy_guarded: bool         = false;
     if (signer.algorithm == jose.PS256 && jose.entropy_valid(entropy) &&
         entropy.available) {
         if (!callback_begin(client)) {
             ret jose.Operation{error: callback_error(
                 "entropy ownership callback is reentrant"), written: 0};
         }
-        val client_before: Client = @client;
+        val client_before:  Client        = @client;
         val request_before: SignedRequest = @request;
-        val owned: bool =
+        val owned:          bool          =
             jose.entropy_owns(entropy, client::*u8, $size_of(Client)) ||
             jose.entropy_owns(entropy, request::*u8, $size_of(SignedRequest)) ||
             jose.entropy_owns(entropy, request.spec.url.data,
-                request.spec.url.len) ||
+            request.spec.url.len) ||
             jose.entropy_owns(entropy, request.spec.payload.data,
-                request.spec.payload.len) ||
+            request.spec.payload.len) ||
             jose.entropy_owns(entropy, request.spec.kid.data,
-                request.spec.kid.len) ||
+            request.spec.kid.len) ||
             jose.entropy_owns(entropy, work.data, work.capacity) ||
             jose.entropy_owns(entropy, bounded_output.data,
-                bounded_output.capacity);
+            bounded_output.capacity);
         val callback_intact: bool = callback_end(client, client_before,
             request, request_before);
         if (!callback_intact) {
@@ -1711,28 +1727,29 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
                 "entropy provider aliases or mutated protocol storage"),
                 written: 0};
         }
-        entropy_guard.source_validate = entropy.validate;
-        entropy_guard.source_ctx = entropy.validation_ctx;
-        entropy_guard.client = client;
-        entropy_guard.request = request;
+        entropy_guard.source_validate  = entropy.validate;
+        entropy_guard.source_ctx       = entropy.validation_ctx;
+        entropy_guard.client           = client;
+        entropy_guard.request          = request;
         guarded_entropy.validation_ctx = (?entropy_guard)::ptr;
-        guarded_entropy.validate = guarded_entropy_validate;
-        entropy_guarded = true;
+        guarded_entropy.validate       = guarded_entropy_validate;
+        entropy_guarded                = true;
     }
     request.wire_body = view.view(nil, 0);
-    var nonce_bytes: [512]u8;
-    var nonce_len: usize = 0;
-    var reservation_token: u64 = 0;
-    val reservation_pool: nonce.Pool = client.nonces;
-    val retrying: bool = request.state == REQUEST_RETRY;
+    var nonce_bytes:       [512]u8;
+    var nonce_len:         usize      = 0;
+    var reservation_token: u64        = 0;
+    val reservation_pool:  nonce.Pool = client.nonces;
+    val retrying:          bool       = request.state == REQUEST_RETRY;
     if (retrying) {
         nonce_len = request.retry_nonce_len;
         var i: usize = 0;
         for (i < nonce_len) {
             nonce_bytes[i] = request.retry_nonce[i];
-            i = i + 1;
+            i              = i + 1;
         }
-    } or {
+    }
+    or {
         val reserved: nonce.Reservation = pool_reserve(client, request,
             ?nonce_bytes[0], client.limits.max_nonce_bytes);
         if (problem.failed(reserved.error)) {
@@ -1744,14 +1761,14 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
             ret jose.Operation{error: problem.local_code(problem.NONCE,
                 problem.MISSING_NONCE, "no replay nonce is available"), written: 0};
         }
-        nonce_len = reserved.value.len;
+        nonce_len         = reserved.value.len;
         reservation_token = reserved.token;
     }
     if (!spec_intact(request) || !signer_intact(request, signer)) {
         var i: usize = 0;
         for (i < nonce_len) {
             nonce_bytes[i] = 0;
-            i = i + 1;
+            i              = i + 1;
         }
         if (reservation_token != 0) {
             pool_finish(client, request, reservation_pool,
@@ -1763,7 +1780,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
     }
     var output_before: [32]u8;
     if (!digest(bounded_output.data, bounded_output.capacity,
-            ?output_before[0])) {
+        ?output_before[0])) {
         if (reservation_token != 0) {
             pool_finish(client, request, reservation_pool,
                 reservation_token, false);
@@ -1782,15 +1799,15 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
             ret jose.Operation{error: callback_error(
                 "entropy callback is reentrant"), written: 0};
         }
-        entropy_guard.client_before = @client;
+        entropy_guard.client_before  = @client;
         entropy_guard.request_before = @request;
     }
     val result: jose.Operation = jose.encode_jws(signer, private_key,
         guarded_entropy,
         jose.Protected{nonce: view.view(?nonce_bytes[0], nonce_len),
-            url: request.spec.url,
-            kid: request.spec.kid, use_jwk: request.spec.use_jwk,
-            include_nonce: true},
+        url:           request.spec.url,
+        kid:           request.spec.kid, use_jwk: request.spec.use_jwk,
+        include_nonce: true},
         request.spec.payload, work, bounded_output);
     var entropy_intact: bool = true;
     if (entropy_guarded) {
@@ -1800,7 +1817,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
     var i: usize = 0;
     for (i < nonce_len) {
         nonce_bytes[i] = 0;
-        i = i + 1;
+        i              = i + 1;
     }
     if (!entropy_intact) {
         if (reservation_token != 0) {
@@ -1838,7 +1855,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
             request.state = REQUEST_READY;
         }
         if (!digest_same(view.view(bounded_output.data,
-                bounded_output.capacity), ?output_before[0])) {
+            bounded_output.capacity), ?output_before[0])) {
             wipe_bytes(bounded_output.data, bounded_output.capacity);
             terminalize(request);
             ret jose.Operation{error: callback_error(
@@ -1860,7 +1877,7 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
             reservation_pool, reservation_token, true);
         if (problem.failed(committed) ||
             !digest_same(view.view(output.data, result.written),
-                ?body_digest[0])) {
+            ?body_digest[0])) {
             wipe_bytes(output.data, result.written);
             terminalize(request);
             if (problem.failed(committed)) {
@@ -1871,9 +1888,9 @@ pub fun prepare_signed(client: *Client, request: *SignedRequest,
         }
     }
     if (retrying) { wipe_retry_nonce(request); }
-    request.attempts = request.attempts + 1;
+    request.attempts  = request.attempts + 1;
     request.wire_body = view.view(output.data, result.written);
-    request.state = REQUEST_AWAITING;
+    request.state     = REQUEST_AWAITING;
     ret result;
 }
 
@@ -1893,28 +1910,28 @@ pub fun signed_wire(client: *Client, request: *SignedRequest) WireRequest {
         ret invalid_wire("signed request is not ready for transport");
     }
     ret WireRequest{error: problem.none(),
-        method: method.from_kind(method.POST), url: request.spec.url,
-        content_type: view.view(JWS_CONTENT_TYPE, 21), body: request.wire_body,
-        timeout_ns: client.limits.request_timeout_ns,
+        method:             method.from_kind(method.POST), url: request.spec.url,
+        content_type:       view.view(JWS_CONTENT_TYPE, 21), body: request.wire_body,
+        timeout_ns:         client.limits.request_timeout_ns,
         max_response_bytes: client.limits.max_response_bytes,
-        response_fields: client.limits.response_fields,
-        replay_safe: false};
+        response_fields:    client.limits.response_fields,
+        replay_safe:        false};
 }
 
 fun response_shape(response: Response, configured: Limits) problem.Error {
     if (!memory_range.valid(response.body.data, response.body.len)) {
         var cause: problem.Error = problem.http(response.status,
             view.view(nil, 0), response.retry_after_seconds);
-        cause.kind = problem.PROTOCOL;
-        cause.code = problem.INVALID_INPUT;
+        cause.kind   = problem.PROTOCOL;
+        cause.code   = problem.INVALID_INPUT;
         cause.detail = "http response body view is invalid";
         ret cause;
     }
     if (response.body.len > configured.max_response_bytes) {
         var cause: problem.Error = problem.http(response.status,
             view.view(nil, 0), response.retry_after_seconds);
-        cause.kind = problem.LIMIT;
-        cause.code = problem.OUTPUT_TOO_SMALL;
+        cause.kind   = problem.LIMIT;
+        cause.code   = problem.OUTPUT_TOO_SMALL;
         cause.detail = "http response body exceeds configured limits";
         ret cause;
     }
@@ -1922,8 +1939,8 @@ fun response_shape(response: Response, configured: Limits) problem.Error {
         !field.validate(response.fields, configured.response_fields, false)) {
         var cause: problem.Error = problem.http(response.status,
             response.body, response.retry_after_seconds);
-        cause.kind = problem.PROTOCOL;
-        cause.code = problem.INVALID_INPUT;
+        cause.kind   = problem.PROTOCOL;
+        cause.code   = problem.INVALID_INPUT;
         cause.detail = "http response fields violate configured limits";
         ret cause;
     }
@@ -1965,7 +1982,7 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
         ret Decision{action: ACTION_FAILED, cause: error};
     }
     if (response.status >= 200 && response.status < 300) {
-        var stored: bool = false;
+        var stored:       bool          = false;
         val nonce_status: problem.Error = store_response_nonce(client, response,
             request, ?stored);
         if (problem.failed(nonce_status)) {
@@ -1973,25 +1990,25 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
             ret Decision{action: ACTION_FAILED, cause: nonce_status};
         }
         request.wire_body = view.view(nil, 0);
-        request.state = REQUEST_COMPLETE;
+        request.state     = REQUEST_COMPLETE;
         wipe_retry_nonce(request);
         ret Decision{action: ACTION_COMPLETE, cause: problem.none()};
     }
     var subproblem_bytes: usize = 0;
     if (!memory_range.size(storage.subproblem_capacity,
-            $size_of(problem.Subproblem), ?subproblem_bytes) ||
+        $size_of(problem.Subproblem), ?subproblem_bytes) ||
         memory_range.overlap(scratch, scratch_capacity, request::*u8,
-            $size_of(SignedRequest)) ||
+        $size_of(SignedRequest)) ||
         memory_range.overlap(storage.data, storage.capacity, request::*u8,
-            $size_of(SignedRequest)) ||
+        $size_of(SignedRequest)) ||
         memory_range.overlap(storage.subproblems::*u8, subproblem_bytes,
-            request::*u8, $size_of(SignedRequest)) ||
+        request::*u8, $size_of(SignedRequest)) ||
         memory_range.overlap(scratch, scratch_capacity, client::*u8,
-            $size_of(Client)) ||
+        $size_of(Client)) ||
         memory_range.overlap(storage.data, storage.capacity, client::*u8,
-            $size_of(Client)) ||
+        $size_of(Client)) ||
         memory_range.overlap(storage.subproblems::*u8, subproblem_bytes,
-            client::*u8, $size_of(Client))) {
+        client::*u8, $size_of(Client))) {
         val error: problem.Error = problem.local_code(problem.PROTOCOL,
             problem.INVALID_INPUT, "problem buffers alias protocol state");
         terminalize(request);
@@ -2010,13 +2027,13 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
         if (request.bad_nonce_retries >= client.limits.max_bad_nonce_retries) {
             terminalize(request);
             var limited: problem.Error = cause;
-            limited.kind = problem.POLICY;
-            limited.code = problem.RETRY_LIMIT;
-            limited.detail = "badNonce retry limit reached";
+            limited.kind      = problem.POLICY;
+            limited.code      = problem.RETRY_LIMIT;
+            limited.detail    = "badNonce retry limit reached";
             limited.retryable = false;
             ret Decision{action: ACTION_FAILED, cause: limited};
         }
-        var bound: bool = false;
+        var bound:        bool          = false;
         val nonce_status: problem.Error = bind_response_nonce(client, request,
             response, false, ?bound);
         if (problem.failed(nonce_status)) {
@@ -2031,7 +2048,7 @@ pub fun accept_signed_response(client: *Client, request: *SignedRequest,
         request.state = REQUEST_NEEDS_NONCE;
         ret Decision{action: ACTION_ACQUIRE_NONCE, cause: cause};
     }
-    var stored: bool = false;
+    var stored:       bool          = false;
     val nonce_status: problem.Error = store_response_nonce(client, response,
         request, ?stored);
     if (problem.failed(nonce_status)) {
@@ -2078,7 +2095,7 @@ pub fun accept_nonce_response(client: *Client, request: *SignedRequest,
         ret problem.http(response.status, response.body,
             response.retry_after_seconds);
     }
-    var bound: bool = false;
+    var bound:  bool          = false;
     val result: problem.Error = bind_response_nonce(client, request, response,
         true, ?bound);
     if (problem.failed(result)) {

@@ -4,27 +4,27 @@
 # be renewed. the window is advice: it is validated, clamped, and combined with
 # the local policy rather than obeyed blindly.
 
-use crypto.contracts;
-use http.core.field;
-use http.core.status;
-use J: std.data.json;
-use R: std.types.result;
-use std.encoding.base64;
-use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
-use std.types.size.usize;
-use std.types.string.str;
-use std.types.view;
 use acme.certificate;
 use acme.client;
 use acme.json;
 use acme.memory_range;
 use acme.problem;
+use crypto.contracts;
+use http.core.field;
+use http.core.status;
+use J: std.data.json;
+use std.encoding.base64;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
 
 # base64url of a 20-byte key identifier and a 20-byte serial, plus the dot
 pub val MAX_CERTIFICATE_ID_BYTES: usize = 64;
-pub val MAX_TIME_BYTES: usize = 64;
+pub val MAX_TIME_BYTES:           usize = 64;
 
 pub rec Window {
     start_unix:          u64;
@@ -60,13 +60,13 @@ pub fun certificate_id(der: view.View, output: contracts.Buffer) Operation {
     if (output.data == nil ||
         !memory_range.valid(output.data, output.capacity) ||
         memory_range.overlap(output.data, output.capacity, der.data,
-            der.len)) {
+        der.len)) {
         ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid renewal identifier output");
     }
     var key_id: view.View;
     var serial: view.View;
-    val parts: problem.Error = certificate.renewal_id_parts(der, ?key_id,
+    val parts:  problem.Error = certificate.renewal_id_parts(der, ?key_id,
         ?serial);
     if (problem.failed(parts)) {
         ret Operation{error: parts, written: 0, value: view.view(nil, 0)};
@@ -100,13 +100,13 @@ pub fun request_url(base: view.View, certificate_id_value: view.View,
         !memory_range.valid(output.data, output.capacity) ||
         !client.url_valid(base, max_url_bytes) ||
         !memory_range.valid(certificate_id_value.data,
-            certificate_id_value.len) ||
+        certificate_id_value.len) ||
         certificate_id_value.len == 0 ||
         certificate_id_value.len > MAX_CERTIFICATE_ID_BYTES ||
         memory_range.overlap(output.data, output.capacity, base.data,
-            base.len) ||
+        base.len) ||
         memory_range.overlap(output.data, output.capacity,
-            certificate_id_value.data, certificate_id_value.len)) {
+        certificate_id_value.data, certificate_id_value.len)) {
         ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid renewal information url inputs");
     }
@@ -120,13 +120,13 @@ pub fun request_url(base: view.View, certificate_id_value: view.View,
     var i: usize = 0;
     for (i < base.len) {
         output.data[i] = base.data[i];
-        i = i + 1;
+        i              = i + 1;
     }
     if (separator == 1) { output.data[base.len] = '/'; }
     i = 0;
     for (i < certificate_id_value.len) {
         output.data[base.len + separator + i] = certificate_id_value.data[i];
-        i = i + 1;
+        i                                     = i + 1;
     }
     val built: view.View = view.view(output.data, total);
     if (!client.url_valid(built, max_url_bytes)) {
@@ -159,7 +159,7 @@ fun days_from_civil(year: i64, month: i64, day: i64) i64 {
     if (month <= 2) { y = y - 1; }
     var era: i64 = y / 400;
     if (y < 0) { era = (y - 399) / 400; }
-    val yoe: i64 = y - era * 400;
+    val yoe:     i64 = y - era * 400;
     var shifted: i64 = month + 9;
     if (month > 2) { shifted = month - 3; }
     val doy: i64 = (153 * shifted + 2) / 5 + day - 1;
@@ -179,10 +179,10 @@ fun parse_timestamp(value: view.View, output: *u64) bool {
         !all_digits(value.data, 11, 2) || value.data[13] != ':' ||
         !all_digits(value.data, 14, 2) || value.data[16] != ':' ||
         !all_digits(value.data, 17, 2)) { ret false; }
-    val year: i64 = digits2(value.data, 0) * 100 + digits2(value.data, 2);
-    val month: i64 = digits2(value.data, 5);
-    val day: i64 = digits2(value.data, 8);
-    val hour: i64 = digits2(value.data, 11);
+    val year:   i64 = digits2(value.data, 0) * 100 + digits2(value.data, 2);
+    val month:  i64 = digits2(value.data, 5);
+    val day:    i64 = digits2(value.data, 8);
+    val hour:   i64 = digits2(value.data, 11);
     val minute: i64 = digits2(value.data, 14);
     val second: i64 = digits2(value.data, 17);
     if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 ||
@@ -199,16 +199,18 @@ fun parse_timestamp(value: view.View, output: *u64) bool {
     if (i == value.len) { ret false; }
     if (value.data[i] == 'Z' || value.data[i] == 'z') {
         if (i + 1 != value.len) { ret false; }
-    } or (value.data[i] == '+' || value.data[i] == '-') {
+    }
+    or (value.data[i] == '+' || value.data[i] == '-') {
         if (i + 6 != value.len || value.data[i + 3] != ':' ||
             !all_digits(value.data, i + 1, 2) ||
             !all_digits(value.data, i + 4, 2)) { ret false; }
-        val offset_hours: i64 = digits2(value.data, i + 1);
+        val offset_hours:   i64 = digits2(value.data, i + 1);
         val offset_minutes: i64 = digits2(value.data, i + 4);
         if (offset_hours > 23 || offset_minutes > 59) { ret false; }
         offset = offset_hours * 3600 + offset_minutes * 60;
         if (value.data[i] == '+') { offset = 0 - offset; }
-    } or { ret false; }
+    }
+    or { ret false; }
     val stamp: i64 = days_from_civil(year, month, day) * 86400 +
         hour * 3600 + minute * 60 + second + offset;
     if (stamp < 0) { ret false; }
@@ -218,9 +220,9 @@ fun parse_timestamp(value: view.View, output: *u64) bool {
 
 fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
     if (value == nil || value.kind != J.STRING || output == nil) { ret false; }
-    val result: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
-    if (R.is_err[usize, str](result)) { ret false; }
-    val len: usize = R.unwrap_ok[usize, str](result);
+    val result: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+    if (sel result.err) { ret false; }
+    val len: usize = result.ok;
     if (len > maximum) { ret false; }
     @output = len;
     ret true;
@@ -230,9 +232,9 @@ fun decode_timestamp(value: *J.Value, output: *u64) bool {
     var len: usize = 0;
     if (!decoded_len(value, MAX_TIME_BYTES, ?len)) { ret false; }
     var decoded: [64]u8;
-    val result: R.Result[usize, str] = J.value_string_decode(value,
+    val result:  res[usize, J.JsonError] = J.value_string_decode(value,
         ?decoded[0], 64);
-    if (R.is_err[usize, str](result)) { ret false; }
+    if (sel result.err) { ret false; }
     ret parse_timestamp(view.view(?decoded[0], len), output);
 }
 
@@ -248,9 +250,9 @@ pub fun parse(response: client.Response, configured: client.Limits,
         scratch_capacity == 0 ||
         !memory_range.valid(scratch, scratch_capacity) ||
         memory_range.overlap(scratch, scratch_capacity, output::*u8,
-            $size_of(Window)) ||
+        $size_of(Window)) ||
         memory_range.overlap(scratch, scratch_capacity, response.body.data,
-            response.body.len)) {
+        response.body.len)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid renewal information response");
     }
@@ -264,10 +266,10 @@ pub fun parse(response: client.Response, configured: client.Limits,
     }
     val document: json.Document = json.parse(response.body, scratch, usable,
         json.Limits{max_bytes: configured.max_response_bytes,
-            max_depth: configured.max_json_depth,
-            max_values: configured.max_json_values,
-            max_key_bytes: configured.max_json_key_bytes,
-            max_key_comparisons: configured.max_json_key_comparisons});
+        max_depth:           configured.max_json_depth,
+        max_values:          configured.max_json_values,
+        max_key_bytes:       configured.max_json_key_bytes,
+        max_key_comparisons: configured.max_json_key_comparisons});
     if (!document.valid) { ret document.error; }
     var root: J.Value = document.root;
     if (root.kind != J.OBJECT) {
@@ -290,7 +292,7 @@ pub fun parse(response: client.Response, configured: client.Limits,
             "renewal information window ends before it starts");
     }
     result.retry_after_seconds = response.retry_after_seconds;
-    result.present = true;
-    @output = result;
+    result.present             = true;
+    @output                    = result;
     ret problem.none();
 }
