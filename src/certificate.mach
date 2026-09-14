@@ -1,22 +1,22 @@
 # csr generation, issuance, alternate chains, and revocation
 
-use crypto.contracts;
-use http.core.field;
-use http.core.status;
-use std.encoding.base64;
-use std.net.ip;
-use std.types.result.res;
-use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
-use std.types.size.usize;
-use std.types.string.str;
-use std.types.view;
 use acme.client;
 use acme.identifier;
 use acme.jose;
 use acme.memory_range;
 use acme.problem;
+use crypto.contracts;
+use http.core.field;
+use http.core.status;
+use std.encoding.base64;
+use std.net.ip;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
 
 pub def Algorithm: u16;
 
@@ -116,9 +116,9 @@ fun prepend(writer: *Back, data: *u8, len: usize) bool {
         ret false;
     }
     val start: usize = writer.cap - writer.pos - len;
-    var i: usize = len;
+    var i:     usize = len;
     for (i > 0) {
-        i = i - 1;
+        i                      = i - 1;
         writer.data[start + i] = data[i];
     }
     writer.pos = writer.pos + len;
@@ -128,7 +128,7 @@ fun prepend(writer: *Back, data: *u8, len: usize) bool {
 fun prepend_byte(writer: *Back, value: u8) bool {
     if (writer.pos == writer.cap) { ret false; }
     writer.data[writer.cap - writer.pos - 1] = value;
-    writer.pos = writer.pos + 1;
+    writer.pos                               = writer.pos + 1;
     ret true;
 }
 
@@ -150,9 +150,13 @@ fun wrap(writer: *Back, tag: u8, len: usize) bool {
     ret prepend_length(writer, len) && prepend_byte(writer, tag);
 }
 
-fun mark(writer: *Back) usize { ret writer.pos; }
+fun mark(writer: *Back) usize {
+    ret writer.pos;
+}
 
-fun since(writer: *Back, start: usize) usize { ret writer.pos - start; }
+fun since(writer: *Back, start: usize) usize {
+    ret writer.pos - start;
+}
 
 val TAG_SEQUENCE:     u8 = 0x30;
 val TAG_SET:          u8 = 0x31;
@@ -207,7 +211,7 @@ fun ip_bytes(value: view.View, output: *u8, len: *usize) bool {
     for (i < value.len) {
         if (value.data[i] == 0) { ret false; }
         text[i] = value.data[i];
-        i = i + 1;
+        i       = i + 1;
     }
     text[value.len] = 0;
     val four: res[ip.IPv4, ip.ParseError] = ip.ipv4_parse(?text[0]);
@@ -216,7 +220,7 @@ fun ip_bytes(value: view.View, output: *u8, len: *usize) bool {
         i = 0;
         for (i < 4) {
             output[i] = address.octets[i];
-            i = i + 1;
+            i         = i + 1;
         }
         @len = 4;
         ret true;
@@ -227,7 +231,7 @@ fun ip_bytes(value: view.View, output: *u8, len: *usize) bool {
     i = 0;
     for (i < 16) {
         output[i] = address.octets[i];
-        i = i + 1;
+        i         = i + 1;
     }
     @len = 16;
     ret true;
@@ -245,13 +249,15 @@ fun general_names(writer: *Back, names: *identifier.Identifier,
             # a wildcard order requests the wildcard name itself
             if (!prepend(writer, entry.value.data, entry.value.len) ||
                 !wrap(writer, TAG_DNS_NAME, entry.value.len)) { ret false; }
-        } or (entry.kind == identifier.IP) {
-            var packed: [16]u8;
+        }
+        or (entry.kind == identifier.IP) {
+            var packed:     [16]u8;
             var packed_len: usize = 0;
             if (!ip_bytes(entry.value, ?packed[0], ?packed_len) ||
                 !prepend(writer, ?packed[0], packed_len) ||
                 !wrap(writer, TAG_IP_ADDRESS, packed_len)) { ret false; }
-        } or { ret false; }
+        }
+        or { ret false; }
     }
     ret true;
 }
@@ -259,11 +265,11 @@ fun general_names(writer: *Back, names: *identifier.Identifier,
 fun extension_request(writer: *Back, names: *identifier.Identifier,
     len: usize) bool {
     val attributes: usize = mark(writer);
-    val set_start: usize = mark(writer);
+    val set_start:  usize = mark(writer);
     val extensions: usize = mark(writer);
-    val extension: usize = mark(writer);
-    val octet: usize = mark(writer);
-    val general: usize = mark(writer);
+    val extension:  usize = mark(writer);
+    val octet:      usize = mark(writer);
+    val general:    usize = mark(writer);
     if (!general_names(writer, names, len) ||
         !wrap(writer, TAG_SEQUENCE, since(writer, general)) ||
         !wrap(writer, TAG_OCTET_STRING, since(writer, octet))) { ret false; }
@@ -282,9 +288,9 @@ fun extension_request(writer: *Back, names: *identifier.Identifier,
 fun signer_valid(value: CsrSigner) bool {
     ret value.sign != nil &&
         (value.algorithm == ECDSA_P256_SHA256 || value.algorithm == ED25519 ||
-            value.algorithm == RSA_SHA256) &&
+        value.algorithm == RSA_SHA256) &&
         memory_range.valid(value.public_key_der.data,
-            value.public_key_der.len) &&
+        value.public_key_der.len) &&
         value.public_key_der.len != 0 &&
         value.public_key_der.len <= MAX_SPKI_BYTES;
 }
@@ -294,7 +300,7 @@ fun names_valid(names: *identifier.Identifier, len: usize,
     if (len == 0 || len > 100) { ret false; }
     var item_bytes: usize = 0;
     if (!memory_range.size(len, $size_of(identifier.Identifier),
-            ?item_bytes) ||
+        ?item_bytes) ||
         !memory_range.valid(names::*u8, item_bytes)) { ret false; }
     var i: usize = 0;
     for (i < len) {
@@ -364,12 +370,12 @@ pub fun encode_csr(names: *identifier.Identifier, len: usize,
         !memory_range.valid(output.data, output.capacity) ||
         work.capacity > MAX_CSR_BYTES || output.capacity > MAX_CSR_BYTES ||
         memory_range.overlap(work.data, work.capacity, output.data,
-            output.capacity) ||
+        output.capacity) ||
         !signer_valid(signer) || !names_valid(names, len, policy) ||
         memory_range.overlap(work.data, work.capacity,
-            signer.public_key_der.data, signer.public_key_der.len) ||
+        signer.public_key_der.data, signer.public_key_der.len) ||
         memory_range.overlap(output.data, output.capacity,
-            signer.public_key_der.data, signer.public_key_der.len)) {
+        signer.public_key_der.data, signer.public_key_der.len)) {
         ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid certificate request inputs");
     }
@@ -378,9 +384,9 @@ pub fun encode_csr(names: *identifier.Identifier, len: usize,
         ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
             "certificate request work storage is too small");
     }
-    val tbs: view.View = body(?info);
-    var raw: [1024]u8;
-    val signature_len: usize = signer.sign(signer.ctx, tbs.data, tbs.len,
+    val tbs:           view.View = body(?info);
+    var raw:           [1024]u8;
+    val signature_len: usize     = signer.sign(signer.ctx, tbs.data, tbs.len,
         ?raw[0], MAX_SIGNATURE_BYTES);
     if (signature_len == 0 || signature_len > MAX_SIGNATURE_BYTES) {
         ret failed(problem.SIGNING, problem.SIGNATURE_FAILED,
@@ -397,8 +403,8 @@ pub fun encode_csr(names: *identifier.Identifier, len: usize,
         ret failed(problem.SIGNING, problem.SIGNATURE_FAILED,
             "signer returned a signature the algorithm does not admit");
     }
-    var request: Back = back(output);
-    val start: usize = mark(?request);
+    var request:         Back  = back(output);
+    val start:           usize = mark(?request);
     val signature_start: usize = mark(?request);
     if (!prepend(?request, ?raw[0], signature_len)) {
         ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
@@ -415,10 +421,10 @@ pub fun encode_csr(names: *identifier.Identifier, len: usize,
     }
     # the request is built from the end of the buffer, so move it to the front
     val encoded: view.View = body(?request);
-    var i: usize = 0;
+    var i:       usize     = 0;
     for (i < encoded.len) {
         output.data[i] = encoded.data[i];
-        i = i + 1;
+        i              = i + 1;
     }
     ret Operation{error: problem.none(), written: encoded.len,
         value: view.view(output.data, encoded.len)};
@@ -437,33 +443,36 @@ fun reader(value: view.View) Reader {
     ret Reader{data: value.data, len: value.len, pos: 0};
 }
 
-fun reader_done(value: *Reader) bool { ret value.pos == value.len; }
+fun reader_done(value: *Reader) bool {
+    ret value.pos == value.len;
+}
 
 # rejects high-tag-number form, indefinite length, and non-minimal lengths
 fun read_tlv(value: *Reader, tag: *u8, content: *view.View) bool {
     if (value.pos + 2 > value.len) { ret false; }
     val current: u8 = value.data[value.pos];
     if ((current & 0x1f) == 0x1f) { ret false; }
-    var at: usize = value.pos + 1;
-    val first: u8 = value.data[at];
+    var at:    usize = value.pos + 1;
+    val first: u8    = value.data[at];
     at = at + 1;
     var size: usize = 0;
     if (first < 128) {
         size = first::usize;
-    } or {
+    }
+    or {
         val count: usize = (first & 0x7f)::usize;
         if (count == 0 || count > 8 || at + count > value.len) { ret false; }
         var i: usize = 0;
         for (i < count) {
             size = (size << 8) + value.data[at + i]::usize;
-            i = i + 1;
+            i    = i + 1;
         }
         at = at + count;
         if (size < 128) { ret false; }
     }
     if (size > value.len - at) { ret false; }
-    @tag = current;
-    @content = view.view(?value.data[at], size);
+    @tag      = current;
+    @content  = view.view(?value.data[at], size);
     value.pos = at + size;
     ret true;
 }
@@ -474,8 +483,8 @@ fun read_expect(value: *Reader, expected: u8, content: *view.View) bool {
 }
 
 fun skip(value: *Reader, count: usize) bool {
-    var i: usize = 0;
-    var tag: u8 = 0;
+    var i:       usize = 0;
+    var tag:     u8    = 0;
     var content: view.View;
     for (i < count) {
         if (!read_tlv(value, ?tag, ?content)) { ret false; }
@@ -503,7 +512,7 @@ fun days_from_civil(year: i64, month: i64, day: i64) i64 {
     if (month <= 2) { y = y - 1; }
     var era: i64 = y / 400;
     if (y < 0) { era = (y - 399) / 400; }
-    val yoe: i64 = y - era * 400;
+    val yoe:     i64 = y - era * 400;
     var shifted: i64 = month + 9;
     if (month > 2) { shifted = month - 3; }
     val doy: i64 = (153 * shifted + 2) / 5 + day - 1;
@@ -514,24 +523,27 @@ fun days_from_civil(year: i64, month: i64, day: i64) i64 {
 # rfc 5280 requires utctime through 2049 and generalizedtime after, both in
 # zulu with seconds present
 fun read_time(tag: u8, content: view.View, output: *u64) bool {
-    var year: i64 = 0;
-    var at: usize = 0;
+    var year: i64   = 0;
+    var at:   usize = 0;
     if (tag == 0x17) {
         if (content.len != 13 || content.data[12] != 'Z' ||
             !all_digits(content.data, 0, 12)) { ret false; }
         year = digits2(content.data, 0);
         # rfc 5280 section 4.1.2.5.1
-        if (year >= 50) { year = year + 1900; } or { year = year + 2000; }
+        if (year >= 50) { year = year + 1900; }
+        or              { year = year + 2000; }
         at = 2;
-    } or (tag == 0x18) {
+    }
+    or (tag == 0x18) {
         if (content.len != 15 || content.data[14] != 'Z' ||
             !all_digits(content.data, 0, 14)) { ret false; }
         year = digits2(content.data, 0) * 100 + digits2(content.data, 2);
-        at = 4;
-    } or { ret false; }
-    val month: i64 = digits2(content.data, at);
-    val day: i64 = digits2(content.data, at + 2);
-    val hour: i64 = digits2(content.data, at + 4);
+        at   = 4;
+    }
+    or { ret false; }
+    val month:  i64 = digits2(content.data, at);
+    val day:    i64 = digits2(content.data, at + 2);
+    val hour:   i64 = digits2(content.data, at + 4);
     val minute: i64 = digits2(content.data, at + 6);
     val second: i64 = digits2(content.data, at + 8);
     if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 ||
@@ -560,14 +572,14 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
         !memory_range.valid(output::*u8, $size_of(Parsed)) ||
         capacity == 0 ||
         !memory_range.size(capacity, $size_of(identifier.Identifier),
-            ?item_bytes) ||
+        ?item_bytes) ||
         !memory_range.valid(names::*u8, item_bytes) ||
         memory_range.overlap(names::*u8, item_bytes, output::*u8,
-            $size_of(Parsed))) {
+        $size_of(Parsed))) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid certificate parse inputs");
     }
-    var outer: Reader = reader(der);
+    var outer:      Reader = reader(der);
     var body_bytes: view.View;
     if (!read_expect(?outer, TAG_SEQUENCE, ?body_bytes) ||
         !reader_done(?outer)) {
@@ -575,13 +587,13 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
             "certificate is not a single der sequence");
     }
     var certificate: Reader = reader(body_bytes);
-    var tbs_bytes: view.View;
+    var tbs_bytes:   view.View;
     if (!read_expect(?certificate, TAG_SEQUENCE, ?tbs_bytes)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "certificate has no tbsCertificate");
     }
-    var tbs: Reader = reader(tbs_bytes);
-    var tag: u8 = 0;
+    var tbs:     Reader = reader(tbs_bytes);
+    var tag:     u8     = 0;
     var content: view.View;
     if (!read_tlv(?tbs, ?tag, ?content)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
@@ -601,12 +613,12 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "tbsCertificate has no validity");
     }
-    var validity: Reader = reader(validity_bytes);
+    var validity:         Reader = reader(validity_bytes);
     var not_before_bytes: view.View;
-    var not_after_bytes: view.View;
-    var before_tag: u8 = 0;
-    var after_tag: u8 = 0;
-    var result: Parsed;
+    var not_after_bytes:  view.View;
+    var before_tag:       u8     = 0;
+    var after_tag:        u8     = 0;
+    var result:           Parsed;
     if (!read_tlv(?validity, ?before_tag, ?not_before_bytes) ||
         !read_tlv(?validity, ?after_tag, ?not_after_bytes) ||
         !reader_done(?validity) ||
@@ -622,7 +634,7 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
             "tbsCertificate has no subject public key");
     }
     var extensions_bytes: view.View;
-    var found: bool = false;
+    var found:            bool = false;
     for (!reader_done(?tbs) && !found) {
         if (!read_tlv(?tbs, ?tag, ?content)) {
             ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
@@ -630,26 +642,26 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
         }
         if (tag == 0xa3) {
             extensions_bytes = content;
-            found = true;
+            found            = true;
         }
     }
-    result.names = names;
+    result.names    = names;
     result.name_len = 0;
     if (!found) {
         # a certificate with no extensions has no subjectAltName at all
         @output = result;
         ret problem.none();
     }
-    var wrapper: Reader = reader(extensions_bytes);
+    var wrapper:    Reader = reader(extensions_bytes);
     var list_bytes: view.View;
     if (!read_expect(?wrapper, TAG_SEQUENCE, ?list_bytes) ||
         !reader_done(?wrapper)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "certificate extensions are malformed");
     }
-    var extensions: Reader = reader(list_bytes);
-    var san: view.View = view.view(nil, 0);
-    var seen: bool = false;
+    var extensions: Reader    = reader(list_bytes);
+    var san:        view.View = view.view(nil, 0);
+    var seen:       bool      = false;
     for (!reader_done(?extensions)) {
         var extension_bytes: view.View;
         if (!read_expect(?extensions, TAG_SEQUENCE, ?extension_bytes)) {
@@ -682,7 +694,7 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
                 ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
                     "certificate carries more than one subjectAltName");
             }
-            san = value_bytes;
+            san  = value_bytes;
             seen = true;
         }
     }
@@ -690,7 +702,7 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
         @output = result;
         ret problem.none();
     }
-    var san_reader: Reader = reader(san);
+    var san_reader:    Reader = reader(san);
     var general_bytes: view.View;
     if (!read_expect(?san_reader, TAG_SEQUENCE, ?general_bytes) ||
         !reader_done(?san_reader)) {
@@ -698,7 +710,7 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
             "subjectAltName is malformed");
     }
     var general: Reader = reader(general_bytes);
-    var count: usize = 0;
+    var count:   usize  = 0;
     for (!reader_done(?general)) {
         if (!read_tlv(?general, ?tag, ?content)) {
             ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
@@ -714,7 +726,8 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
             if (tag == TAG_DNS_NAME) {
                 names[count] = identifier.Identifier{kind: identifier.DNS,
                     value: content};
-            } or {
+            }
+            or {
                 if (content.len != 4 && content.len != 16) {
                     ret problem.local_code(problem.PROTOCOL,
                         problem.INVALID_INPUT,
@@ -727,7 +740,7 @@ pub fun parse_certificate(der: view.View, names: *identifier.Identifier,
         }
     }
     result.name_len = count;
-    @output = result;
+    @output         = result;
     ret problem.none();
 }
 
@@ -738,7 +751,7 @@ fun same_identifier(certificate_name: identifier.Identifier,
         ret identifier.same(certificate_name, requested);
     }
     # a certificate carries an ip address as raw octets, the order carried text
-    var packed: [16]u8;
+    var packed:     [16]u8;
     var packed_len: usize = 0;
     if (!ip_bytes(requested.value, ?packed[0], ?packed_len) ||
         packed_len != certificate_name.value.len) { ret false; }
@@ -758,13 +771,13 @@ pub fun covers(value: Parsed, requested: *identifier.Identifier,
     if (value.name_len != len || len == 0) { ret false; }
     var item_bytes: usize = 0;
     if (!memory_range.size(len, $size_of(identifier.Identifier),
-            ?item_bytes) ||
+        ?item_bytes) ||
         !memory_range.valid(requested::*u8, item_bytes) ||
         !memory_range.valid(value.names::*u8, item_bytes)) { ret false; }
     var i: usize = 0;
     for (i < len) {
-        var matched: bool = false;
-        var j: usize = 0;
+        var matched: bool  = false;
+        var j:       usize = 0;
         for (j < value.name_len) {
             if (same_identifier(value.names[j], requested[i])) {
                 matched = true;
@@ -808,22 +821,22 @@ pub fun parse_chain(body: view.View, certificates: *Certificate,
         !memory_range.valid(der_storage, der_capacity) || output == nil ||
         !memory_range.valid(output::*u8, $size_of(Chain)) ||
         memory_range.overlap(der_storage, der_capacity, certificates::*u8,
-            item_bytes) ||
+        item_bytes) ||
         memory_range.overlap(der_storage, der_capacity, body.data, body.len) ||
         memory_range.overlap(certificates::*u8, item_bytes, body.data,
-            body.len) ||
+        body.len) ||
         memory_range.overlap(output::*u8, $size_of(Chain), der_storage,
-            der_capacity) ||
+        der_capacity) ||
         memory_range.overlap(output::*u8, $size_of(Chain),
-            certificates::*u8, item_bytes)) {
+        certificates::*u8, item_bytes)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid certificate chain inputs");
     }
-    val begin: str = "-----BEGIN CERTIFICATE-----";
-    val finish: str = "-----END CERTIFICATE-----";
-    var count: usize = 0;
-    var cursor: usize = 0;
-    var used: usize = 0;
+    val begin:   str   = "-----BEGIN CERTIFICATE-----";
+    val finish:  str   = "-----END CERTIFICATE-----";
+    var count:   usize = 0;
+    var cursor:  usize = 0;
+    var used:    usize = 0;
     var encoded: [65536]u8;
     for (cursor < body.len) {
         if (!literal_at(body, cursor, begin, 27)) {
@@ -839,7 +852,7 @@ pub fun parse_chain(body: view.View, certificates: *Certificate,
         }
         cursor = cursor + 27;
         var encoded_len: usize = 0;
-        var closed: bool = false;
+        var closed:      bool  = false;
         for (cursor < body.len && !closed) {
             if (literal_at(body, cursor, finish, 25)) {
                 cursor = cursor + 25;
@@ -857,8 +870,8 @@ pub fun parse_chain(body: view.View, certificates: *Certificate,
                     "certificate chain has a malformed pem body");
             }
             encoded[encoded_len] = current;
-            encoded_len = encoded_len + 1;
-            cursor = cursor + 1;
+            encoded_len          = encoded_len + 1;
+            cursor               = cursor + 1;
         }
         if (!closed || encoded_len == 0) {
             ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
@@ -875,8 +888,9 @@ pub fun parse_chain(body: view.View, certificates: *Certificate,
                 "certificate chain body is not decodable into storage");
         }
         certificates[count] = Certificate{
-            der: view.view(?der_storage[used], written)};
-        used = used + written;
+            der: view.view(?der_storage[used], written)
+        };
+        used  = used + written;
         count = count + 1;
     }
     if (count == 0) {
@@ -902,7 +916,7 @@ pub fun verify_issued(value: Chain, requested: *identifier.Identifier,
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "certificate chain range is invalid");
     }
-    var parsed: Parsed;
+    var parsed:  Parsed;
     val decoded: problem.Error = parse_certificate(value.certificates[0].der,
         names, capacity, ?parsed);
     if (problem.failed(decoded)) { ret decoded; }
@@ -915,7 +929,7 @@ pub fun verify_issued(value: Chain, requested: *identifier.Identifier,
 }
 
 fun base64url_len(len: usize) usize {
-    val whole: usize = len / 3;
+    val whole:     usize = len / 3;
     val remainder: usize = len - whole * 3;
     if (remainder == 0) { ret whole * 4; }
     ret whole * 4 + remainder + 1;
@@ -926,7 +940,7 @@ fun put(output: contracts.Buffer, at: usize, text: str, len: usize) bool {
     var i: usize = 0;
     for (i < len) {
         output.data[at + i] = text[i];
-        i = i + 1;
+        i                   = i + 1;
     }
     ret true;
 }
@@ -943,11 +957,11 @@ pub fun encode_finalize(csr: view.View, output: contracts.Buffer) Operation {
         !memory_range.valid(csr.data, csr.len) || csr.len == 0 ||
         csr.len > MAX_CSR_BYTES ||
         memory_range.overlap(output.data, output.capacity, csr.data,
-            csr.len)) {
+        csr.len)) {
         ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid finalize inputs");
     }
-    val body: usize = base64url_len(csr.len);
+    val body:  usize = base64url_len(csr.len);
     val total: usize = 8 + body + 2;
     if (output.capacity < total) {
         ret failed(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
@@ -958,7 +972,7 @@ pub fun encode_finalize(csr: view.View, output: contracts.Buffer) Operation {
             "finalize preflight disagreed with encoding");
     }
     if (base64.encode_url(csr.data, csr.len, ?output.data[8],
-            output.capacity - 8) != body ||
+        output.capacity - 8) != body ||
         !put(output, 8 + body, "\"}", 2)) {
         ret failed(problem.STATE, problem.INVALID_STATE,
             "finalize encoding disagreed with its preflight");
@@ -970,14 +984,14 @@ fun decimal(output: contracts.Buffer, at: usize, value: u8,
     written: *usize) bool {
     if (value >= 10) {
         if (at + 2 > output.capacity) { ret false; }
-        output.data[at] = ('0'::usize + (value / 10)::usize)::u8;
+        output.data[at]     = ('0'::usize + (value / 10)::usize)::u8;
         output.data[at + 1] = ('0'::usize + (value % 10)::usize)::u8;
-        @written = 2;
+        @written            = 2;
         ret true;
     }
     if (at + 1 > output.capacity) { ret false; }
     output.data[at] = ('0'::usize + value::usize)::u8;
-    @written = 1;
+    @written        = 1;
     ret true;
 }
 
@@ -989,11 +1003,11 @@ pub fun encode_revoke(der: view.View, reason: Reason,
         !memory_range.valid(der.data, der.len) || der.len == 0 ||
         der.len > MAX_CERTIFICATE_BYTES || !reason_valid(reason) ||
         memory_range.overlap(output.data, output.capacity, der.data,
-            der.len)) {
+        der.len)) {
         ret failed(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid revocation inputs");
     }
-    val body: usize = base64url_len(der.len);
+    val body:   usize = base64url_len(der.len);
     var digits: usize = 1;
     if (reason >= 10) { digits = 2; }
     val total: usize = 16 + body + 11 + digits + 1;
@@ -1006,7 +1020,7 @@ pub fun encode_revoke(der: view.View, reason: Reason,
             "revocation preflight disagreed with encoding");
     }
     if (base64.encode_url(der.data, der.len, ?output.data[16],
-            output.capacity - 16) != body ||
+        output.capacity - 16) != body ||
         !put(output, 16 + body, "\",\"reason\":", 11)) {
         ret failed(problem.STATE, problem.INVALID_STATE,
             "revocation encoding disagreed with its preflight");
@@ -1036,8 +1050,9 @@ pub fun begin_finalize(protocol: *client.Client,
             "finalize request has invalid payload binding");
     }
     ret client.begin_signed_bound(protocol, state, client.SignedSpec{
-        url: finalize_url, payload: payload, kid: account_url,
-        use_jwk: false}, signer);
+        url:     finalize_url, payload: payload, kid: account_url,
+        use_jwk: false
+    }, signer);
 }
 
 # rfc 8555 section 7.4.2: the certificate is fetched with post-as-get
@@ -1049,8 +1064,9 @@ pub fun begin_download(protocol: *client.Client,
             "certificate download requires an account url");
     }
     ret client.begin_signed_bound(protocol, state, client.SignedSpec{
-        url: certificate_url, payload: view.view(nil, 0), kid: account_url,
-        use_jwk: false}, signer);
+        url:     certificate_url, payload: view.view(nil, 0), kid: account_url,
+        use_jwk: false
+    }, signer);
 }
 
 # rfc 8555 section 7.6 admits either the account key or the certificate key.
@@ -1069,8 +1085,9 @@ pub fun begin_revoke(protocol: *client.Client, state: *client.SignedRequest,
     var kid: view.View = account_url;
     if (use_certificate_key) { kid = view.view(nil, 0); }
     ret client.begin_signed_bound(protocol, state, client.SignedSpec{
-        url: revoke_url, payload: payload, kid: kid,
-        use_jwk: use_certificate_key}, signer);
+        url:     revoke_url, payload: payload, kid: kid,
+        use_jwk: use_certificate_key
+    }, signer);
 }
 
 pub rec Alternates {
@@ -1136,11 +1153,11 @@ fun scan_link(value: view.View, storage: *u8, capacity: usize, used: *usize,
         var j: usize = 0;
         for (j < target.len) {
             storage[@used + j] = target.data[j];
-            j = j + 1;
+            j                  = j + 1;
         }
         urls[@count] = view.view(?storage[@used], target.len);
-        @used = @used + target.len;
-        @count = @count + 1;
+        @used        = @used + target.len;
+        @count       = @count + 1;
     }
     ret problem.none();
 }
@@ -1158,18 +1175,18 @@ pub fun parse_alternates(response: client.Response, max_url_bytes: usize,
         !memory_range.valid(urls::*u8, item_bytes) ||
         memory_range.overlap(storage, capacity, urls::*u8, item_bytes) ||
         memory_range.overlap(storage, capacity, output::*u8,
-            $size_of(Alternates)) ||
+        $size_of(Alternates)) ||
         memory_range.overlap(urls::*u8, item_bytes, output::*u8,
-            $size_of(Alternates))) {
+        $size_of(Alternates))) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid alternate chain inputs");
     }
-    var used: usize = 0;
+    var used:  usize = 0;
     var count: usize = 0;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (i < response.fields.len) {
         if (field.name_equal(response.fields.items[i].name,
-                view.view("link", 4))) {
+            view.view("link", 4))) {
             val scanned: problem.Error = scan_link(
                 response.fields.items[i].value, storage, capacity, ?used,
                 urls, limit, ?count, max_url_bytes);
@@ -1191,7 +1208,7 @@ pub fun renewal_id_parts(der: view.View, key_id: *view.View,
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "invalid renewal identifier inputs");
     }
-    var outer: Reader = reader(der);
+    var outer:      Reader = reader(der);
     var body_bytes: view.View;
     if (!read_expect(?outer, TAG_SEQUENCE, ?body_bytes) ||
         !reader_done(?outer)) {
@@ -1199,13 +1216,13 @@ pub fun renewal_id_parts(der: view.View, key_id: *view.View,
             "certificate is not a single der sequence");
     }
     var certificate: Reader = reader(body_bytes);
-    var tbs_bytes: view.View;
+    var tbs_bytes:   view.View;
     if (!read_expect(?certificate, TAG_SEQUENCE, ?tbs_bytes)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "certificate has no tbsCertificate");
     }
-    var tbs: Reader = reader(tbs_bytes);
-    var tag: u8 = 0;
+    var tbs:     Reader = reader(tbs_bytes);
+    var tag:     u8     = 0;
     var content: view.View;
     if (!read_tlv(?tbs, ?tag, ?content)) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
@@ -1228,7 +1245,7 @@ pub fun renewal_id_parts(der: view.View, key_id: *view.View,
             "tbsCertificate is malformed before its extensions");
     }
     var extensions_bytes: view.View;
-    var found: bool = false;
+    var found:            bool = false;
     for (!reader_done(?tbs) && !found) {
         if (!read_tlv(?tbs, ?tag, ?content)) {
             ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
@@ -1236,14 +1253,14 @@ pub fun renewal_id_parts(der: view.View, key_id: *view.View,
         }
         if (tag == 0xa3) {
             extensions_bytes = content;
-            found = true;
+            found            = true;
         }
     }
     if (!found) {
         ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
             "certificate has no extensions");
     }
-    var wrapper: Reader = reader(extensions_bytes);
+    var wrapper:    Reader = reader(extensions_bytes);
     var list_bytes: view.View;
     if (!read_expect(?wrapper, TAG_SEQUENCE, ?list_bytes) ||
         !reader_done(?wrapper)) {
@@ -1276,14 +1293,14 @@ pub fun renewal_id_parts(der: view.View, key_id: *view.View,
         if (oid_bytes.len == 3 && oid_bytes.data[0] == 0x55 &&
             oid_bytes.data[1] == 0x1d && oid_bytes.data[2] == 0x23 &&
             tag == TAG_OCTET_STRING) {
-            var aki: Reader = reader(value_bytes);
+            var aki:       Reader = reader(value_bytes);
             var aki_bytes: view.View;
             if (!read_expect(?aki, TAG_SEQUENCE, ?aki_bytes)) {
                 ret problem.local_code(problem.PROTOCOL,
                     problem.INVALID_INPUT,
                     "authority key identifier is malformed");
             }
-            var fields: Reader = reader(aki_bytes);
+            var fields:    Reader = reader(aki_bytes);
             var key_bytes: view.View;
             # [0] keyIdentifier is the first field when present
             if (!read_tlv(?fields, ?tag, ?key_bytes) || tag != 0x80 ||
