@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.2.0] - 2026-09-13
+
+### Changed
+- Migrated to mach 5.0 and mach-std 2.0.0.
+- Dependencies: mach-crypto v0.9.0, mach-http v0.8.0.
+
 ## [0.1.9] - 2026-09-05
 
 ### Changed
