@@ -107,8 +107,6 @@ protocol vector project with:
 ```text
 mach test . --profile debug
 mach test . --profile release
-mach test test/protocol --profile debug
-mach test test/protocol --profile release
 ```
 
 `test/live` is a conformance suite that drives a real ACME authority rather
