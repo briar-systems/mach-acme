@@ -82,16 +82,16 @@ pub rec Error {
 
 pub fun none() Error {
     var result: Error;
-    result.kind = NONE;
-    result.code = OK;
+    result.kind      = NONE;
+    result.code      = OK;
     result.retryable = false;
     ret result;
 }
 
 pub fun local_code(kind: Kind, code: Code, detail: str) Error {
     var result: Error = none();
-    result.kind = kind;
-    result.code = code;
+    result.kind   = kind;
+    result.code   = code;
     result.detail = detail;
     ret result;
 }
@@ -102,10 +102,10 @@ pub fun local(kind: Kind, detail: str) Error {
 
 pub fun http(status: u16, body: view.View, retry_after_seconds: u64) Error {
     var result: Error = local_code(HTTP, HTTP_STATUS, "http response rejected");
-    result.http.status = status;
-    result.http.body = body;
+    result.http.status              = status;
+    result.http.body                = body;
     result.http.retry_after_seconds = retry_after_seconds;
-    result.retryable = status == 408 || status == 425 || status == 429 || status >= 500;
+    result.retryable                = status == 408 || status == 425 || status == 429 || status >= 500;
     ret result;
 }
 
@@ -115,7 +115,7 @@ pub fun acme(value: Problem, status: u16, body: view.View,
     result.kind = PROTOCOL;
     result.code = ACME_PROBLEM;
     if (bad_nonce) {
-        result.code = BAD_NONCE;
+        result.code      = BAD_NONCE;
         result.retryable = true;
     }
     result.problem = value;
