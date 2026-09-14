@@ -8,7 +8,7 @@ use crypto.contracts;
 use http.core.field;
 use http.core.status;
 use J: std.data.json;
-use R: std.types.result;
+use std.types.result.res;
 use std.encoding.base64;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -218,9 +218,9 @@ fun parse_timestamp(value: view.View, output: *u64) bool {
 
 fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
     if (value == nil || value.kind != J.STRING || output == nil) { ret false; }
-    val result: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
-    if (R.is_err[usize, str](result)) { ret false; }
-    val len: usize = R.unwrap_ok[usize, str](result);
+    val result: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+    if (sel result.err) { ret false; }
+    val len: usize = result.ok;
     if (len > maximum) { ret false; }
     @output = len;
     ret true;
@@ -230,9 +230,9 @@ fun decode_timestamp(value: *J.Value, output: *u64) bool {
     var len: usize = 0;
     if (!decoded_len(value, MAX_TIME_BYTES, ?len)) { ret false; }
     var decoded: [64]u8;
-    val result: R.Result[usize, str] = J.value_string_decode(value,
+    val result: res[usize, J.JsonError] = J.value_string_decode(value,
         ?decoded[0], 64);
-    if (R.is_err[usize, str](result)) { ret false; }
+    if (sel result.err) { ret false; }
     ret parse_timestamp(view.view(?decoded[0], len), output);
 }
 

@@ -3,7 +3,7 @@
 use crypto.contracts;
 use crypto.hash;
 use J: std.data.json;
-use R: std.types.result;
+use std.types.result.res;
 use std.encoding.base64;
 use std.sync.atomic;
 use std.system.os;
@@ -47,8 +47,8 @@ pub rec Presentation {
 }
 
 pub def SupportsFun: fun(ptr, identifier.Identifier, u8) bool;
-pub def PresentFun: fun(ptr, identifier.Identifier, Challenge, view.View) R.Result[Presentation, problem.Error];
-pub def CleanupFun: fun(ptr, Presentation) R.Result[bool, problem.Error];
+pub def PresentFun: fun(ptr, identifier.Identifier, Challenge, view.View) res[Presentation, problem.Error];
+pub def CleanupFun: fun(ptr, Presentation) res[bool, problem.Error];
 
 pub rec Provider {
     ctx:      ptr;
@@ -94,13 +94,13 @@ pub fun kind_from_name(value: view.View) u8 {
 fun value_equals(value: *J.Value, expected: *u8) bool {
     if (value == nil || value.kind != J.STRING) { ret false; }
     var decoded: [32]u8;
-    val measured: R.Result[usize, str] = J.value_string_decode(value, nil, 0);
-    if (R.is_err[usize, str](measured)) { ret false; }
-    val len: usize = R.unwrap_ok[usize, str](measured);
+    val measured: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+    if (sel measured.err) { ret false; }
+    val len: usize = measured.ok;
     if (len > 31) { ret false; }
-    val result: R.Result[usize, str] = J.value_string_decode(value,
+    val result: res[usize, J.JsonError] = J.value_string_decode(value,
         ?decoded[0], 32);
-    if (R.is_err[usize, str](result)) { ret false; }
+    if (sel result.err) { ret false; }
     var i: usize = 0;
     for (i < len) {
         if (expected[i] == 0 || decoded[i] != expected[i]) { ret false; }
@@ -509,15 +509,15 @@ pub fun begin(attempt: *Attempt, subject: identifier.Identifier,
     attempt.present_calls = attempt.present_calls + 1;
     attempt.subject = subject;
     attempt.kind = value.typ;
-    val result: R.Result[Presentation, problem.Error] =
+    val result: res[Presentation, problem.Error] =
         attempt.provider.present(attempt.provider.ctx, subject, value,
             key_authorization_value);
-    if (R.is_err[Presentation, problem.Error](result)) {
+    if (sel result.err) {
         attempt.state = ATTEMPT_FAILED;
         leave(attempt);
-        ret R.unwrap_err[Presentation, problem.Error](result);
+        ret result.err;
     }
-    attempt.presentation = R.unwrap_ok[Presentation, problem.Error](result);
+    attempt.presentation = result.ok;
     attempt.state = ATTEMPT_PRESENTED;
     leave(attempt);
     ret problem.none();
@@ -546,15 +546,15 @@ pub fun finish(attempt: *Attempt) problem.Error {
         ret problem.none();
     }
     attempt.cleanup_calls = attempt.cleanup_calls + 1;
-    val result: R.Result[bool, problem.Error] = attempt.provider.cleanup(
+    val result: res[bool, problem.Error] = attempt.provider.cleanup(
         attempt.provider.ctx, attempt.presentation);
     # the attempt is retired either way. a provider that could not withdraw
     # its own state reports that, but is never asked twice.
     attempt.state = ATTEMPT_CLEANED;
     attempt.presentation = Presentation{ctx: nil};
     leave(attempt);
-    if (R.is_err[bool, problem.Error](result)) {
-        ret R.unwrap_err[bool, problem.Error](result);
+    if (sel result.err) {
+        ret result.err;
     }
     ret problem.none();
 }

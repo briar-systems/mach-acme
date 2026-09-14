@@ -9,8 +9,9 @@ use fs: std.filesystem;
 use fixed: std.allocator.fixed;
 use A: std.allocator;
 use IO: std.io.error;
-use O: std.types.option;
-use R: std.types.result;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.error.err;
 use std.sync.atomic;
 use std.sync.thread;
 use J: std.data.json;
@@ -39,7 +40,20 @@ use acme.nonce;
 use acme.problem;
 use acme.storage;
 
-fun equal(first: *u8, second: *u8, len: usize) bool {
+
+
+fun fixed_ok(outcome: err[A.Error]) bool {
+    ret sel outcome.ok;
+}
+
+fun fs_ok(outcome: err[fs.FsError]) bool {
+    ret sel outcome.ok;
+}
+
+fun file_exists(path: str) bool {
+    val present: res[bool, IO.Error] = fs.exists(path);
+    ret (sel present.ok) && present.ok;
+}fun equal(first: *u8, second: *u8, len: usize) bool {
     var i: usize = 0;
     for (i < len) {
         if (first[i] != second[i]) { ret false; }
@@ -2212,34 +2226,34 @@ fun account_store_persist(value: *AccountStore) bool {
     var allocator_bytes: [4096]u8;
     var allocator_state: fixed.FixedState;
     var allocator: A.Allocator;
-    if (O.is_some[*u8](fixed.make(?allocator, ?allocator_state,
+    if (!fixed_ok(fixed.make(?allocator, ?allocator_state,
             ?allocator_bytes[0], 4096))) { ret false; }
-    ret !O.is_some[str](fs.replace_bytes_atomic(?allocator, value.path,
+    ret fs_ok(fs.replace_bytes_atomic(?allocator, value.path,
         ?record[0], 48, 384, 448));
 }
 
 fun account_store_reload(value: *AccountStore) bool {
-    if (!value.persistent || !fs.exists(value.path)) { ret true; }
-    val opened: R.Result[fs.File, IO.Error] = fs.open(value.path);
-    if (R.is_err[fs.File, IO.Error](opened)) { ret false; }
-    var file: fs.File = R.unwrap_ok[fs.File, IO.Error](opened);
+    if (!value.persistent || !file_exists(value.path)) { ret true; }
+    val opened: res[fs.File, IO.Error] = fs.open(value.path);
+    if (sel opened.err) { ret false; }
+    var file: fs.File = opened.ok;
     var record: [49]u8;
     var position: usize = 0;
     var valid: bool = true;
     for (position < 48 && valid) {
-        val read: R.Result[usize, IO.Error] = fs.read(file,
+        val read: res[usize, IO.Error] = fs.read(file,
             ?record[position], 48 - position);
-        if (R.is_err[usize, IO.Error](read)) { valid = false; }
-        or {
-            val count: usize = R.unwrap_ok[usize, IO.Error](read);
+        if (sel read.err) { valid = false; }
+        if (sel read.ok) {
+            val count: usize = read.ok;
             if (count == 0) { valid = false; }
             or { position = position + count; }
         }
     }
     if (valid) {
-        val extra: R.Result[usize, IO.Error] = fs.read(file, ?record[48], 1);
-        valid = !R.is_err[usize, IO.Error](extra) &&
-            R.unwrap_ok[usize, IO.Error](extra) == 0;
+        val extra: res[usize, IO.Error] = fs.read(file, ?record[48], 1);
+        valid = (sel extra.ok) &&
+            extra.ok == 0;
     }
     fs.close(?file);
     if (!valid || position != 48 || !equal(?record[0], "MACACME1", 8) ||
@@ -3144,7 +3158,7 @@ test "storage: persistent provider survives restart and rejects torn state" {
     val first_write: storage.Write = storage.begin_replace(?first_manager,
         current, next);
     if (problem.failed(first_write.error) || first_write.transaction.token == 0 ||
-        !fs.exists(path)) { ret 4; }
+        !file_exists(path)) { ret 4; }
     var restarted: AccountStore;
     restarted.current = current;
     restarted.pending = next;
@@ -3171,7 +3185,7 @@ test "storage: persistent provider survives restart and rejects torn state" {
     }
     var torn: [12]u8;
     copy(?torn[0], "MACACME1", 8);
-    if (O.is_some[str](fs.write_bytes(path, ?torn[0], 12, 384))) { ret 10; }
+    if (!fs_ok(fs.write_bytes(path, ?torn[0], 12, 384))) { ret 10; }
     recovered.status = 91;
     if (storage.recover(?restarted_manager, current.account.url,
             ?recovered).code != problem.STORAGE_FAILED ||
@@ -3611,7 +3625,7 @@ fun counting_supports(ctx: ptr, subject: identifier.Identifier,
 
 fun counting_present(ctx: ptr, subject: identifier.Identifier,
     value: challenge.Challenge,
-    key_authorization: view.View) R.Result[challenge.Presentation, problem.Error] {
+    key_authorization: view.View) res[challenge.Presentation, problem.Error] {
     val state: *CountingProvider = ctx::*CountingProvider;
     state.present_calls = state.present_calls + 1;
     state.seen_len = key_authorization.len;
@@ -3625,24 +3639,21 @@ fun counting_present(ctx: ptr, subject: identifier.Identifier,
         state.reentered = problem.failed(challenge.finish(state.reenter));
     }
     if (state.fail_present) {
-        ret R.err[challenge.Presentation, problem.Error](
-            problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
-                "provider could not publish"));
+        ret res[challenge.Presentation, problem.Error].err{problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
+                "provider could not publish")};
     }
-    ret R.ok[challenge.Presentation, problem.Error](
-        challenge.Presentation{ctx: ctx});
+    ret res[challenge.Presentation, problem.Error].ok{challenge.Presentation{ctx: ctx}};
 }
 
 fun counting_cleanup(ctx: ptr,
-    presentation: challenge.Presentation) R.Result[bool, problem.Error] {
+    presentation: challenge.Presentation) res[bool, problem.Error] {
     val state: *CountingProvider = ctx::*CountingProvider;
     state.cleanup_calls = state.cleanup_calls + 1;
     if (state.fail_cleanup) {
-        ret R.err[bool, problem.Error](
-            problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
-                "provider could not withdraw"));
+        ret res[bool, problem.Error].err{problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
+                "provider could not withdraw")};
     }
-    ret R.ok[bool, problem.Error](true);
+    ret res[bool, problem.Error].ok{true};
 }
 
 fun counting_provider(state: *CountingProvider) challenge.Provider {
@@ -4499,19 +4510,19 @@ test "certificate: private key and chain replacement is transactional" {
 }
 
 fun read_raw(path: *u8, buffer: *u8, capacity: usize, len: *usize) bool {
-    val opened: R.Result[fs.File, IO.Error] = fs.open(path);
-    if (R.is_err[fs.File, IO.Error](opened)) { ret false; }
-    var file: fs.File = R.unwrap_ok[fs.File, IO.Error](opened);
+    val opened: res[fs.File, IO.Error] = fs.open(path);
+    if (sel opened.err) { ret false; }
+    var file: fs.File = opened.ok;
     var total: usize = 0;
     var reading: bool = true;
     for (reading) {
-        val received: R.Result[usize, IO.Error] = fs.read(file, ?buffer[total],
+        val received: res[usize, IO.Error] = fs.read(file, ?buffer[total],
             capacity - total);
-        if (R.is_err[usize, IO.Error](received)) {
+        if (sel received.err) {
             fs.close(?file);
             ret false;
         }
-        val count: usize = R.unwrap_ok[usize, IO.Error](received);
+        val count: usize = received.ok;
         if (count == 0 || total + count == capacity) { reading = false; }
         total = total + count;
     }
@@ -4542,9 +4553,9 @@ test "file store: documents are versioned, checksummed, and atomically replaced"
         file_store.needs_migration(document)) { ret 4; }
 
     # durable acme state includes account keys, so the file is owner-only
-    val meta: R.Result[fs.Metadata, str] = fs.metadata(path);
-    if (R.is_err[fs.Metadata, str](meta)) { ret 5; }
-    var found: fs.Metadata = R.unwrap_ok[fs.Metadata, str](meta);
+    val meta: res[fs.Metadata, IO.Error] = fs.metadata(path);
+    if (sel meta.err) { ret 5; }
+    var found: fs.Metadata = meta.ok;
     if ((found.mode & 511) != 384) { ret 6; }
 
     # a document is refused when it names a different record kind
@@ -4557,28 +4568,28 @@ test "file store: documents are versioned, checksummed, and atomically replaced"
     if (!read_raw(path, ?raw[0], 8192, ?raw_len) ||
         raw_len != file_store.HEADER_BYTES + 18) { ret 8; }
     raw[file_store.HEADER_BYTES + 3] = raw[file_store.HEADER_BYTES + 3] ^ 1;
-    if (O.is_some[str](fs.write_bytes(path, ?raw[0], raw_len, 384))) { ret 9; }
+    if (!fs_ok(fs.write_bytes(path, ?raw[0], raw_len, 384))) { ret 9; }
     if (file_store.read_document(path, file_store.DOC_ORDER, ?buffer[0], 8192,
             ?document).code != problem.STORAGE_FAILED) { ret 10; }
 
     # a truncated document, a wrong magic, and a future schema version are all
     # refused rather than partly believed
     raw[file_store.HEADER_BYTES + 3] = raw[file_store.HEADER_BYTES + 3] ^ 1;
-    if (O.is_some[str](fs.write_bytes(path, ?raw[0], raw_len - 4, 384)) ||
+    if (!fs_ok(fs.write_bytes(path, ?raw[0], raw_len - 4, 384)) ||
         !problem.failed(file_store.read_document(path, file_store.DOC_ORDER,
             ?buffer[0], 8192, ?document))) { ret 11; }
-    if (O.is_some[str](fs.write_bytes(path, ?raw[0], 20, 384)) ||
+    if (!fs_ok(fs.write_bytes(path, ?raw[0], 20, 384)) ||
         !problem.failed(file_store.read_document(path, file_store.DOC_ORDER,
             ?buffer[0], 8192, ?document))) { ret 12; }
     var broken: [8192]u8;
     copy(?broken[0], ?raw[0], raw_len);
     broken[0] = 'X';
-    if (O.is_some[str](fs.write_bytes(path, ?broken[0], raw_len, 384)) ||
+    if (!fs_ok(fs.write_bytes(path, ?broken[0], raw_len, 384)) ||
         !problem.failed(file_store.read_document(path, file_store.DOC_ORDER,
             ?buffer[0], 8192, ?document))) { ret 13; }
     copy(?broken[0], ?raw[0], raw_len);
     broken[11] = 99;
-    if (O.is_some[str](fs.write_bytes(path, ?broken[0], raw_len, 384)) ||
+    if (!fs_ok(fs.write_bytes(path, ?broken[0], raw_len, 384)) ||
         !problem.failed(file_store.read_document(path, file_store.DOC_ORDER,
             ?buffer[0], 8192, ?document))) { ret 14; }
 
@@ -4587,7 +4598,7 @@ test "file store: documents are versioned, checksummed, and atomically replaced"
     # to encode the document but too small for the replacement's own
     # temporary-path storage, so the write fails before the destination is
     # touched, which is the path a full disk would also take.
-    if (O.is_some[str](fs.write_bytes(path, ?raw[0], raw_len, 384))) { ret 15; }
+    if (!fs_ok(fs.write_bytes(path, ?raw[0], raw_len, 384))) { ret 15; }
     val locked: *u8 = "/tmp/mach-acme-preserve.bin";
     fs.remove_file(locked);
     if (problem.failed(file_store.write_document(locked,
@@ -4625,7 +4636,7 @@ test "file store: documents are versioned, checksummed, and atomically replaced"
     copy(?broken[0], ?raw[0], raw_len);
     broken[file_store.HEADER_BYTES + 1] =
         broken[file_store.HEADER_BYTES + 1] ^ 0xff;
-    if (O.is_some[str](fs.write_bytes(backup, ?broken[0], raw_len, 384))) {
+    if (!fs_ok(fs.write_bytes(backup, ?broken[0], raw_len, 384))) {
         ret 26;
     }
     if (!problem.failed(file_store.copy_document(backup, locked,
@@ -4805,7 +4816,7 @@ test "file store: durable records survive restart and an interrupted write" {
     var raw_len: usize = 0;
     if (!read_raw(account_path, ?raw[0], 8192, ?raw_len)) { ret 27; }
     raw[file_store.HEADER_BYTES + 2] = raw[file_store.HEADER_BYTES + 2] ^ 0xff;
-    if (O.is_some[str](fs.write_bytes(account_path, ?raw[0], raw_len, 384))) {
+    if (!fs_ok(fs.write_bytes(account_path, ?raw[0], raw_len, 384))) {
         ret 28;
     }
     var corrupt: file_store.Store;

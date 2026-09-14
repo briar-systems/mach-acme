@@ -1,10 +1,11 @@
 out/
-dep/
-.DS_Store
-.claude/
+test/*/dep/
+test/*/out/
 *.swp
-*.swo
 *~
-.tools/
 .wt/
 .mach-seed/
+.mach-txn-lock
+.DS_Store
+.claude/
+.tools/
