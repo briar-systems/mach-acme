@@ -490,6 +490,27 @@ fun pool_secret_disjoint(snapshot: nonce.Pool, client: *Client,
     ret problem.none();
 }
 
+# the client carries the callback lock word, which other threads change between
+# any two unlocked reads, so its integrity is checked field by field under the lock
+fun pool_client_disjoint(snapshot: nonce.Pool, client: *Client,
+    request: *SignedRequest) problem.Error {
+    if (!callback_begin(client)) {
+        ret callback_error("nonce ownership callback is reentrant");
+    }
+    val client_before:  Client        = @client;
+    val request_before: SignedRequest = @request;
+    val owned:          bool          = snapshot.aliases(snapshot.ctx,
+        client::*u8, $size_of(Client));
+    if (!callback_end(client, client_before, request, request_before)) {
+        ret callback_error("nonce ownership callback mutated protocol state");
+    }
+    if (owned) {
+        ret problem.local_code(problem.PROTOCOL, problem.INVALID_INPUT,
+            "nonce provider storage aliases protocol-owned storage");
+    }
+    ret problem.none();
+}
+
 fun pool_ready_snapshot(client: *Client, request: *SignedRequest,
     output: *nonce.Pool) problem.Error {
     if (client == nil || request == nil || output == nil ||
@@ -497,8 +518,8 @@ fun pool_ready_snapshot(client: *Client, request: *SignedRequest,
         ret callback_error("nonce pool descriptor is invalid");
     }
     val snapshot:        nonce.Pool    = client.nonces;
-    val client_disjoint: problem.Error = pool_range_disjoint(snapshot, client,
-        request, client::*u8, $size_of(Client));
+    val client_disjoint: problem.Error = pool_client_disjoint(snapshot, client,
+        request);
     if (problem.failed(client_disjoint)) { ret client_disjoint; }
     val request_disjoint: problem.Error = pool_range_disjoint(snapshot, client,
         request, request::*u8, $size_of(SignedRequest));
