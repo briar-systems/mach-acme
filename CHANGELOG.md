@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.2.1] - 2026-09-15
+
+### Fixed
+- Concurrent requests on one client no longer fail about 3% of the time as a mutated protocol state. The nonce provider ownership check hashed the client's own callback lock word, which other threads change (#51).
+
+### Changed
+- Dependencies: mach-crypto v0.9.1, mach-http v0.8.2.
+- The protocol tests are part of the root test set (#48).
+
+## [0.2.0] - 2026-09-13
+
+### Changed
+- Migrated to mach 5.0 and mach-std 2.0.0.
+- Dependencies: mach-crypto v0.9.0, mach-http v0.8.0.
+
 ## [0.1.9] - 2026-09-05
 
 ### Changed

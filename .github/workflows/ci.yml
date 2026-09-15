@@ -35,7 +35,6 @@ jobs:
         run: |
           set -euo pipefail
           mach dep pull .
-          mach dep pull test/protocol
           mach dep pull test/live
 
       - name: Build
@@ -46,12 +45,6 @@ jobs:
 
       - name: Test (release)
         run: mach test . --profile release
-
-      - name: Test the protocol vector project
-        run: mach test test/protocol --profile debug
-
-      - name: Test the protocol vector project (release)
-        run: mach test test/protocol --profile release
 
       # test/live drives a real ACME authority on loopback rather than a
       # fixture, so it is the only leg that proves the wire behaviour end to
