@@ -5,7 +5,7 @@
 ## [0.2.1] - 2026-09-15
 
 ### Changed
-- Dependencies: mach-crypto v0.9.1, mach-http v0.8.1.
+- Dependencies: mach-crypto v0.9.1, mach-http v0.8.2.
 - The protocol tests are part of the root test set (#48).
 
 ## [0.2.0] - 2026-09-13
