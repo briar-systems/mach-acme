@@ -273,8 +273,9 @@ owner-only and their directories owner-only.
 
 > **Known issue:** on Windows, state files and directories are not yet owner-only.
 > mach-std does not enforce file modes there, so key files get the default
-> inherited permissions. Tracked in #57, with the fix coming in
-> briar-systems/mach-std#703.
+> inherited permissions. Tracked in
+> [#57](https://github.com/briar-systems/mach-acme/issues/57), with the fix coming in
+> [briar-systems/mach-std#703](https://github.com/briar-systems/mach-std/issues/703).
 
 `read_document` validates the magic, the schema version, the record kind, the
 declared length, and the payload digest before publishing any payload. A
