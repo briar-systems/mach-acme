@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Security
+- Known issue: on Windows, durable state files are not yet owner-only because mach-std does not enforce file modes there. The README discloses it until the std fix lands (#57).
+
 ### Changed
 - CI runs the shared family pipeline from briar-systems/.github, with the live ACME suite as a subproject and a single `gate` check (#53).
 
