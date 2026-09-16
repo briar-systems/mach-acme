@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- CI runs the shared family pipeline from briar-systems/.github, with the live ACME suite as a subproject and a single `gate` check (#53).
+
 ## [0.2.1] - 2026-09-15
 
 ### Fixed
