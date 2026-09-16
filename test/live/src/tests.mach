@@ -6,28 +6,8 @@
 # suite speaks http/1.1 over a blocking socket. every acme byte, url, status,
 # and header still comes from and returns to the real server.
 
-use std.runtime;
-use http.core.field;
-use http.core.method;
-use http.core.status;
-use std.types.result.res;
-use T: std.chrono.time;
-use std.net.ip;
-use std.net.tcp;
-use IO: std.io.error;
-use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
-use std.types.size.usize;
-use std.types.string.str;
-use std.types.view;
-use crypto.contracts;
-use crypto.group.p256;
-use crypto.signature;
-use acme.certificate;
-use acme.renewal;
-use acme.renewal_info;
 use acme.account;
+use acme.certificate;
 use acme.challenge;
 use acme.client;
 use acme.external_account;
@@ -37,10 +17,30 @@ use acme.nonce;
 use acme.order;
 use acme.poll;
 use acme.problem;
+use acme.renewal;
+use acme.renewal_info;
+use crypto.contracts;
+use crypto.group.p256;
+use crypto.signature;
+use http.core.field;
+use http.core.method;
+use http.core.status;
+use T:  std.chrono.time;
+use IO: std.io.error;
+use std.net.ip;
+use std.net.tcp;
+use std.runtime;
 use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
 
-val ACME_PORT:      u16 = 14001;
-val MANAGE_PORT:    u16 = 8055;
+val ACME_PORT:      u16   = 14001;
+val MANAGE_PORT:    u16   = 8055;
 val MAX_BODY_BYTES: usize = 65536;
 val MAX_FIELDS:     usize = 64;
 
@@ -63,7 +63,7 @@ fun copy(destination: *u8, source: *u8, len: usize) {
     var i: usize = 0;
     for (i < len) {
         destination[i] = source[i];
-        i = i + 1;
+        i              = i + 1;
     }
 }
 
@@ -95,17 +95,17 @@ fun put_text(writer: *Writer, text: *u8) bool {
 }
 
 fun put_number(writer: *Writer, value: usize) bool {
-    var digits: [24]u8;
-    var count: usize = 0;
+    var digits:    [24]u8;
+    var count:     usize = 0;
     var remaining: usize = value;
     if (remaining == 0) {
         digits[0] = '0';
-        count = 1;
+        count     = 1;
     }
     for (remaining != 0) {
         digits[count] = ('0'::usize + remaining % 10)::u8;
-        remaining = remaining / 10;
-        count = count + 1;
+        remaining     = remaining / 10;
+        count         = count + 1;
     }
     var i: usize = 0;
     for (i < count) {
@@ -131,13 +131,15 @@ fun split_url(url: view.View, host: *view.View, path: *view.View) bool {
 }
 
 fun method_name(value: method.Method) *u8 {
-    if (value.kind == method.GET) { ret "GET"; }
+    if (value.kind == method.GET)  { ret "GET"; }
     if (value.kind == method.HEAD) { ret "HEAD"; }
     if (value.kind == method.POST) { ret "POST"; }
     ret nil;
 }
 
-fun digit_value(value: u8) bool { ret value >= '0' && value <= '9'; }
+fun digit_value(value: u8) bool {
+    ret value >= '0' && value <= '9';
+}
 
 fun parse_status(data: *u8, len: usize, output: *u16) usize {
     if (len < 12 || data[0] != 'H' || data[1] != 'T' || data[2] != 'T' ||
@@ -160,7 +162,7 @@ fun parse_status(data: *u8, len: usize, output: *u16) usize {
 
 fun trim(data: *u8, start: usize, finish: usize, output: *view.View) {
     var first: usize = start;
-    var last: usize = finish;
+    var last:  usize = finish;
     for (first < last && (data[first] == ' ' || data[first] == '\t')) {
         first = first + 1;
     }
@@ -172,11 +174,11 @@ fun trim(data: *u8, start: usize, finish: usize, output: *view.View) {
 
 fun parse_number(value: view.View) usize {
     var total: usize = 0;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (i < value.len) {
         if (!digit_value(value.data[i])) { ret 0; }
         total = total * 10 + (value.data[i] - '0')::usize;
-        i = i + 1;
+        i     = i + 1;
     }
     ret total;
 }
@@ -189,10 +191,10 @@ fun name_is(value: view.View, expected: *u8) bool {
 # the offset of the body plus its declared length
 fun parse_headers(exchange: *Exchange, start: usize, body_at: *usize,
     body_len: *usize, chunked: *bool) bool {
-    var i: usize = start;
-    var declared: usize = 0;
-    var has_length: bool = false;
-    @chunked = false;
+    var i:          usize = start;
+    var declared:   usize = 0;
+    var has_length: bool  = false;
+    @chunked        = false;
     exchange.fields = field.init(?exchange.items[0], MAX_FIELDS,
         field.limits(MAX_FIELDS, 65536, 256, 8192));
     for (true) {
@@ -200,7 +202,10 @@ fun parse_headers(exchange: *Exchange, start: usize, body_at: *usize,
         if (exchange.storage[i] == '\r' && exchange.storage[i + 1] == '\n') {
             @body_at = i + 2;
             if (@chunked) { ret true; }
-            if (!has_length) { @body_len = 0; ret true; }
+            if (!has_length) {
+                @body_len = 0;
+                ret true;
+            }
             @body_len = declared;
             ret true;
         }
@@ -213,21 +218,21 @@ fun parse_headers(exchange: *Exchange, start: usize, body_at: *usize,
         var finish: usize = colon;
         for (finish + 1 < exchange.len &&
             !(exchange.storage[finish] == '\r' &&
-                exchange.storage[finish + 1] == '\n')) {
+            exchange.storage[finish + 1] == '\n')) {
             finish = finish + 1;
         }
-        if (finish + 1 >= exchange.len) { ret false; }
+        if (finish + 1 >= exchange.len)        { ret false; }
         if (exchange.fields.len >= MAX_FIELDS) { ret false; }
-        var name: view.View;
+        var name:  view.View;
         var value: view.View;
         trim(?exchange.storage[0], i, colon, ?name);
         trim(?exchange.storage[0], colon + 1, finish, ?value);
         exchange.items[exchange.fields.len] = field.Field{name: name,
             value: value, sensitive: false};
-        exchange.fields.len = exchange.fields.len + 1;
+        exchange.fields.len   = exchange.fields.len + 1;
         exchange.fields.bytes = exchange.fields.bytes + name.len + value.len;
         if (name_is(name, "content-length")) {
-            declared = parse_number(value);
+            declared   = parse_number(value);
             has_length = true;
         }
         if (name_is(name, "transfer-encoding")) { @chunked = true; }
@@ -237,7 +242,10 @@ fun parse_headers(exchange: *Exchange, start: usize, body_at: *usize,
 }
 
 fun hex_value(value: u8, output: *usize) bool {
-    if (value >= '0' && value <= '9') { @output = (value - '0')::usize; ret true; }
+    if (value >= '0' && value <= '9') {
+        @output = (value - '0')::usize;
+        ret true;
+    }
     if (value >= 'a' && value <= 'f') {
         @output = (value - 'a')::usize + 10;
         ret true;
@@ -251,18 +259,18 @@ fun hex_value(value: u8, output: *usize) bool {
 
 # rewrites a chunked body in place so the exchange exposes one contiguous view
 fun dechunk(exchange: *Exchange, body_at: usize, output: *usize) bool {
-    var read: usize = body_at;
+    var read:  usize = body_at;
     var write: usize = body_at;
     for (true) {
-        var size: usize = 0;
-        var digits: usize = 0;
-        var terminated: bool = false;
+        var size:       usize = 0;
+        var digits:     usize = 0;
+        var terminated: bool  = false;
         for (read < exchange.len && !terminated) {
             var value: usize = 0;
             if (!hex_value(exchange.storage[read], ?value)) { ret false; }
-            size = size * 16 + value;
+            size   = size * 16 + value;
             digits = digits + 1;
-            read = read + 1;
+            read   = read + 1;
             if (read + 1 < exchange.len && exchange.storage[read] == '\r' &&
                 exchange.storage[read + 1] == '\n') { terminated = true; }
         }
@@ -276,10 +284,10 @@ fun dechunk(exchange: *Exchange, body_at: usize, output: *usize) bool {
         var i: usize = 0;
         for (i < size) {
             exchange.storage[write + i] = exchange.storage[read + i];
-            i = i + 1;
+            i                           = i + 1;
         }
         write = write + size;
-        read = read + size + 2;
+        read  = read + size + 2;
     }
     ret false;
 }
@@ -306,14 +314,14 @@ pub fun execute(request: client.WireRequest, exchange: *Exchange) bool {
     if (!split_url(request.url, ?host, ?path)) { ret false; }
     val name: *u8 = method_name(request.method);
     if (name == nil) { ret false; }
-    var head: [8192]u8;
+    var head:   [8192]u8;
     var writer: Writer = Writer{data: ?head[0], cap: 8192, pos: 0};
     if (!put_text(?writer, name) || !put_text(?writer, " ") ||
         !put(?writer, path.data, path.len) ||
         !put_text(?writer, " HTTP/1.1\r\nHost: ") ||
         !put(?writer, host.data, host.len) ||
         !put_text(?writer,
-            "\r\nUser-Agent: mach-acme-live/0.1\r\nConnection: close\r\n")) {
+        "\r\nUser-Agent: mach-acme-live/0.1\r\nConnection: close\r\n")) {
         ret false;
     }
     if (request.content_type.len != 0 &&
@@ -352,15 +360,16 @@ pub fun execute(request: client.WireRequest, exchange: *Exchange) bool {
     val header_at: usize = parse_status(?exchange.storage[0], exchange.len,
         ?exchange.status);
     if (header_at == 0) { ret false; }
-    var body_at: usize = 0;
+    var body_at:  usize = 0;
     var body_len: usize = 0;
-    var chunked: bool = false;
+    var chunked:  bool  = false;
     if (!parse_headers(exchange, header_at, ?body_at, ?body_len, ?chunked)) {
         ret false;
     }
     if (chunked) {
         if (!dechunk(exchange, body_at, ?body_len)) { ret false; }
-    } or {
+    }
+    or {
         if (body_at + body_len > exchange.len) { ret false; }
     }
     exchange.body = view.view(nil, 0);
@@ -383,7 +392,7 @@ fun all_digits(value: view.View) bool {
 
 fun month_index(data: *u8) i64 {
     val names: *u8 = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    var i: i64 = 0;
+    var i:     i64 = 0;
     for (i < 12) {
         val at: usize = (i * 3)::usize;
         if (names[at] == data[0] && names[at + 1] == data[1] &&
@@ -404,7 +413,7 @@ fun days_from_civil(year: i64, month: i64, day: i64) i64 {
     if (month <= 2) { y = y - 1; }
     var era: i64 = y / 400;
     if (y < 0) { era = (y - 399) / 400; }
-    val yoe: i64 = y - era * 400;
+    val yoe:     i64 = y - era * 400;
     var shifted: i64 = month + 9;
     if (month > 2) { shifted = month - 3; }
     val doy: i64 = (153 * shifted + 2) / 5 + day - 1;
@@ -428,8 +437,8 @@ fun parse_http_date(value: view.View, output: *i64) bool {
     val year: i64 = ((value.data[12] - '0')::i64) * 1000 +
         ((value.data[13] - '0')::i64) * 100 +
         ((value.data[14] - '0')::i64) * 10 + (value.data[15] - '0')::i64;
-    val day: i64 = two_digits(?value.data[5]);
-    val hour: i64 = two_digits(?value.data[17]);
+    val day:    i64 = two_digits(?value.data[5]);
+    val hour:   i64 = two_digits(?value.data[17]);
     val minute: i64 = two_digits(?value.data[20]);
     val second: i64 = two_digits(?value.data[23]);
     if (day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60) {
@@ -457,10 +466,10 @@ fun header(exchange: *Exchange, name: *u8, output: *view.View) bool {
 fun retry_after(exchange: *Exchange) u64 {
     var advised: view.View;
     if (!header(exchange, "retry-after", ?advised)) { ret 0; }
-    if (all_digits(advised)) { ret parse_number(advised)::u64; }
-    var origin: view.View;
+    if (all_digits(advised))                        { ret parse_number(advised)::u64; }
+    var origin:   view.View;
     var deadline: i64 = 0;
-    var now: i64 = 0;
+    var now:      i64 = 0;
     if (!header(exchange, "date", ?origin) ||
         !parse_http_date(advised, ?deadline) ||
         !parse_http_date(origin, ?now) || deadline <= now) { ret 0; }
@@ -473,21 +482,21 @@ pub fun response(exchange: *Exchange) client.Response {
 }
 
 test "live: the harness reaches a real acme directory over http/1.1" {
-    var exchange: Exchange;
-    val configured: client.Limits = client.limits_default();
-    val discovery: client.WireRequest = client.discovery_request(
+    var exchange:   Exchange;
+    val configured: client.Limits      = client.limits_default();
+    val discovery:  client.WireRequest = client.discovery_request(
         view.view("https://127.0.0.1:14001/dir", 27), configured);
-    if (problem.failed(discovery.error)) { ret 1; }
-    if (!execute(discovery, ?exchange)) { ret 2; }
+    if (problem.failed(discovery.error))                        { ret 1; }
+    if (!execute(discovery, ?exchange))                         { ret 2; }
     if (exchange.status != status.OK || exchange.body.len == 0) { ret 3; }
-    var scratch: [65536]u8;
-    var text: [16384]u8;
-    var caa: [8]view.View;
+    var scratch:   [65536]u8;
+    var text:      [16384]u8;
+    var caa:       [8]view.View;
     var directory: client.Directory;
-    val parsed: problem.Error = client.parse_directory(response(?exchange),
+    val parsed:    problem.Error = client.parse_directory(response(?exchange),
         configured, ?scratch[0], 65536,
         client.DirectoryStorage{data: ?text[0], capacity: 16384,
-            caa_items: ?caa[0], caa_capacity: 8}, ?directory);
+        caa_items: ?caa[0], caa_capacity: 8}, ?directory);
     if (problem.failed(parsed)) { ret 4; }
     if (directory.new_nonce_url.len == 0 ||
         directory.new_account_url.len == 0 ||
@@ -498,26 +507,26 @@ test "live: the harness reaches a real acme directory over http/1.1" {
 # an authenticated session against the live authority: account key, replay
 # nonce pool, discovered directory, and the registered account url
 rec Session {
-    protocol:      client.Client;
-    pool:          nonce.Pool;
-    memory:        nonce.Memory;
-    slots:         [8]nonce.Slot;
-    nonce_bytes:   [1024]u8;
-    directory:     client.Directory;
+    protocol:       client.Client;
+    pool:           nonce.Pool;
+    memory:         nonce.Memory;
+    slots:          [8]nonce.Slot;
+    nonce_bytes:    [1024]u8;
+    directory:      client.Directory;
     directory_text: [8192]u8;
-    caa:           [8]view.View;
-    public_key:    jose.PublicKey;
-    private_key:   jose.PrivateKey;
-    private_bytes: [32]^u8;
-    public_bytes:  [65]u8;
-    account:       account.Account;
-    account_text:  [4096]u8;
-    contacts:      [8]view.View;
-    scratch:       [32768]u8;
-    work:          [8192]u8;
-    body:          [8192]u8;
-    problem_text:  [4096]u8;
-    subproblems:   [8]problem.Subproblem;
+    caa:            [8]view.View;
+    public_key:     jose.PublicKey;
+    private_key:    jose.PrivateKey;
+    private_bytes:  [32]^u8;
+    public_bytes:   [65]u8;
+    account:        account.Account;
+    account_text:   [4096]u8;
+    contacts:       [8]view.View;
+    scratch:        [32768]u8;
+    work:           [8192]u8;
+    body:           [8192]u8;
+    problem_text:   [4096]u8;
+    subproblems:    [8]problem.Subproblem;
 }
 
 fun set_private(output: *^u8) {
@@ -530,14 +539,15 @@ fun set_private(output: *^u8) {
     var i: usize = 0;
     for (i < 32) {
         output[i] = value[i];
-        i = i + 1;
+        i         = i + 1;
     }
 }
 
 fun session_keys(session: *Session) bool {
     set_private(?session.private_bytes[0]);
     val secret: contracts.SecretBytes = contracts.SecretBytes{
-        data: ?session.private_bytes[0], len: 32};
+        data: ?session.private_bytes[0], len: 32
+    };
     val derived: contracts.Operation = p256.derive_public(secret,
         contracts.Buffer{data: ?session.public_bytes[0], capacity: 65});
     if (derived.error != contracts.OK) { ret false; }
@@ -556,10 +566,10 @@ fun problem_storage(session: *Session) client.ProblemStorage {
 fun session_begin(session: *Session, exchange: *Exchange) bool {
     if (!session_keys(session)) { ret false; }
     if (problem.failed(nonce.init_memory(?session.memory, ?session.slots[0], 8,
-            ?session.nonce_bytes[0], 1024, 128))) { ret false; }
+        ?session.nonce_bytes[0], 1024, 128))) { ret false; }
     session.pool = nonce.pool(?session.memory);
     if (problem.failed(client.init(?session.protocol, ?session.pool,
-            client.limits_default()))) { ret false; }
+        client.limits_default()))) { ret false; }
     val discovery: client.WireRequest = client.discovery_request(
         view.view("https://127.0.0.1:14001/dir", 27),
         client.limits_default());
@@ -567,7 +577,7 @@ fun session_begin(session: *Session, exchange: *Exchange) bool {
     ret !problem.failed(client.parse_directory(response(exchange),
         client.limits_default(), ?session.scratch[0], 32768,
         client.DirectoryStorage{data: ?session.directory_text[0],
-            capacity: 8192, caa_items: ?session.caa[0], caa_capacity: 8},
+        capacity: 8192, caa_items: ?session.caa[0], caa_capacity: 8},
         ?session.directory));
 }
 
@@ -583,7 +593,7 @@ fun run_signed(session: *Session, request: *client.SignedRequest,
                 ?session.protocol, session.directory);
             if (!execute(head, exchange)) { ret false; }
             if (problem.failed(client.accept_nonce_response(?session.protocol,
-                    request, response(exchange)))) { ret false; }
+                request, response(exchange)))) { ret false; }
         }
         val signed: jose.Operation = client.prepare_signed(?session.protocol,
             request, jose.signer(session.public_key), session.private_key,
@@ -610,35 +620,35 @@ fun run_signed(session: *Session, request: *client.SignedRequest,
 
 fun account_limits() account.Limits {
     ret account.Limits{max_response_bytes: 65536, max_json_scratch: 32768,
-        max_json_depth: 16, max_json_values: 4096, max_json_key_bytes: 128,
+        max_json_depth:           16, max_json_values: 4096, max_json_key_bytes: 128,
         max_json_key_comparisons: 65536, max_url_bytes: 4096,
-        max_contacts: 8, max_contact_bytes: 4096,
-        response_fields: field.limits(64, 65536, 256, 8192)};
+        max_contacts:             8, max_contact_bytes: 4096,
+        response_fields:          field.limits(64, 65536, 256, 8192)};
 }
 
 # registers the session's account key and retains the returned account url
 fun session_account(session: *Session, exchange: *Exchange) bool {
     var payload: [1024]u8;
-    var wanted: account.Request;
-    wanted.contacts = nil;
-    wanted.contact_len = 0;
-    wanted.terms_of_service_agreed = true;
-    wanted.only_return_existing = false;
+    var wanted:  account.Request;
+    wanted.contacts                 = nil;
+    wanted.contact_len              = 0;
+    wanted.terms_of_service_agreed  = true;
+    wanted.only_return_existing     = false;
     wanted.external_account_binding = external_account.none();
     val encoded: account.Operation = account.encode(account.CREATE, wanted,
         contracts.Buffer{data: ?payload[0], capacity: 1024});
     if (problem.failed(encoded.error)) { ret false; }
     var request: client.SignedRequest;
     if (problem.failed(account.begin(?session.protocol, ?request,
-            account.CREATE, session.directory.new_account_url,
-            view.view(nil, 0), encoded.payload, encoded,
-            jose.signer(session.public_key)))) { ret false; }
+        account.CREATE, session.directory.new_account_url,
+        view.view(nil, 0), encoded.payload, encoded,
+        jose.signer(session.public_key)))) { ret false; }
     var decision: client.Decision;
     if (!run_signed(session, ?request, exchange, ?decision)) { ret false; }
     ret !problem.failed(account.parse(account.CREATE, response(exchange),
         view.view(nil, 0), account_limits(), ?session.scratch[0], 32768,
         account.Storage{data: ?session.account_text[0], capacity: 4096,
-            contacts: ?session.contacts[0], contact_capacity: 8},
+        contacts: ?session.contacts[0], contact_capacity: 8},
         ?session.account));
 }
 
@@ -650,7 +660,7 @@ fun dns_name(value: str, len: usize) identifier.Identifier {
 fun order_storage(text: *u8, names: *identifier.Identifier,
     authorizations: *view.View) order.Storage {
     ret order.Storage{data: text, capacity: 8192, identifiers: names,
-        identifier_capacity: 8, authorizations: authorizations,
+        identifier_capacity:    8, authorizations: authorizations,
         authorization_capacity: 8};
 }
 
@@ -662,14 +672,14 @@ fun create_order(session: *Session, exchange: *Exchange,
     var payload: [2048]u8;
     val encoded: order.Operation = order.encode(
         order.Request{identifiers: names, len: len,
-            not_before: view.view(nil, 0), not_after: view.view(nil, 0)},
+        not_before: view.view(nil, 0), not_after: view.view(nil, 0)},
         policy, order.limits_default(),
         contracts.Buffer{data: ?payload[0], capacity: 2048});
     if (problem.failed(encoded.error)) { ret false; }
     var request: client.SignedRequest;
     if (problem.failed(order.begin_new(?session.protocol, ?request,
-            session.directory.new_order_url, session.account.url,
-            encoded.payload, encoded, jose.signer(session.public_key)))) {
+        session.directory.new_order_url, session.account.url,
+        encoded.payload, encoded, jose.signer(session.public_key)))) {
         ret false;
     }
     if (!run_signed(session, ?request, exchange, decision)) { ret false; }
@@ -683,7 +693,7 @@ fun fetch_authorization(session: *Session, exchange: *Exchange,
     storage: order.AuthorizationStorage, output: *order.Authorization) bool {
     var request: client.SignedRequest;
     if (problem.failed(order.begin_fetch(?session.protocol, ?request, url,
-            session.account.url, jose.signer(session.public_key)))) {
+        session.account.url, jose.signer(session.public_key)))) {
         ret false;
     }
     var decision: client.Decision;
@@ -694,29 +704,29 @@ fun fetch_authorization(session: *Session, exchange: *Exchange,
 }
 
 test "live: a multi-identifier order returns one authorization per name" {
-    var session: Session;
+    var session:  Session;
     var exchange: Exchange;
-    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     if (session.account.status != account.VALID ||
         session.account.url.len == 0) { ret 3; }
 
-    var names: [2]identifier.Identifier;
+    var names:  [2]identifier.Identifier;
     var name_a: [64]u8;
     var name_b: [64]u8;
-    val len_a: usize = unique_name("multi-a", 7, ?name_a[0]);
-    val len_b: usize = unique_name("multi-b", 7, ?name_b[0]);
+    val len_a:  usize = unique_name("multi-a", 7, ?name_a[0]);
+    val len_b:  usize = unique_name("multi-b", 7, ?name_b[0]);
     names[0] = dns_name(?name_a[0], len_a);
     names[1] = dns_name(?name_b[0], len_b);
-    var text: [8192]u8;
-    var parsed_names: [8]identifier.Identifier;
+    var text:           [8192]u8;
+    var parsed_names:   [8]identifier.Identifier;
     var authorizations: [8]view.View;
-    var created: order.Order;
-    var decision: client.Decision;
+    var created:        order.Order;
+    var decision:       client.Decision;
     if (!create_order(?session, ?exchange, ?names[0], 2,
-            identifier.policy_default(),
-            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
-            ?created, ?decision)) { ret 4; }
+        identifier.policy_default(),
+        order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+        ?created, ?decision)) { ret 4; }
     if (created.status != order.PENDING || created.identifier_len != 2 ||
         created.authorization_len != 2 || created.url.len == 0 ||
         created.finalize_url.len == 0 ||
@@ -726,19 +736,19 @@ test "live: a multi-identifier order returns one authorization per name" {
     # identifier and offers the three challenge types pebble implements
     var i: usize = 0;
     for (i < created.authorization_len) {
-        var authorization: order.Authorization;
+        var authorization:      order.Authorization;
         var authorization_text: [8192]u8;
-        var challenges: [8]challenge.Challenge;
+        var challenges:         [8]challenge.Challenge;
         if (!fetch_authorization(?session, ?exchange, authorizations[i],
-                identifier.policy_default(),
-                order.AuthorizationStorage{data: ?authorization_text[0],
-                    capacity: 8192, challenges: ?challenges[0],
-                    challenge_capacity: 8}, ?authorization)) { ret 6; }
+            identifier.policy_default(),
+            order.AuthorizationStorage{data: ?authorization_text[0],
+            capacity:           8192, challenges: ?challenges[0],
+            challenge_capacity: 8}, ?authorization)) { ret 6; }
         if (authorization.status != order.AUTH_PENDING ||
             authorization.wildcard ||
             authorization.identifier.kind != identifier.DNS) { ret 7; }
-        var matched: bool = false;
-        var j: usize = 0;
+        var matched: bool  = false;
+        var j:       usize = 0;
         for (j < created.identifier_len) {
             if (identifier.same(authorization.identifier,
                 parsed_names[j])) { matched = true; }
@@ -748,7 +758,7 @@ test "live: a multi-identifier order returns one authorization per name" {
         if (order.select_challenge(authorization, challenge.HTTP_01) == nil ||
             order.select_challenge(authorization, challenge.DNS_01) == nil ||
             order.select_challenge(authorization,
-                challenge.TLS_ALPN_01) == nil) { ret 9; }
+            challenge.TLS_ALPN_01) == nil) { ret 9; }
         if (!order.challenge_admissible(authorization, challenge.HTTP_01)) {
             ret 10;
         }
@@ -758,40 +768,40 @@ test "live: a multi-identifier order returns one authorization per name" {
 }
 
 test "live: a wildcard order yields a dns-01 only authorization" {
-    var session: Session;
+    var session:  Session;
     var exchange: Exchange;
-    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
-    var names: [1]identifier.Identifier;
+    var names:     [1]identifier.Identifier;
     var wild_name: [64]u8;
     wild_name[0] = '*';
     wild_name[1] = '.';
     val wild_len: usize = 2 + unique_name("wild", 4, ?wild_name[2]);
     names[0] = dns_name(?wild_name[0], wild_len);
-    var text: [8192]u8;
-    var parsed_names: [8]identifier.Identifier;
+    var text:           [8192]u8;
+    var parsed_names:   [8]identifier.Identifier;
     var authorizations: [8]view.View;
-    var created: order.Order;
-    var decision: client.Decision;
+    var created:        order.Order;
+    var decision:       client.Decision;
     if (!create_order(?session, ?exchange, ?names[0], 1,
-            identifier.policy_default(),
-            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
-            ?created, ?decision)) { ret 3; }
+        identifier.policy_default(),
+        order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+        ?created, ?decision)) { ret 3; }
     if (created.identifier_len != 1 || created.authorization_len != 1) {
         ret 4;
     }
-    var authorization: order.Authorization;
+    var authorization:      order.Authorization;
     var authorization_text: [8192]u8;
-    var challenges: [8]challenge.Challenge;
+    var challenges:         [8]challenge.Challenge;
     if (!fetch_authorization(?session, ?exchange, authorizations[0],
-            identifier.policy_default(),
-            order.AuthorizationStorage{data: ?authorization_text[0],
-                capacity: 8192, challenges: ?challenges[0],
-                challenge_capacity: 8}, ?authorization)) { ret 5; }
+        identifier.policy_default(),
+        order.AuthorizationStorage{data: ?authorization_text[0],
+        capacity:           8192, challenges: ?challenges[0],
+        challenge_capacity: 8}, ?authorization)) { ret 5; }
     # the authority names the base domain and flags the wildcard separately
     if (!authorization.wildcard ||
         !identifier.same(authorization.identifier,
-            dns_name(?wild_name[2], wild_len - 2))) { ret 6; }
+        dns_name(?wild_name[2], wild_len - 2))) { ret 6; }
     if (!order.challenge_admissible(authorization, challenge.DNS_01) ||
         order.challenge_admissible(authorization, challenge.HTTP_01) ||
         order.challenge_admissible(authorization, challenge.TLS_ALPN_01)) {
@@ -804,23 +814,23 @@ test "live: a wildcard order yields a dns-01 only authorization" {
 }
 
 test "live: a rejected identifier surfaces as a structured acme problem" {
-    var session: Session;
+    var session:  Session;
     var exchange: Exchange;
-    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     var names: [1]identifier.Identifier;
     names[0] = dns_name("blocked-domain.example", 22);
-    var text: [8192]u8;
-    var parsed_names: [8]identifier.Identifier;
+    var text:           [8192]u8;
+    var parsed_names:   [8]identifier.Identifier;
     var authorizations: [8]view.View;
-    var created: order.Order;
-    var decision: client.Decision;
+    var created:        order.Order;
+    var decision:       client.Decision;
     # the authority blocks this name, so order creation must fail with the
     # authority's own problem document rather than a transport error
     if (create_order(?session, ?exchange, ?names[0], 1,
-            identifier.policy_default(),
-            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
-            ?created, ?decision)) { ret 3; }
+        identifier.policy_default(),
+        order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+        ?created, ?decision)) { ret 3; }
     if (decision.action != client.ACTION_FAILED) { ret 4; }
     if (decision.cause.kind != problem.PROTOCOL ||
         decision.cause.code != problem.ACME_PROBLEM) { ret 5; }
@@ -830,39 +840,39 @@ test "live: a rejected identifier surfaces as a structured acme problem" {
 }
 
 test "live: post-as-get order polling drives the bounded poll decision" {
-    var session: Session;
+    var session:  Session;
     var exchange: Exchange;
-    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
-    var names: [1]identifier.Identifier;
+    var names:     [1]identifier.Identifier;
     var poll_name: [64]u8;
-    val poll_len: usize = unique_name("poll", 4, ?poll_name[0]);
+    val poll_len:  usize = unique_name("poll", 4, ?poll_name[0]);
     names[0] = dns_name(?poll_name[0], poll_len);
-    var text: [8192]u8;
-    var parsed_names: [8]identifier.Identifier;
+    var text:           [8192]u8;
+    var parsed_names:   [8]identifier.Identifier;
     var authorizations: [8]view.View;
-    var created: order.Order;
-    var decision: client.Decision;
+    var created:        order.Order;
+    var decision:       client.Decision;
     if (!create_order(?session, ?exchange, ?names[0], 1,
-            identifier.policy_default(),
-            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
-            ?created, ?decision)) { ret 3; }
+        identifier.policy_default(),
+        order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+        ?created, ?decision)) { ret 3; }
 
     # post-as-get the order the authority just created
     var request: client.SignedRequest;
     if (problem.failed(order.begin_fetch(?session.protocol, ?request,
-            created.url, session.account.url,
-            jose.signer(session.public_key)))) { ret 4; }
+        created.url, session.account.url,
+        jose.signer(session.public_key)))) { ret 4; }
     if (!run_signed(?session, ?request, ?exchange, ?decision)) { ret 5; }
-    var polled: order.Order;
-    var poll_text: [8192]u8;
-    var poll_names: [8]identifier.Identifier;
+    var polled:              order.Order;
+    var poll_text:           [8192]u8;
+    var poll_names:          [8]identifier.Identifier;
     var poll_authorizations: [8]view.View;
     if (problem.failed(order.parse(response(?exchange), created.url,
-            identifier.policy_default(), order.limits_default(),
-            ?session.scratch[0], 32768,
-            order_storage(?poll_text[0], ?poll_names[0],
-                ?poll_authorizations[0]), ?polled))) { ret 6; }
+        identifier.policy_default(), order.limits_default(),
+        ?session.scratch[0], 32768,
+        order_storage(?poll_text[0], ?poll_names[0],
+        ?poll_authorizations[0]), ?polled))) { ret 6; }
     # a re-read of the same order names the same resource and identifiers
     if (polled.status != order.PENDING || polled.identifier_len != 1 ||
         polled.authorization_len != 1 ||
@@ -871,20 +881,20 @@ test "live: post-as-get order polling drives the bounded poll decision" {
     # the live status feeds the bounded poll decision. this authority does not
     # advise Retry-After on a pending order; it does once a challenge is
     # processing, which the challenge suite exercises.
-    var state: poll.State;
+    var state:  poll.State;
     var policy: poll.Policy = poll.policy_default();
     policy.min_delay_ns = 1000000000;
     policy.max_delay_ns = 60000000000;
     if (problem.failed(poll.begin(?state, policy, 3600000000000))) {
         ret 8;
     }
-    val advised: u64 = retry_after(?exchange);
-    val waited: poll.Decision = order.poll_next(?state, polled.status,
+    val advised: u64           = retry_after(?exchange);
+    val waited:  poll.Decision = order.poll_next(?state, polled.status,
         order.READY, advised, 0);
     if (waited.action != poll.WAIT) { ret 9; }
     var expected: u64 = policy.min_delay_ns;
     if (advised * 1000000000 > expected) { expected = advised * 1000000000; }
-    if (waited.delay_ns != expected) { ret 10; }
+    if (waited.delay_ns != expected)     { ret 10; }
 
     # an absolute deadline the next wait would pass stops the loop
     if (problem.failed(poll.begin(?state, policy, 500000000))) { ret 11; }
@@ -895,19 +905,19 @@ test "live: post-as-get order polling drives the bounded poll decision" {
     if (problem.failed(poll.begin(?state, policy, 3600000000000)) ||
         !poll.cancel(?state) ||
         order.poll_next(?state, polled.status, order.READY, advised,
-            0).action != poll.CANCELLED) { ret 13; }
+        0).action != poll.CANCELLED) { ret 13; }
     ret 0;
 }
 
 # posts a json document to the challenge test server's management api. that
 # server answers the authority's http-01, dns-01, and tls-alpn-01 validation.
 fun manage(path: *u8, body: *u8, len: usize) bool {
-    var head: [1024]u8;
+    var head:   [1024]u8;
     var writer: Writer = Writer{data: ?head[0], cap: 1024, pos: 0};
     if (!put_text(?writer, "POST ") || !put_text(?writer, path) ||
         !put_text(?writer, " HTTP/1.1\r\nHost: 127.0.0.1:8055\r\n") ||
         !put_text(?writer,
-            "User-Agent: mach-acme-live/0.1\r\nConnection: close\r\n") ||
+        "User-Agent: mach-acme-live/0.1\r\nConnection: close\r\n") ||
         !put_text(?writer, "Content-Type: application/json\r\nContent-Length: ") ||
         !put_number(?writer, len) || !put_text(?writer, "\r\n\r\n")) {
         ret false;
@@ -943,7 +953,7 @@ fun put_json_string(writer: *Writer, value: view.View) bool {
     var i: usize = 0;
     for (i < value.len) {
         if (value.data[i] == '"' || value.data[i] == '\\') { ret false; }
-        if (!put(writer, ?value.data[i], 1)) { ret false; }
+        if (!put(writer, ?value.data[i], 1))               { ret false; }
         i = i + 1;
     }
     ret put_text(writer, "\"");
@@ -970,18 +980,19 @@ fun live_present(ctx: ptr, subject: identifier.Identifier,
     value: challenge.Challenge,
     key_auth: view.View) res[challenge.Presentation, problem.Error] {
     val state: *LiveProvider = ctx::*LiveProvider;
-    state.kind = value.typ;
+    state.kind  = value.typ;
     state.token = value.token;
-    var body: [1024]u8;
+    var body:   [1024]u8;
     var writer: Writer = Writer{data: ?body[0], cap: 1024, pos: 0};
-    var ok: bool = false;
+    var ok:     bool   = false;
     if (value.typ == challenge.HTTP_01) {
         ok = put_text(?writer, "{\"token\":") &&
             put_json_string(?writer, value.token) &&
             put_text(?writer, ",\"content\":") &&
             put_json_string(?writer, key_auth) && put_text(?writer, "}") &&
             manage("/add-http01", ?body[0], writer.pos);
-    } or (value.typ == challenge.DNS_01) {
+    }
+    or (value.typ == challenge.DNS_01) {
         # the record name and value are the library's own computation, so the
         # authority validates exactly what mach-acme produced
         val named: challenge.Operation = challenge.dns_name(subject,
@@ -992,15 +1003,16 @@ fun live_present(ctx: ptr, subject: identifier.Identifier,
             ret res[challenge.Presentation, problem.Error].err{named.error};
         }
         state.dns_name_len = named.written;
-        ok = put_text(?writer, "{\"host\":") &&
+        ok                 = put_text(?writer, "{\"host\":") &&
             put_json_string(?writer,
-                view.view(?state.dns_record[0], named.written)) &&
+            view.view(?state.dns_record[0], named.written)) &&
             put_text(?writer, ",\"value\":") &&
             put_json_string(?writer,
-                view.view(?state.dns_value[0], valued.written)) &&
+            view.view(?state.dns_value[0], valued.written)) &&
             put_text(?writer, "}") &&
             manage("/set-txt", ?body[0], writer.pos);
-    } or {
+    }
+    or {
         ok = put_text(?writer, "{\"host\":") &&
             put_json_string(?writer, subject.value) &&
             put_text(?writer, ",\"content\":") &&
@@ -1009,31 +1021,33 @@ fun live_present(ctx: ptr, subject: identifier.Identifier,
     }
     if (!ok) {
         ret res[challenge.Presentation, problem.Error].err{problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
-                "challenge test server rejected the presentation")};
+            "challenge test server rejected the presentation")};
     }
-    state.subject = subject;
-    state.key_auth = key_auth;
+    state.subject   = subject;
+    state.key_auth  = key_auth;
     state.published = true;
     ret res[challenge.Presentation, problem.Error].ok{challenge.Presentation{ctx: ctx}};
 }
 
 fun live_cleanup(ctx: ptr,
     presentation: challenge.Presentation) res[bool, problem.Error] {
-    val state: *LiveProvider = ctx::*LiveProvider;
-    var body: [1024]u8;
-    var writer: Writer = Writer{data: ?body[0], cap: 1024, pos: 0};
-    var ok: bool = false;
+    val state:  *LiveProvider = ctx::*LiveProvider;
+    var body:   [1024]u8;
+    var writer: Writer        = Writer{data: ?body[0], cap: 1024, pos: 0};
+    var ok:     bool          = false;
     if (state.kind == challenge.HTTP_01) {
         ok = put_text(?writer, "{\"token\":") &&
             put_json_string(?writer, state.token) && put_text(?writer, "}") &&
             manage("/del-http01", ?body[0], writer.pos);
-    } or (state.kind == challenge.DNS_01) {
+    }
+    or (state.kind == challenge.DNS_01) {
         ok = put_text(?writer, "{\"host\":") &&
             put_json_string(?writer,
-                view.view(?state.dns_record[0], state.dns_name_len)) &&
+            view.view(?state.dns_record[0], state.dns_name_len)) &&
             put_text(?writer, "}") &&
             manage("/clear-txt", ?body[0], writer.pos);
-    } or {
+    }
+    or {
         ok = put_text(?writer, "{\"host\":") &&
             put_json_string(?writer, state.subject.value) &&
             put_text(?writer, "}") &&
@@ -1042,14 +1056,14 @@ fun live_cleanup(ctx: ptr,
     state.published = false;
     if (!ok) {
         ret res[bool, problem.Error].err{problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
-                "challenge test server rejected the cleanup")};
+            "challenge test server rejected the cleanup")};
     }
     ret res[bool, problem.Error].ok{true};
 }
 
 fun live_provider(state: *LiveProvider) challenge.Provider {
-    state.published = false;
-    state.kind = 0;
+    state.published    = false;
+    state.kind         = 0;
     state.dns_name_len = 0;
     ret challenge.Provider{ctx: state::ptr, supports: live_supports,
         present: live_present, cleanup: live_cleanup};
@@ -1082,27 +1096,27 @@ fun unique_name(prefix: str, prefix_len: usize, output: *u8) usize {
     var i: usize = 0;
     for (i < prefix_len) {
         output[i] = prefix[i];
-        i = i + 1;
+        i         = i + 1;
     }
     output[prefix_len] = '-';
-    var value: u64 = monotonic_ns()::u64;
+    var value:  u64   = monotonic_ns()::u64;
     var digits: [24]u8;
-    var count: usize = 0;
+    var count:  usize = 0;
     for (count < 14) {
         digits[count] = ('0'::u64 + value % 10)::u8;
-        value = value / 10;
-        count = count + 1;
+        value         = value / 10;
+        count         = count + 1;
     }
     var j: usize = 0;
     for (j < count) {
         output[prefix_len + 1 + j] = digits[count - 1 - j];
-        j = j + 1;
+        j                          = j + 1;
     }
     val suffix: str = ".live.example";
     j = 0;
     for (j < 13) {
         output[prefix_len + 1 + count + j] = suffix[j];
-        j = j + 1;
+        j                                  = j + 1;
     }
     ret prefix_len + 1 + count + 13;
 }
@@ -1112,25 +1126,26 @@ fun run_challenge(session: *Session, exchange: *Exchange, name: str,
     attempt: *challenge.Attempt, advised: *u64, ready: *ReadyOrder) i32 {
     var names: [1]identifier.Identifier;
     names[0] = dns_name(name, name_len);
-    var text: [8192]u8;
-    var parsed_names: [8]identifier.Identifier;
+    var text:           [8192]u8;
+    var parsed_names:   [8]identifier.Identifier;
     var authorizations: [8]view.View;
-    var created: order.Order;
-    var decision: client.Decision;
+    var created:        order.Order;
+    var decision:       client.Decision;
     if (!create_order(session, exchange, ?names[0], 1,
-            identifier.policy_default(),
-            order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
-            ?created, ?decision)) { ret 10; }
+        identifier.policy_default(),
+        order_storage(?text[0], ?parsed_names[0], ?authorizations[0]),
+        ?created, ?decision)) { ret 10; }
     if (created.authorization_len != 1) { ret 11; }
 
-    var authorization: order.Authorization;
+    var authorization:      order.Authorization;
     var authorization_text: [8192]u8;
-    var challenges: [8]challenge.Challenge;
-    val storage: order.AuthorizationStorage = order.AuthorizationStorage{
-        data: ?authorization_text[0], capacity: 8192,
-        challenges: ?challenges[0], challenge_capacity: 8};
+    var challenges:         [8]challenge.Challenge;
+    val storage:            order.AuthorizationStorage = order.AuthorizationStorage{
+        data:       ?authorization_text[0], capacity: 8192,
+        challenges: ?challenges[0], challenge_capacity: 8
+    };
     if (!fetch_authorization(session, exchange, authorizations[0],
-            identifier.policy_default(), storage, ?authorization)) { ret 12; }
+        identifier.policy_default(), storage, ?authorization)) { ret 12; }
     if (!order.challenge_admissible(authorization, kind)) { ret 13; }
     val selected: *challenge.Challenge = order.select_challenge(authorization,
         kind);
@@ -1139,40 +1154,40 @@ fun run_challenge(session: *Session, exchange: *Exchange, name: str,
     # the key authorization is derived from the account key this session
     # actually registered, not supplied by the test
     var key_auth_bytes: [256]u8;
-    val key_auth: challenge.Operation = challenge.key_authorization(@selected,
+    val key_auth:       challenge.Operation = challenge.key_authorization(@selected,
         jose.signer(session.public_key),
         contracts.Buffer{data: ?key_auth_bytes[0], capacity: 256});
     if (problem.failed(key_auth.error)) { ret 15; }
 
     if (problem.failed(challenge.attempt_init(attempt,
-            live_provider(provider)))) { ret 16; }
+        live_provider(provider)))) { ret 16; }
     if (problem.failed(challenge.begin(attempt, authorization.identifier,
-            @selected, key_auth.value))) { ret 17; }
+        @selected, key_auth.value))) { ret 17; }
     if (attempt.present_calls != 1 || !challenge.presented(attempt)) { ret 18; }
 
     # tell the authority the challenge is ready
     var respond: client.SignedRequest;
     if (problem.failed(challenge.begin_respond(?session.protocol, ?respond,
-            selected.url, session.account.url,
-            view.view(challenge.RESPOND_PAYLOAD, 2),
-            jose.signer(session.public_key)))) { ret 19; }
+        selected.url, session.account.url,
+        view.view(challenge.RESPOND_PAYLOAD, 2),
+        jose.signer(session.public_key)))) { ret 19; }
     if (!run_signed(session, ?respond, exchange, ?decision)) { ret 20; }
 
     # poll the authorization until the authority validates it
-    var state: poll.State;
+    var state:  poll.State;
     var policy: poll.Policy = poll.policy_default();
     policy.min_delay_ns = 200000000;
     policy.max_delay_ns = 2000000000;
     policy.max_attempts = 40;
     if (problem.failed(poll.begin(?state, policy,
-            monotonic_ns() + 60000000000))) { ret 21; }
+        monotonic_ns() + 60000000000))) { ret 21; }
     @advised = 0;
-    var settled: bool = false;
-    var rounds: usize = 0;
+    var settled: bool  = false;
+    var rounds:  usize = 0;
     for (!settled && rounds < 40) {
         rounds = rounds + 1;
         if (!fetch_authorization(session, exchange, authorizations[0],
-                identifier.policy_default(), storage, ?authorization)) {
+            identifier.policy_default(), storage, ?authorization)) {
             ret 22;
         }
         val advice: u64 = retry_after(exchange);
@@ -1183,8 +1198,8 @@ fun run_challenge(session: *Session, exchange: *Exchange, name: str,
             authorization.status == order.AUTH_VALID,
             authorization.status == order.AUTH_INVALID, 0, monotonic_ns());
         if (step.action == poll.READY) { settled = true; }
-        or (step.action == poll.WAIT) { os.sleep(step.delay_ns::i64); }
-        or { ret 23; }
+        or (step.action == poll.WAIT)  { os.sleep(step.delay_ns::i64); }
+        or                             { ret 23; }
     }
     if (!settled || authorization.status != order.AUTH_VALID) { ret 24; }
 
@@ -1197,52 +1212,52 @@ fun run_challenge(session: *Session, exchange: *Exchange, name: str,
     # every authorization is valid, so the order is ready to finalize
     var fetch: client.SignedRequest;
     if (problem.failed(order.begin_fetch(?session.protocol, ?fetch,
-            created.url, session.account.url,
-            jose.signer(session.public_key)))) { ret 27; }
+        created.url, session.account.url,
+        jose.signer(session.public_key)))) { ret 27; }
     if (!run_signed(session, ?fetch, exchange, ?decision)) { ret 28; }
     if (problem.failed(order.parse(response(exchange), created.url,
-            identifier.policy_default(), order.limits_default(),
-            ?session.scratch[0], 32768,
-            order_storage(?ready.text[0], ?ready.names[0],
-                ?ready.authorizations[0]), ?ready.value))) { ret 29; }
+        identifier.policy_default(), order.limits_default(),
+        ?session.scratch[0], 32768,
+        order_storage(?ready.text[0], ?ready.names[0],
+        ?ready.authorizations[0]), ?ready.value))) { ret 29; }
     if (ready.value.status != order.READY ||
         ready.value.finalize_url.len == 0) { ret 30; }
     # a polled order reuses the caller's known url by design, so the ready
     # order keeps its own copy rather than a view into this frame
     if (created.url.len == 0 || created.url.len > 512) { ret 31; }
     copy(?ready.url_bytes[0], created.url.data, created.url.len);
-    ready.url_len = created.url.len;
+    ready.url_len   = created.url.len;
     ready.value.url = view.view(?ready.url_bytes[0], created.url.len);
     ret 0;
 }
 
 test "live: http-01 validates against the authority end to end" {
-    var session: Session;
+    var session:  Session;
     var exchange: Exchange;
-    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     var provider: LiveProvider;
-    var attempt: challenge.Attempt;
-    var advised: u64 = 0;
-    var ready: ReadyOrder;
-    var name: [64]u8;
+    var attempt:  challenge.Attempt;
+    var advised:  u64   = 0;
+    var ready:    ReadyOrder;
+    var name:     [64]u8;
     val name_len: usize = unique_name("http01", 6, ?name[0]);
     ret run_challenge(?session, ?exchange, ?name[0], name_len,
         challenge.HTTP_01, ?provider, ?attempt, ?advised, ?ready);
 }
 
 test "live: dns-01 validates the library's own record name and digest" {
-    var session: Session;
+    var session:  Session;
     var exchange: Exchange;
-    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     var provider: LiveProvider;
-    var attempt: challenge.Attempt;
-    var advised: u64 = 0;
-    var ready: ReadyOrder;
-    var name: [64]u8;
+    var attempt:  challenge.Attempt;
+    var advised:  u64   = 0;
+    var ready:    ReadyOrder;
+    var name:     [64]u8;
     val name_len: usize = unique_name("dns01", 5, ?name[0]);
-    val outcome: i32 = run_challenge(?session, ?exchange, ?name[0], name_len,
+    val outcome:  i32   = run_challenge(?session, ?exchange, ?name[0], name_len,
         challenge.DNS_01, ?provider, ?attempt, ?advised, ?ready);
     if (outcome != 0) { ret outcome; }
     # the record the authority resolved was named and valued by mach-acme
@@ -1253,15 +1268,15 @@ test "live: dns-01 validates the library's own record name and digest" {
 }
 
 test "live: tls-alpn-01 validates against the authority end to end" {
-    var session: Session;
+    var session:  Session;
     var exchange: Exchange;
-    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     var provider: LiveProvider;
-    var attempt: challenge.Attempt;
-    var advised: u64 = 0;
-    var ready: ReadyOrder;
-    var name: [64]u8;
+    var attempt:  challenge.Attempt;
+    var advised:  u64   = 0;
+    var ready:    ReadyOrder;
+    var name:     [64]u8;
     val name_len: usize = unique_name("alpn01", 6, ?name[0]);
     ret run_challenge(?session, ?exchange, ?name[0], name_len,
         challenge.TLS_ALPN_01, ?provider, ?attempt, ?advised, ?ready);
@@ -1275,11 +1290,12 @@ fun set_certificate_private(output: *^u8) {
         0x3b, 0x11, 0x9c, 0x4a, 0x77, 0x2e, 0x05, 0x91,
         0x64, 0xd0, 0x8e, 0x2f, 0xba, 0x61, 0x3c, 0x57,
         0x18, 0xa9, 0x40, 0xd6, 0x22, 0xef, 0x83, 0x0c,
-        0x75, 0x14, 0xbb, 0x29, 0x6e, 0x0d, 0x41, 0x88};
+        0x75, 0x14, 0xbb, 0x29, 0x6e, 0x0d, 0x41, 0x88
+    };
     var i: usize = 0;
     for (i < 32) {
         output[i] = value[i];
-        i = i + 1;
+        i         = i + 1;
     }
 }
 
@@ -1297,7 +1313,7 @@ fun certificate_sign(ctx: ptr, tbs: *u8, tbs_len: usize, output: *u8,
 
 fun certificate_spki(output: *u8, len: *usize) bool {
     var private_bytes: [32]^u8;
-    var point: [65]u8;
+    var point:         [65]u8;
     set_certificate_private(?private_bytes[0]);
     val derived: contracts.Operation = p256.derive_public(
         contracts.SecretBytes{data: ?private_bytes[0], len: 32},
@@ -1307,56 +1323,63 @@ fun certificate_spki(output: *u8, len: *usize) bool {
         0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
         0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
         0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
-        0x42, 0x00};
+        0x42, 0x00
+    };
     var i: usize = 0;
-    for (i < 26) { output[i] = prefix[i]; i = i + 1; }
+    for (i < 26) {
+        output[i] = prefix[i];
+        i         = i + 1;
+    }
     i = 0;
-    for (i < 65) { output[26 + i] = point[i]; i = i + 1; }
+    for (i < 65) {
+        output[26 + i] = point[i];
+        i              = i + 1;
+    }
     @len = 91;
     ret true;
 }
 
 test "live: an order is finalized, downloaded, verified, and revoked" {
-    var session: Session;
+    var session:  Session;
     var exchange: Exchange;
-    if (!session_begin(?session, ?exchange)) { ret 1; }
+    if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     var provider: LiveProvider;
-    var attempt: challenge.Attempt;
-    var advised: u64 = 0;
-    var ready: ReadyOrder;
-    var name: [64]u8;
+    var attempt:  challenge.Attempt;
+    var advised:  u64   = 0;
+    var ready:    ReadyOrder;
+    var name:     [64]u8;
     val name_len: usize = unique_name("issue", 5, ?name[0]);
-    val prepared: i32 = run_challenge(?session, ?exchange, ?name[0], name_len,
+    val prepared: i32   = run_challenge(?session, ?exchange, ?name[0], name_len,
         challenge.HTTP_01, ?provider, ?attempt, ?advised, ?ready);
     if (prepared != 0) { ret prepared; }
 
     # the csr is built from the order's own identifiers and signed by a key
     # the account does not hold
-    var spki: [128]u8;
+    var spki:     [128]u8;
     var spki_len: usize = 0;
     if (!certificate_spki(?spki[0], ?spki_len)) { ret 3; }
-    var csr_work: [4096]u8;
+    var csr_work:   [4096]u8;
     var csr_output: [4096]u8;
-    val csr: certificate.Operation = certificate.encode_csr(
+    val csr:        certificate.Operation = certificate.encode_csr(
         ready.value.identifiers, ready.value.identifier_len,
         identifier.policy_default(),
         certificate.CsrSigner{ctx: nil, sign: certificate_sign,
-            algorithm: certificate.ECDSA_P256_SHA256,
-            public_key_der: view.view(?spki[0], spki_len)},
+        algorithm:      certificate.ECDSA_P256_SHA256,
+        public_key_der: view.view(?spki[0], spki_len)},
         contracts.Buffer{data: ?csr_work[0], capacity: 4096},
         contracts.Buffer{data: ?csr_output[0], capacity: 4096});
     if (problem.failed(csr.error)) { ret 4; }
 
     # rfc 8555 section 7.4 finalize
-    var payload: [8192]u8;
+    var payload:  [8192]u8;
     val finalize: certificate.Operation = certificate.encode_finalize(
         csr.value, contracts.Buffer{data: ?payload[0], capacity: 8192});
     if (problem.failed(finalize.error)) { ret 5; }
     var request: client.SignedRequest;
     if (problem.failed(certificate.begin_finalize(?session.protocol, ?request,
-            ready.value.finalize_url, session.account.url, finalize.value,
-            finalize, jose.signer(session.public_key)))) { ret 6; }
+        ready.value.finalize_url, session.account.url, finalize.value,
+        finalize, jose.signer(session.public_key)))) { ret 6; }
     var decision: client.Decision;
     if (!run_signed(?session, ?request, ?exchange, ?decision)) { ret 7; }
 
@@ -1364,73 +1387,73 @@ test "live: an order is finalized, downloaded, verified, and revoked" {
     # while it is. the advice is honoured exactly.
     val finalize_advice: u64 = retry_after(?exchange);
     if (finalize_advice == 0) { ret 8; }
-    var advice_state: poll.State;
+    var advice_state:  poll.State;
     var advice_policy: poll.Policy = poll.policy_default();
     advice_policy.min_delay_ns = 1000000000;
     advice_policy.max_delay_ns = 60000000000;
     if (problem.failed(poll.begin(?advice_state, advice_policy,
-            3600000000000))) { ret 9; }
+        3600000000000))) { ret 9; }
     val advised_wait: poll.Decision = poll.next(?advice_state, false, false,
         finalize_advice, 0);
     if (advised_wait.action != poll.WAIT ||
         advised_wait.delay_ns != finalize_advice * 1000000000) { ret 10; }
 
     # poll the order to valid
-    var state: poll.State;
+    var state:  poll.State;
     var policy: poll.Policy = poll.policy_default();
     policy.min_delay_ns = 200000000;
     policy.max_delay_ns = 2000000000;
     policy.max_attempts = 40;
     if (problem.failed(poll.begin(?state, policy,
-            monotonic_ns() + 60000000000))) { ret 11; }
-    var issued: order.Order;
-    var issued_text: [8192]u8;
-    var issued_names: [8]identifier.Identifier;
+        monotonic_ns() + 60000000000))) { ret 11; }
+    var issued:                order.Order;
+    var issued_text:           [8192]u8;
+    var issued_names:          [8]identifier.Identifier;
     var issued_authorizations: [8]view.View;
-    var settled: bool = false;
-    var rounds: usize = 0;
+    var settled:               bool  = false;
+    var rounds:                usize = 0;
     for (!settled && rounds < 40) {
         rounds = rounds + 1;
         var fetch: client.SignedRequest;
         if (problem.failed(order.begin_fetch(?session.protocol, ?fetch,
-                ready.value.url, session.account.url,
-                jose.signer(session.public_key)))) { ret 12; }
+            ready.value.url, session.account.url,
+            jose.signer(session.public_key)))) { ret 12; }
         if (!run_signed(?session, ?fetch, ?exchange, ?decision)) { ret 13; }
         if (problem.failed(order.parse(response(?exchange), ready.value.url,
-                identifier.policy_default(), order.limits_default(),
-                ?session.scratch[0], 32768,
-                order_storage(?issued_text[0], ?issued_names[0],
-                    ?issued_authorizations[0]), ?issued))) { ret 14; }
+            identifier.policy_default(), order.limits_default(),
+            ?session.scratch[0], 32768,
+            order_storage(?issued_text[0], ?issued_names[0],
+            ?issued_authorizations[0]), ?issued))) { ret 14; }
         val step: poll.Decision = poll.next(?state,
             issued.status == order.VALID, issued.status == order.INVALID, 0,
             monotonic_ns());
         if (step.action == poll.READY) { settled = true; }
-        or (step.action == poll.WAIT) { os.sleep(step.delay_ns::i64); }
-        or { ret 15; }
+        or (step.action == poll.WAIT)  { os.sleep(step.delay_ns::i64); }
+        or                             { ret 15; }
     }
     if (!settled || issued.certificate_url.len == 0) { ret 16; }
 
     # rfc 8555 section 7.4.2 download
     var download: client.SignedRequest;
     if (problem.failed(certificate.begin_download(?session.protocol,
-            ?download, issued.certificate_url, session.account.url,
-            jose.signer(session.public_key)))) { ret 17; }
+        ?download, issued.certificate_url, session.account.url,
+        jose.signer(session.public_key)))) { ret 17; }
     if (!run_signed(?session, ?download, ?exchange, ?decision)) { ret 18; }
     var certificates: [8]certificate.Certificate;
-    var der: [32768]u8;
-    var chain: certificate.Chain;
+    var der:          [32768]u8;
+    var chain:        certificate.Chain;
     if (problem.failed(certificate.parse_chain(exchange.body,
-            ?certificates[0], 8, ?der[0], 32768, ?chain))) { ret 19; }
+        ?certificates[0], 8, ?der[0], 32768, ?chain))) { ret 19; }
     # a real authority returns the leaf plus at least one issuer
     if (chain.len < 2) { ret 20; }
 
     # the issued certificate must cover exactly what was ordered, checked
     # before anything is written to storage
     var leaf_names: [8]identifier.Identifier;
-    var parsed: certificate.Parsed;
+    var parsed:     certificate.Parsed;
     if (problem.failed(certificate.verify_issued(chain,
-            ready.value.identifiers, ready.value.identifier_len,
-            ?leaf_names[0], 8, ?parsed))) { ret 21; }
+        ready.value.identifiers, ready.value.identifier_len,
+        ?leaf_names[0], 8, ?parsed))) { ret 21; }
     if (parsed.name_len != 1 || parsed.names[0].kind != identifier.DNS ||
         parsed.names[0].value.len != name_len ||
         !equal(parsed.names[0].value.data, ?name[0], name_len) ||
@@ -1440,35 +1463,35 @@ test "live: an order is finalized, downloaded, verified, and revoked" {
     var foreign: [1]identifier.Identifier;
     foreign[0] = dns_name("other.live.example", 18);
     if (certificate.verify_issued(chain, ?foreign[0], 1, ?leaf_names[0], 8,
-            ?parsed).code != problem.INVALID_INPUT) { ret 23; }
+        ?parsed).code != problem.INVALID_INPUT) { ret 23; }
 
     # rfc 8288 alternate chains, when the authority offers any
     var alternate_text: [1024]u8;
     var alternate_urls: [8]view.View;
-    var alternates: certificate.Alternates;
+    var alternates:     certificate.Alternates;
     if (problem.failed(certificate.parse_alternates(response(?exchange), 4096,
-            ?alternate_text[0], 1024, ?alternate_urls[0], 8, ?alternates))) {
+        ?alternate_text[0], 1024, ?alternate_urls[0], 8, ?alternates))) {
         ret 24;
     }
 
     # draft-ietf-acme-ari: ask the authority when it would prefer this exact
     # certificate to be renewed, and plan from its answer
     if (session.directory.renewal_info_url.len == 0) { ret 31; }
-    var id_bytes: [128]u8;
+    var id_bytes:       [128]u8;
     val certificate_id: renewal_info.Operation =
         renewal_info.certificate_id(chain.certificates[0].der,
-            contracts.Buffer{data: ?id_bytes[0], capacity: 128});
+        contracts.Buffer{data: ?id_bytes[0], capacity: 128});
     if (problem.failed(certificate_id.error)) { ret 32; }
     var ari_url: [512]u8;
-    val ari: renewal_info.Operation = renewal_info.request_url(
+    val ari:     renewal_info.Operation = renewal_info.request_url(
         session.directory.renewal_info_url, certificate_id.value, 4096,
         contracts.Buffer{data: ?ari_url[0], capacity: 512});
     if (problem.failed(ari.error)) { ret 33; }
     if (!execute(renewal_info.request(ari.value, client.limits_default()),
-            ?exchange)) { ret 34; }
+        ?exchange)) { ret 34; }
     var window: renewal_info.Window;
     if (problem.failed(renewal_info.parse(response(?exchange),
-            client.limits_default(), ?session.scratch[0], 32768, ?window))) {
+        client.limits_default(), ?session.scratch[0], 32768, ?window))) {
         ret 35;
     }
     # the authority's window must be usable and sit inside the certificate's
@@ -1476,38 +1499,38 @@ test "live: an order is finalized, downloaded, verified, and revoked" {
     if (!renewal_info.window_valid(window) ||
         window.end_unix <= parsed.not_before_unix) { ret 36; }
 
-    var schedule: renewal.Schedule;
+    var schedule:       renewal.Schedule;
     var renewal_policy: renewal.Policy = renewal.policy_default();
     renewal_policy.renew_before_seconds = 2592000;
     if (problem.failed(renewal.begin(?schedule, renewal_policy,
-            view.view(?name[0], name_len), parsed.not_before_unix,
-            parsed.not_after_unix))) { ret 37; }
+        view.view(?name[0], name_len), parsed.not_before_unix,
+        parsed.not_after_unix))) { ret 37; }
     if (problem.failed(renewal.plan(?schedule, window, renewal.no_random(),
-            parsed.not_before_unix, renewal.no_observer()))) { ret 38; }
+        parsed.not_before_unix, renewal.no_observer()))) { ret 38; }
     # the planned instant is inside the certificate this authority issued
     if (schedule.next_run_unix < parsed.not_before_unix ||
         schedule.next_run_unix > parsed.not_after_unix) { ret 39; }
 
     # rfc 8555 section 7.6 revocation under the account key
     var revoke_payload: [32768]u8;
-    val revoke: certificate.Operation = certificate.encode_revoke(
+    val revoke:         certificate.Operation = certificate.encode_revoke(
         chain.certificates[0].der, certificate.SUPERSEDED,
         contracts.Buffer{data: ?revoke_payload[0], capacity: 32768});
     if (problem.failed(revoke.error)) { ret 40; }
     var revocation: client.SignedRequest;
     if (problem.failed(certificate.begin_revoke(?session.protocol,
-            ?revocation, session.directory.revoke_cert_url,
-            session.account.url, revoke.value, revoke, false,
-            jose.signer(session.public_key)))) { ret 41; }
+        ?revocation, session.directory.revoke_cert_url,
+        session.account.url, revoke.value, revoke, false,
+        jose.signer(session.public_key)))) { ret 41; }
     if (!run_signed(?session, ?revocation, ?exchange, ?decision)) { ret 42; }
 
     # revoking the same certificate again is refused by the authority with a
     # structured acme problem rather than silently accepted
     var again: client.SignedRequest;
     if (problem.failed(certificate.begin_revoke(?session.protocol, ?again,
-            session.directory.revoke_cert_url, session.account.url,
-            revoke.value, revoke, false,
-            jose.signer(session.public_key)))) { ret 43; }
+        session.directory.revoke_cert_url, session.account.url,
+        revoke.value, revoke, false,
+        jose.signer(session.public_key)))) { ret 43; }
     if (run_signed(?session, ?again, ?exchange, ?decision)) { ret 44; }
     if (decision.cause.code != problem.ACME_PROBLEM ||
         decision.cause.problem.typ.len == 0) { ret 45; }

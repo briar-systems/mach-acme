@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-16
+
+### Security
+- Durable state files and directories are now owner-only on Windows too. Before this they took the inherited default permissions, because mach-std did not enforce file modes there (#57, briar-systems/mach-std#703).
+
+### Changed
+- Dependencies: mach-std v3.2.0, mach-crypto v0.10.1, mach-http v0.9.0. A consumer that declares its own std must be on v3.2.0.
+- CI runs the shared family pipeline from briar-systems/.github, with the live ACME suite as a subproject and a single `gate` check (#53).
+
 ## [0.2.1] - 2026-09-15
 
 ### Fixed
