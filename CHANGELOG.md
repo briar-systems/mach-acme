@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Changed
+- Dependencies: mach-crypto v0.12.0, which has faster X25519 and Ed25519 (#70).
 - Releases are published by the shared release workflow when a `v*` tag is pushed. It checks the tag, version and changelog, runs the full CI tier, then publishes the GitHub release (#68).
 
 ## [0.4.0] - 2026-09-17
