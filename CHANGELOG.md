@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- Releases are published by the shared release workflow when a `v*` tag is pushed. It checks the tag, version and changelog, runs the full CI tier, then publishes the GitHub release (#68).
+
 ## [0.4.0] - 2026-09-17
 
 ### Changed
