@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- The copyright is now held by Briar Systems LLC (#78).
+
 ## [0.4.2] - 2026-09-17
 
 ### Changed
