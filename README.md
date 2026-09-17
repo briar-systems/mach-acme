@@ -95,14 +95,14 @@ buffer requirements.
 
 ## Dependencies
 
-The repository pins exact released Git tags:
+The repository pins exact released Git tags and builds with mach 5.2.0 or later:
 
-- `mach-std` v0.34.0
-- `mach-http` v0.7.5
-- `mach-crypto` v0.8.1
+- `mach-std` v4.0.1
+- `mach-http` v0.10.0
+- `mach-crypto` v0.11.0
 
-Build output uses Mach's repository-local `out/` path. Run the root tests and the
-protocol vector project with:
+Build output uses Mach's repository-local `out/` path. Run the root tests, which
+include the protocol vectors, with:
 
 ```text
 mach test . --profile debug
