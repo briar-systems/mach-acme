@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-17
+
+### Changed
+- Dependencies: mach-http v0.11.0 (#74).
+
 ## [0.4.1] - 2026-09-17
 
 ### Changed
