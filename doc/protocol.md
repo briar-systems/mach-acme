@@ -235,19 +235,22 @@ capacity failure leaves the caller's output record unchanged.
 
 Polling is a decision, not a loop. The library owns no clock and no timer.
 `order.poll_next` receives the current status, the target status, the
-authority's Retry-After in seconds, and a caller-supplied monotonic reading,
+authority's Retry-After in seconds, and the current `std.chrono.time.Instant`,
 and returns exactly one of wait, ready, terminal, deadline, cancelled, or
-limit.
+limit. The deadline and the current reading are monotonic `Instant`s, so a
+wall-clock `time.Time` does not type-check as either.
 
 Retry-After is honoured when it exceeds the local backoff floor, and every wait
 is clamped to the policy ceiling, so a hostile or mistaken advisory cannot
 produce an unbounded wait. Backoff doubles from the floor and saturates at the
 ceiling without overflowing. A wait that would pass the absolute deadline is
 refused rather than truncated, and the attempt counter is not advanced by a
-decision that produced no wait. Cancellation is checked before any status
-interpretation. A terminal status that is not the target is reported distinctly
-from reaching the target, so an order that went `invalid` is never mistaken for
-success.
+decision that produced no wait. The observed status is accounted for before
+cancellation or the deadline: an order that reached its target is ready, and
+one that failed is terminal, even after `poll.cancel` or past the deadline.
+Cancelled is returned only for an observation that made no progress. A terminal
+status that is not the target is reported distinctly from reaching the target,
+so an order that went `invalid` is never mistaken for success.
 
 ## Challenges
 
@@ -299,7 +302,8 @@ supplies a resolver and a test supplies a deterministic answer. Each
 consecutive: a record that appears and then disappears restarts the count
 rather than proceeding. The wait is bounded by the shared poll policy's attempt
 ceiling, delay ceiling, and absolute deadline, and cancellation is honoured
-before any observation is made.
+before any observation is made, since nothing has arrived yet that a
+cancellation could discard.
 
 ## Bounded waiting
 
@@ -312,9 +316,23 @@ is clamped to the policy ceiling, so a hostile or mistaken advisory cannot
 produce an unbounded wait. Backoff doubles from the floor and saturates without
 overflowing. A wait that would pass the absolute deadline is refused rather
 than truncated, and a decision that produced no wait does not advance the
-attempt counter. Cancellation is checked before any status interpretation, and
-a terminal status that is not the target is reported distinctly from reaching
-the target.
+attempt counter. A terminal status that is not the target is reported
+distinctly from reaching the target.
+
+The caller's observation is accounted for before the poll's own state.
+`poll.next` returns ready for an observation that reached the target, and
+terminal for one that failed, even after `poll.cancel` and even at or past the
+deadline. This is deliberate. Cancellation states the caller's intent and says
+nothing about what the authority already did. A finalized order that is already
+`valid` holds an issued certificate, and abandoning it as cancelled would make
+the next run issue again and spend a rate-limited duplicate. Cancelled is
+returned only for an observation that made no progress. Every decision carries
+`cancelled`, which is true whenever the poll had been cancelled, so a caller
+that is shutting down still sees that it cancelled when a ready decision
+outranked it, and can record the ready resource it is leaving behind.
+
+Deadlines and the current reading are `std.chrono.time.Instant` values from
+`time.instant()`. The library never reads a clock itself.
 
 ## Certificate requests
 

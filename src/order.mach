@@ -12,6 +12,7 @@ use crypto.contracts;
 use crypto.hash;
 use http.core.field;
 use http.core.status;
+use std.chrono.time;
 use J: std.data.json;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -944,14 +945,20 @@ pub fun challenge_admissible(value: Authorization, kind: u8) bool {
 # order polling reduces the rfc 8555 status vocabulary to the shared bounded
 # poll decision, so orders, challenges, and renewal never drift apart
 pub fun poll_next(state: *poll.State, current: u8, target: u8,
-    retry_after_seconds: u64, now_ns: i64) poll.Decision {
+    retry_after_seconds: u64, now: time.Instant) poll.Decision {
     if (current == 0 || target == 0) {
         ret poll.Decision{action: poll.TERMINAL, delay_ns: 0,
             cause: problem.local_code(problem.STATE, problem.INVALID_STATE,
-            "order poll received an unknown status")};
+            "order poll received an unknown status"),
+            cancelled: poll.cancelled(state)};
     }
     ret poll.next(state, current == target, status_terminal(current),
-        retry_after_seconds, now_ns);
+        retry_after_seconds, now);
+}
+
+# a fixed monotonic instant, nanoseconds after the clock's start
+fun at(ns: i64) time.Instant {
+    ret time.Instant{sec: ns / 1000000000, nsec: ns % 1000000000};
 }
 
 test "acme.order: polling maps order statuses onto the bounded decision" {
@@ -960,25 +967,29 @@ test "acme.order: polling maps order statuses onto the bounded decision" {
     policy.min_delay_ns = 1000000000;
     policy.max_delay_ns = 8000000000;
     policy.max_attempts = 4;
-    if (problem.failed(poll.begin(?state, policy, 1000000000000))) { ret 1; }
+    if (problem.failed(poll.begin(?state, policy, at(1000000000000)))) { ret 1; }
     # a pending order waits, and the authority's advice outranks the floor
-    if (poll_next(?state, PENDING, READY, 0, 0).delay_ns != 1000000000 ||
-        poll_next(?state, PENDING, READY, 5, 0).delay_ns != 5000000000) {
+    if (poll_next(?state, PENDING, READY, 0, at(0)).delay_ns != 1000000000 ||
+        poll_next(?state, PENDING, READY, 5, at(0)).delay_ns != 5000000000) {
         ret 2;
     }
-    if (problem.failed(poll.begin(?state, policy, 1000000000000))) { ret 3; }
+    if (problem.failed(poll.begin(?state, policy, at(1000000000000)))) { ret 3; }
     # reaching the target, overshooting it, and failing are distinct
-    if (poll_next(?state, READY, READY, 0, 0).action != poll.READY ||
-        poll_next(?state, VALID, READY, 0, 0).action != poll.TERMINAL ||
-        poll_next(?state, INVALID, READY, 0, 0).action != poll.TERMINAL ||
-        poll_next(?state, PROCESSING, VALID, 0, 0).action != poll.WAIT ||
-        poll_next(?state, READY, VALID, 0, 0).action != poll.WAIT) { ret 4; }
+    if (poll_next(?state, READY, READY, 0, at(0)).action != poll.READY ||
+        poll_next(?state, VALID, READY, 0, at(0)).action != poll.TERMINAL ||
+        poll_next(?state, INVALID, READY, 0, at(0)).action != poll.TERMINAL ||
+        poll_next(?state, PROCESSING, VALID, 0, at(0)).action != poll.WAIT ||
+        poll_next(?state, READY, VALID, 0, at(0)).action != poll.WAIT) { ret 4; }
     # an unknown status is never treated as progress
-    if (poll_next(?state, 0, READY, 0, 0).action != poll.TERMINAL ||
-        poll_next(?state, PENDING, 0, 0, 0).action != poll.TERMINAL) { ret 5; }
+    if (poll_next(?state, 0, READY, 0, at(0)).action != poll.TERMINAL ||
+        poll_next(?state, PENDING, 0, 0, at(0)).action != poll.TERMINAL) { ret 5; }
     if (!poll.cancel(?state) ||
-        poll_next(?state, PENDING, READY, 0, 0).action != poll.CANCELLED) {
+        poll_next(?state, PENDING, READY, 0, at(0)).action != poll.CANCELLED) {
         ret 6;
     }
+    # a finalized order that is already valid is ready even after a cancel, so
+    # an issued certificate is downloaded rather than issued again
+    val issued: poll.Decision = poll_next(?state, VALID, VALID, 0, at(0));
+    if (issued.action != poll.READY || !issued.cancelled) { ret 7; }
     ret 0;
 }
