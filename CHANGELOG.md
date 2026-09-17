@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-17
+
 ### Changed
 - Dependencies: mach-std v4.0.1, mach-crypto v0.11.0, mach-http v0.10.0. Building now needs mach 5.2.0 or later, and a consumer that declares its own std must be on v4.0.1 (#64).
 - The README's dependency list matches the pins again.
