@@ -1,7 +1,7 @@
 [project]
 id = "acme"
 mach = "^5.3"
-version = "0.4.2"
+version = "0.5.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
