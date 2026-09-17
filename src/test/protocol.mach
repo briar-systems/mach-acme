@@ -23,6 +23,7 @@ use http.core.method;
 use http.core.status;
 use A: std.allocator;
 use std.allocator.fixed;
+use std.chrono.time;
 use J: std.data.json;
 use std.encoding.base64;
 use fs: std.filesystem;
@@ -39,6 +40,11 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
+
+# a fixed monotonic instant, nanoseconds after the clock's start
+fun at(ns: i64) time.Instant {
+    ret time.Instant{sec: ns / 1000000000, nsec: ns % 1000000000};
+}
 
 fun fixed_ok(outcome: err[A.Error]) bool {
     ret sel outcome.ok;
@@ -3788,8 +3794,8 @@ test "challenge: presentation and cleanup run exactly once on every exit" {
         problem.failed(challenge.begin(?timed_attempt, subject,
         pending_challenge(challenge.DNS_01), key_auth))) { ret 13; }
     var waiting: poll.State;
-    if (problem.failed(poll.begin(?waiting, poll.policy_default(), 0)) ||
-        poll.next(?waiting, false, false, 0, 1).action != poll.DEADLINE) {
+    if (problem.failed(poll.begin(?waiting, poll.policy_default(), at(0))) ||
+        poll.next(?waiting, false, false, 0, at(1)).action != poll.DEADLINE) {
         ret 14;
     }
     if (problem.failed(challenge.finish(?timed_attempt)) ||
@@ -3806,8 +3812,8 @@ test "challenge: presentation and cleanup run exactly once on every exit" {
         pending_challenge(challenge.TLS_ALPN_01), key_auth))) { ret 16; }
     var stopping: poll.State;
     if (problem.failed(poll.begin(?stopping, poll.policy_default(),
-        1000000000000)) || !poll.cancel(?stopping) ||
-        poll.next(?stopping, false, false, 0, 0).action != poll.CANCELLED) {
+        at(1000000000000))) || !poll.cancel(?stopping) ||
+        poll.next(?stopping, false, false, 0, at(0)).action != poll.CANCELLED) {
         ret 17;
     }
     if (problem.failed(challenge.finish(?cancelled_attempt)) ||
@@ -3893,17 +3899,17 @@ test "challenge: dns propagation is bounded, injectable, and consecutive" {
     probe.at         = 0;
     probe.calls      = 0;
     if (problem.failed(challenge.propagation_begin(?state, policy,
-        1000000000000))) { ret 1; }
+        at(1000000000000)))) { ret 1; }
     if (challenge.propagation_next(?state, injected, name, expected,
-        0).action != poll.WAIT || state.confirmed != 0) { ret 2; }
+        at(0)).action != poll.WAIT || state.confirmed != 0) { ret 2; }
     if (challenge.propagation_next(?state, injected, name, expected,
-        0).action != poll.WAIT || state.confirmed != 1) { ret 3; }
+        at(0)).action != poll.WAIT || state.confirmed != 1) { ret 3; }
     if (challenge.propagation_next(?state, injected, name, expected,
-        0).action != poll.WAIT || state.confirmed != 0) { ret 4; }
+        at(0)).action != poll.WAIT || state.confirmed != 0) { ret 4; }
     if (challenge.propagation_next(?state, injected, name, expected,
-        0).action != poll.WAIT || state.confirmed != 1) { ret 5; }
+        at(0)).action != poll.WAIT || state.confirmed != 1) { ret 5; }
     val settled: poll.Decision = challenge.propagation_next(?state, injected,
-        name, expected, 0);
+        name, expected, at(0));
     if (settled.action != poll.READY || state.confirmed != 2 ||
         probe.calls != 5) { ret 6; }
 
@@ -3920,39 +3926,39 @@ test "challenge: dns propagation is bounded, injectable, and consecutive" {
     val absent: challenge.Probe = challenge.Probe{ctx: (?never)::ptr,
         observe: scripted_observe};
     if (problem.failed(challenge.propagation_begin(?state, policy,
-        1000000000000))) { ret 7; }
+        at(1000000000000)))) { ret 7; }
     var rounds: usize       = 0;
     var action: poll.Action = poll.WAIT;
     for (rounds < 32 && action == poll.WAIT) {
         action = challenge.propagation_next(?state, absent, name, expected,
-            0).action;
+            at(0)).action;
         rounds = rounds + 1;
     }
     if (action != poll.LIMIT || rounds != 9) { ret 8; }
 
     # the absolute deadline and cancellation both stop the wait
-    if (problem.failed(challenge.propagation_begin(?state, policy, 0))) {
+    if (problem.failed(challenge.propagation_begin(?state, policy, at(0)))) {
         ret 9;
     }
     if (challenge.propagation_next(?state, absent, name, expected,
-        1).action != poll.DEADLINE) { ret 10; }
+        at(1)).action != poll.DEADLINE) { ret 10; }
     if (problem.failed(challenge.propagation_begin(?state, policy,
-        1000000000000)) || !challenge.propagation_cancel(?state)) {
+        at(1000000000000))) || !challenge.propagation_cancel(?state)) {
         ret 11;
     }
     val stopped: poll.Decision = challenge.propagation_next(?state, absent,
-        name, expected, 0);
+        name, expected, at(0));
     if (stopped.action != poll.CANCELLED) { ret 12; }
 
     # an absent probe or an empty record is refused before any observation
     var empty: challenge.Probe = injected;
     empty.observe = nil;
     if (problem.failed(challenge.propagation_begin(?state, policy,
-        1000000000000))) { ret 13; }
-    if (challenge.propagation_next(?state, empty, name, expected, 0).action !=
+        at(1000000000000)))) { ret 13; }
+    if (challenge.propagation_next(?state, empty, name, expected, at(0)).action !=
         poll.TERMINAL ||
         challenge.propagation_next(?state, injected, view.view(nil, 0),
-        expected, 0).action != poll.TERMINAL) { ret 14; }
+        expected, at(0)).action != poll.TERMINAL) { ret 14; }
     ret 0;
 }
 

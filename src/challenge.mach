@@ -8,6 +8,7 @@ use acme.poll;
 use acme.problem;
 use crypto.contracts;
 use crypto.hash;
+use std.chrono.time;
 use J: std.data.json;
 use std.encoding.base64;
 use std.sync.atomic;
@@ -595,7 +596,7 @@ pub fun propagation_policy_valid(value: PropagationPolicy) bool {
 }
 
 pub fun propagation_begin(state: *Propagation, policy: PropagationPolicy,
-    deadline_ns: i64) problem.Error {
+    deadline: time.Instant) problem.Error {
     if (state == nil ||
         !memory_range.valid(state::*u8, $size_of(Propagation)) ||
         !propagation_policy_valid(policy)) {
@@ -605,7 +606,7 @@ pub fun propagation_begin(state: *Propagation, policy: PropagationPolicy,
     state.policy    = policy;
     state.confirmed = 0;
     state.checks    = 0;
-    ret poll.begin(?state.state, policy.poll, deadline_ns);
+    ret poll.begin(?state.state, policy.poll, deadline);
 }
 
 pub fun propagation_cancel(state: *Propagation) bool {
@@ -619,7 +620,7 @@ pub fun propagation_cancel(state: *Propagation) bool {
 # one observation per call. confirmations must be consecutive, so a record
 # that appears and then disappears restarts the count rather than proceeding.
 pub fun propagation_next(state: *Propagation, probe: Probe, name: view.View,
-    expected: view.View, now_ns: i64) poll.Decision {
+    expected: view.View, now: time.Instant) poll.Decision {
     if (state == nil ||
         !memory_range.valid(state::*u8, $size_of(Propagation)) ||
         !propagation_policy_valid(state.policy) || probe.observe == nil ||
@@ -628,15 +629,16 @@ pub fun propagation_next(state: *Propagation, probe: Probe, name: view.View,
         expected.len == 0) {
         ret poll.Decision{action: poll.TERMINAL, delay_ns: 0,
             cause: challenge_error(problem.INVALID_INPUT,
-            "invalid propagation probe or record")};
+            "invalid propagation probe or record"), cancelled: false};
     }
+    # nothing has been observed yet, so a cancellation loses nothing here
     if (poll.cancelled(?state.state)) {
-        ret poll.next(?state.state, false, false, 0, now_ns);
+        ret poll.next(?state.state, false, false, 0, now);
     }
     if (state.checks == 0xffffffffffffffff) {
         ret poll.Decision{action: poll.LIMIT, delay_ns: 0,
             cause: problem.local_code(problem.POLICY, problem.RETRY_LIMIT,
-            "propagation check counter exhausted")};
+            "propagation check counter exhausted"), cancelled: false};
     }
     state.checks = state.checks + 1;
     if (probe.observe(probe.ctx, name, expected)) {
@@ -646,7 +648,7 @@ pub fun propagation_next(state: *Propagation, probe: Probe, name: view.View,
         state.confirmed = 0;
     }
     ret poll.next(?state.state,
-        state.confirmed >= state.policy.required_checks, false, 0, now_ns);
+        state.confirmed >= state.policy.required_checks, false, 0, now);
 }
 
 fun same_bytes(first: *u8, second: *u8, len: usize) bool {

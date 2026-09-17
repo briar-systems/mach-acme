@@ -31,6 +31,7 @@ use std.net.ip;
 use std.net.tcp;
 use std.runtime;
 use std.system.os;
+use std.system.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -885,27 +886,27 @@ test "live: post-as-get order polling drives the bounded poll decision" {
     var policy: poll.Policy = poll.policy_default();
     policy.min_delay_ns = 1000000000;
     policy.max_delay_ns = 60000000000;
-    if (problem.failed(poll.begin(?state, policy, 3600000000000))) {
+    if (problem.failed(poll.begin(?state, policy, fixed(3600000000000)))) {
         ret 8;
     }
     val advised: u64           = retry_after(?exchange);
     val waited:  poll.Decision = order.poll_next(?state, polled.status,
-        order.READY, advised, 0);
+        order.READY, advised, fixed(0));
     if (waited.action != poll.WAIT) { ret 9; }
     var expected: u64 = policy.min_delay_ns;
     if (advised * 1000000000 > expected) { expected = advised * 1000000000; }
     if (waited.delay_ns != expected)     { ret 10; }
 
     # an absolute deadline the next wait would pass stops the loop
-    if (problem.failed(poll.begin(?state, policy, 500000000))) { ret 11; }
-    if (order.poll_next(?state, polled.status, order.READY, advised, 0).action
+    if (problem.failed(poll.begin(?state, policy, fixed(500000000)))) { ret 11; }
+    if (order.poll_next(?state, polled.status, order.READY, advised, fixed(0)).action
         != poll.DEADLINE) { ret 12; }
 
     # cancellation is observable from outside the poll loop
-    if (problem.failed(poll.begin(?state, policy, 3600000000000)) ||
+    if (problem.failed(poll.begin(?state, policy, fixed(3600000000000))) ||
         !poll.cancel(?state) ||
         order.poll_next(?state, polled.status, order.READY, advised,
-        0).action != poll.CANCELLED) { ret 13; }
+        fixed(0)).action != poll.CANCELLED) { ret 13; }
     ret 0;
 }
 
@@ -1080,10 +1081,23 @@ rec ReadyOrder {
     value:          order.Order;
 }
 
-fun monotonic_ns() i64 {
-    val clock: T.Clock = T.monotonic();
-    if (sel clock.err) { ret 0; }
-    ret clock.ok.sec * 1000000000 + clock.ok.nsec;
+# a live run cannot bound a wait without the monotonic clock, so a refusal
+# ends the suite rather than degrading into a deadline at the clock's origin
+fun instant_now() T.Instant {
+    val clock: T.InstantClock = T.instant();
+    if (sel clock.ok) { ret clock.ok; }
+    panic.panic("live suite: monotonic clock refused");
+    # unreachable: panic aborts the process
+    ret T.Instant{sec: 0, nsec: 0};
+}
+
+fun deadline_in(nanoseconds: i64) T.Instant {
+    ret T.instant_add(instant_now(), nanoseconds);
+}
+
+# a fixed instant for decisions that depend only on the distance to a deadline
+fun fixed(ns: i64) T.Instant {
+    ret T.Instant{sec: ns / 1000000000, nsec: ns % 1000000000};
 }
 
 # drives one identifier all the way through one challenge type against the
@@ -1099,9 +1113,10 @@ fun unique_name(prefix: str, prefix_len: usize, output: *u8) usize {
         i         = i + 1;
     }
     output[prefix_len] = '-';
-    var value:  u64   = monotonic_ns()::u64;
+    val seed:   T.Instant = instant_now();
+    var value:  u64       = (seed.sec * 1000000000 + seed.nsec)::u64;
     var digits: [24]u8;
-    var count:  usize = 0;
+    var count:  usize     = 0;
     for (count < 14) {
         digits[count] = ('0'::u64 + value % 10)::u8;
         value         = value / 10;
@@ -1180,7 +1195,7 @@ fun run_challenge(session: *Session, exchange: *Exchange, name: str,
     policy.max_delay_ns = 2000000000;
     policy.max_attempts = 40;
     if (problem.failed(poll.begin(?state, policy,
-        monotonic_ns() + 60000000000))) { ret 21; }
+        deadline_in(60000000000)))) { ret 21; }
     @advised = 0;
     var settled: bool  = false;
     var rounds:  usize = 0;
@@ -1196,7 +1211,7 @@ fun run_challenge(session: *Session, exchange: *Exchange, name: str,
         # the wait is taken from the policy floor rather than the advice
         val step: poll.Decision = poll.next(?state,
             authorization.status == order.AUTH_VALID,
-            authorization.status == order.AUTH_INVALID, 0, monotonic_ns());
+            authorization.status == order.AUTH_INVALID, 0, instant_now());
         if (step.action == poll.READY) { settled = true; }
         or (step.action == poll.WAIT)  { os.sleep(step.delay_ns::i64); }
         or                             { ret 23; }
@@ -1392,9 +1407,9 @@ test "live: an order is finalized, downloaded, verified, and revoked" {
     advice_policy.min_delay_ns = 1000000000;
     advice_policy.max_delay_ns = 60000000000;
     if (problem.failed(poll.begin(?advice_state, advice_policy,
-        3600000000000))) { ret 9; }
+        fixed(3600000000000)))) { ret 9; }
     val advised_wait: poll.Decision = poll.next(?advice_state, false, false,
-        finalize_advice, 0);
+        finalize_advice, fixed(0));
     if (advised_wait.action != poll.WAIT ||
         advised_wait.delay_ns != finalize_advice * 1000000000) { ret 10; }
 
@@ -1405,7 +1420,7 @@ test "live: an order is finalized, downloaded, verified, and revoked" {
     policy.max_delay_ns = 2000000000;
     policy.max_attempts = 40;
     if (problem.failed(poll.begin(?state, policy,
-        monotonic_ns() + 60000000000))) { ret 11; }
+        deadline_in(60000000000)))) { ret 11; }
     var issued:                order.Order;
     var issued_text:           [8192]u8;
     var issued_names:          [8]identifier.Identifier;
@@ -1426,7 +1441,7 @@ test "live: an order is finalized, downloaded, verified, and revoked" {
             ?issued_authorizations[0]), ?issued))) { ret 14; }
         val step: poll.Decision = poll.next(?state,
             issued.status == order.VALID, issued.status == order.INVALID, 0,
-            monotonic_ns());
+            instant_now());
         if (step.action == poll.READY) { settled = true; }
         or (step.action == poll.WAIT)  { os.sleep(step.delay_ns::i64); }
         or                             { ret 15; }

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-17
+
+### Changed
+- **Breaking.** Dependencies: mach-std v5.3.0, mach-crypto v0.13.2, mach-http v0.12.0, and `mach.toml` now requires mach `^5.3`. A consumer must be on std 5.x as well. mach-acme itself consumes no std completions and uses only `http.core`, so the std 5.3 completion contract and the http 0.12 engine changes do not reach it (#80).
+- **Breaking.** Poll deadlines and readings are monotonic `std.chrono.time.Instant` values instead of bare `i64` nanoseconds: `poll.begin` takes `deadline: time.Instant`, `poll.next` and `order.poll_next` take `now: time.Instant`, and so do `challenge.propagation_begin` and `challenge.propagation_next`. A wall-clock `time.Time` no longer type-checks as a deadline. The renewal schedule keeps its wall-clock unix seconds, because certificate validity is compared against the outside world (#80).
+- **Breaking.** `poll.next` accounts for the caller's observation before cancellation. An observation that reached the target is `READY`, and a failed one is `TERMINAL`, even after `poll.cancel`. `CANCELLED` is returned only for an observation that made no progress. The old order, which checked cancellation first, could tell a caller to abandon a finalized order that was already `valid`. The next run would then issue again and spend a duplicate-certificate slot. `poll.Decision` gains `cancelled`, which reports that the poll had been cancelled even when a `READY` or `TERMINAL` decision outranked it (#80).
+
+### Changed
+- The copyright is now held by Briar Systems LLC (#78).
+
 ## [0.4.2] - 2026-09-17
 
 ### Changed
