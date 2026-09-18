@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-  # a tag push has no base branch, so release.yml asks for the full tier
+  # a tag push has no base branch, so cd.yml asks for the full tier
   workflow_call:
     inputs:
       heavy:
