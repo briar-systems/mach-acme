@@ -95,11 +95,12 @@ buffer requirements.
 
 ## Dependencies
 
-The repository pins exact released Git tags and builds with mach 5.3.0 or later:
+The manifest selects releases by version range, with the resolved release
+committed as a gitlink under `dep/`, and builds with mach 5.9.0 or later:
 
-- `mach-std` v5.3.0
-- `mach-http` v0.12.0
-- `mach-crypto` v0.13.2
+- `mach-std` `^6.0` (v6.0.0)
+- `mach-http` `^0.15` (v0.15.0)
+- `mach-crypto` `^0.18` (v0.18.0)
 
 Build output uses Mach's repository-local `out/` path. Run the root tests, which
 include the protocol vectors, with:
