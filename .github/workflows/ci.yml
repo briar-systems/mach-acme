@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-  # a tag push has no base branch, so release.yml asks for the full tier
+  # a tag push has no base branch, so cd.yml asks for the full tier
   workflow_call:
     inputs:
       heavy:
@@ -27,6 +27,8 @@ jobs:
     uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
     with:
       heavy: ${{ inputs.heavy }}
+      # crypto 0.17+ links a secret multiply, so the aarch64 tests need FEAT_DIT
+      dit: required
       subprojects: >-
         [{"path": "test/live", "clean-dep": true, "legs": ["x86_64-linux"]}]
       evidence: |
