@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-19
+
 ### Changed
 - **Breaking.** Dependencies: mach-std `^6.0` (v6.0.0), mach-crypto `^0.18` (v0.18.0), mach-http `^0.15` (v0.15.0), selected by version range with the resolved release committed as a gitlink, and `mach.toml` now requires mach `^5.9`. A consumer must be on std 6.x. None of the std 6 migration tables reach mach-acme: it uses no `sort`, `heap`, `map`, `set` or `buffers` account, and its only `std.crypto.ct` call is `zeroize`. crypto's SHA-2 now runs on std's hardware-dispatched states, and `hash.Sha256` stays opaque to the callers here. http 0.15's public surface is unchanged and mach-acme uses only `http.core` (#88).
 - CI asks the family workflow for `dit: required`, because mach-crypto 0.17 and later link a secret multiply that needs FEAT_DIT on aarch64 (#88).
