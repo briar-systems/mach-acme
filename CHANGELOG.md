@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+- **Breaking.** Dependencies: mach-std `^7.0` (v7.0.2), mach-crypto `^0.20` (v0.20.0), mach-http `^0.17` (v0.17.0), selected by version range with the resolved release committed as a gitlink. A consumer must be on std 7.x. None of the std 7 migration items reach mach-acme: it calls no `io.runtime.make`, stores no `data.toml.Value`, and builds no `allocator.page`, `testing` or `arena` (its only allocator construction is `allocator.fixed` in the protocol tests). crypto 0.19 and 0.20 rewrite the P-256, RSA and Poly1305 arithmetic on 64-bit limbs with unchanged signatures and key acceptance, and the JOSE signing paths here exercise them unchanged. http 0.16 and 0.17 change only the exchange engines, retry policy and HTTP/3 surfaces, and mach-acme reaches http only through `core.field`, `core.method` and `core.status`. `mach = "^5.9"` is unchanged (#92).
+- The live conformance subproject pins std v7.0.2, crypto v0.20.0 and http v0.17.0 by tag (#92).
+
 ## [0.6.0] - 2026-09-19
 
 ### Changed
