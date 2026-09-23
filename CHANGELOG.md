@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-23
+
+### Changed
+- Dependencies: mach-http `^0.18` (v0.18.0), so mach-acme resolves alongside a project that needs http 0.18. http 0.18 adds `h2.connection.pending_work` and fixes a frame dropped at end of stream, and mach-acme reaches http only through `core.field`, `core.method` and `core.status`. The live conformance subproject pins http v0.18.0 by tag (#96).
+
 ## [0.7.0] - 2026-09-22
 
 ### Changed
