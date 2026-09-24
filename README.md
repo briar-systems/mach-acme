@@ -103,9 +103,9 @@ buffer requirements.
 The manifest selects releases by version range, with the resolved release
 committed as a gitlink under `dep/`, and builds with mach 5.9.0 or later:
 
-- `mach-std` `^6.0` (v6.0.0)
-- `mach-http` `^0.15` (v0.15.0)
-- `mach-crypto` `^0.18` (v0.18.0)
+- `mach-std` `^7.0` (v7.0.2)
+- `mach-http` `^0.18` (v0.18.0)
+- `mach-crypto` `^0.20` (v0.20.0)
 
 Build output uses Mach's repository-local `out/` path. Run the root tests, which
 include the protocol vectors, with:
