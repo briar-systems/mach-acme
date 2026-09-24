@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- README: "Remaining scope" is removed, because everything it listed as a later layer is implemented. The README now says the library leaves transport to its host, that `test/live` issues a certificate end to end against a real authority, and that hedge provides a production transport. The dependency list names the resolved releases, std v7.0.2, http v0.18.0 and crypto v0.20.0 (#100).
+
 ## [0.7.1] - 2026-09-23
 
 ### Changed
