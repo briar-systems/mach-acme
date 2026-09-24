@@ -1,15 +1,20 @@
 # mach-acme
 
-`mach-acme` provides lightweight, bounded ACME protocol components for Mach. The
-directory, JOSE, replay-nonce, signed-request, account lifecycle, and structured
-problem foundations are implemented. Order, challenge, certificate, and renewal
-contracts remain separate so applications can choose their storage and deployment
-systems.
+`mach-acme` provides lightweight, bounded ACME protocol components for Mach. It
+implements the RFC 8555 lifecycle from directory discovery and account
+management through orders, challenges, finalization, certificate download, and
+revocation, along with durable state and ARI renewal scheduling. Storage,
+challenge presentation, and deployment stay behind caller-supplied contracts so
+applications choose their own systems.
 
-The library does not pretend to be a network client. It produces typed HTTP
-requests and accepts typed HTTP responses. A future `mach-http` client transport
-will execute those requests without changing the ACME state machine or key
-ownership contract.
+The library is not a network client. It produces typed HTTP requests and
+accepts typed HTTP responses, and leaves executing them, TLS included, to its
+host. Given a transport, it issues a certificate end to end: the conformance
+suite in `test/live` orders, validates, finalizes, downloads, verifies, and
+revokes a certificate against a real ACME authority. hedge provides a
+production transport (`hedge.acme.transport` and `hedge.acme.origination`) and
+reaches the Let's Encrypt staging server over TLS through it
+(briar-systems/hedge#227).
 
 ## Implemented
 
@@ -155,15 +160,6 @@ ambiguous transport outcome retains the pending credential so `storage.recover`
 can reconcile the server's active key after restart. `key_change.resolve` accepts
 only a recovered next-generation key replacement and commits or aborts its exact
 transaction.
-
-## Remaining scope
-
-Network execution waits on the production `mach-http` client lifecycle. Order and
-authorization progression, challenge polling, finalization, certificate
-installation, and renewal scheduling are tracked as later ACME layers. The
-current protocol boundary is shaped so those layers add request payloads and
-response decoders without changing signing, nonce, account, or transport
-ownership.
 
 ## Orders and authorizations
 
