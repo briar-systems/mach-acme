@@ -29,6 +29,8 @@ jobs:
       heavy: ${{ inputs.heavy }}
       # std 8 needs mach 5.12, so this seeds v5.12.0 until the family pin moves (briar-systems/.github#103)
       mach-version: v5.12.0
+      # mach 5.12 tests one artifact's closure, and src/test/protocol.mach is reached only by the tests artifact
+      test-selections: '[["--lib", "tests"]]'
       # crypto 0.17+ links a secret multiply, so the aarch64 tests need FEAT_DIT
       dit: required
       subprojects: >-
