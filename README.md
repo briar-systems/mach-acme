@@ -121,7 +121,7 @@ mach test . --lib tests --profile release
 
 `test/selections/verify.sh` fails when a test declared under `src` is collected
 by neither selection on some target. A new module that holds tests and that the
-library does not reach belongs in `src/test/tests.mach`.
+library does not reach belongs in `src/lib/tests.mach`.
 
 `test/live` is a conformance suite that drives a real ACME authority rather
 than a fixture. Start the local stack first, then run it:
