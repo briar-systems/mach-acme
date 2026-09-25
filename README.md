@@ -101,19 +101,27 @@ buffer requirements.
 ## Dependencies
 
 The manifest selects releases by version range, with the resolved release
-committed as a gitlink under `dep/`, and builds with mach 5.9.0 or later:
+committed as a gitlink under `dep/`, and builds with mach 5.12.0 or later:
 
-- `mach-std` `^7.0` (v7.0.2)
-- `mach-http` `^0.18` (v0.18.0)
-- `mach-crypto` `^0.20` (v0.20.0)
+- `mach-std` `^8.0` (v8.0.0)
+- `mach-http` `^0.19` (v0.19.0)
+- `mach-crypto` `^0.22` (v0.22.0)
 
-Build output uses Mach's repository-local `out/` path. Run the root tests, which
-include the protocol vectors, with:
+Build output uses Mach's repository-local `out/` path. `mach test` runs the
+tests of one artifact's closure. The library artifact, `acme`, is the default.
+The protocol vectors in `src/test` are reached only by the test-only `tests`
+artifact, so run both selections:
 
 ```text
 mach test . --profile debug
+mach test . --lib tests --profile debug
 mach test . --profile release
+mach test . --lib tests --profile release
 ```
+
+`test/selections/verify.sh` fails when a test declared under `src` is collected
+by neither selection on some target. A new module that holds tests and that the
+library does not reach belongs in `src/test/tests.mach`.
 
 `test/live` is a conformance suite that drives a real ACME authority rather
 than a fixture. Start the local stack first, then run it:
