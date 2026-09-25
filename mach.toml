@@ -1,7 +1,7 @@
 [project]
 id = "acme"
 mach = "^5.12"
-version = "0.8.1"
+version = "0.9.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -80,4 +80,4 @@ version = "^0.22"
 
 [dep.http]
 git = "https://github.com/briar-systems/mach-http"
-version = "^0.19"
+version = "^0.20"

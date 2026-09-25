@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-25
+
+### Changed
+- **Breaking.** Dependencies: mach-http `^0.20` at v0.20.0 (was `^0.19` at v0.19.0). Resolution is flat, so a consumer must move to http 0.20 with it. http 0.20 adds `EVENT_REQUEST_REJECTED` to the server h1 engine, a query check in the router and `core.target`, and mach-acme reaches http only through `core.field`, `core.method` and `core.status`, so nothing it uses changes. The live conformance subproject pins http v0.20.0 by tag, and its suite passes against pebble (#110).
+
 ## [0.8.1] - 2026-09-25
 
 ### Changed
