@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-25
+
+### Changed
+- **Breaking.** Dependencies: mach-std `^8.0` (v8.0.0, was `^7.0` at v7.0.2), mach-crypto `^0.22` (v0.22.0, was `^0.20` at v0.20.0), mach-http `^0.19` (v0.19.0, was `^0.18` at v0.18.0), and mach `^5.12` (was `^5.9`), which std 8 requires. Resolution is flat, so a consumer must move to std 8.x and mach 5.12 with it. Rebuild anything that links std rather than recompiling against the new sources, as std's release notes say. std 8 adds the typed secret view and grows `buffers.SecretSource`, and mach-acme uses neither. crypto 0.21 and 0.22 change AES and AES-GCM, which mach-acme does not reach, and http 0.19 changes only h2. The only source change is the layout mach 5.12's formatter requires in `src/test/protocol.mach` (#101).
+- The protocol vectors in `src/test/protocol.mach` run under `mach test . --lib tests`. mach 5.12 tests only the selected artifact's closure (briar-systems/mach#3813), so `mach test .` alone now collects the 15 tests the library reaches and not the other 46. The test-only `[artifact.tests]` reaches them, and `[artifact.acme]` is marked `default = true`, so `mach build .`, `--all-targets` and a consumer's `use acme` still select the library alone. `test/selections/verify.sh` fails when a test declared under `src` is collected by neither selection on some target, and CI runs it on the primary leg (#101).
+- CI seeds mach v5.12.0 until the family pin moves (briar-systems/.github#103), and runs the `tests` selection on every leg. The live conformance subproject pins std v8.0.0, crypto v0.22.0 and http v0.19.0 by tag (#101).
+
+### Fixed
+- README: "Remaining scope" is removed, because everything it listed as a later layer is implemented. The README now says the library leaves transport to its host, that `test/live` issues a certificate end to end against a real authority, and that hedge provides a production transport. The dependency list names the resolved releases, std v7.0.2, http v0.18.0 and crypto v0.20.0 (#100).
+
 ## [0.7.1] - 2026-09-23
 
 ### Changed
