@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-25
+
 ### Changed
 
 - The library entry moved from `src/lib.mach` to `src/lib/acme.mach` and the tests entry from `src/test/tests.mach` to `src/lib/tests.mach`, the family layout for artifact entries (briar-systems/.github#107). A bare `use acme;` still binds the library entry, and every other module path is unchanged. The entry module itself is now `acme.lib.acme`, so an import that named `acme.lib` directly names that path or uses `use acme;` instead (#106).
