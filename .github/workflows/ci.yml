@@ -27,6 +27,8 @@ jobs:
     uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
     with:
       heavy: ${{ inputs.heavy }}
+      # std 8 needs mach 5.12, so this seeds v5.12.0 until the family pin moves (briar-systems/.github#103)
+      mach-version: v5.12.0
       # crypto 0.17+ links a secret multiply, so the aarch64 tests need FEAT_DIT
       dit: required
       subprojects: >-

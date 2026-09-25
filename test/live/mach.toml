@@ -1,6 +1,6 @@
 [project]
 id = "acme-live-test"
-mach = "^5.9"
+mach = "^5.12"
 version = "0.0.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
@@ -41,12 +41,12 @@ path = "../.."
 # pin for a dependency it selects by version, and this tree is not committed
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v7.0.2"
+ref = "tag/v8.0.0"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.20.0"
+ref = "tag/v0.22.0"
 
 [dep.http]
 git = "https://github.com/briar-systems/mach-http"
-ref = "tag/v0.18.0"
+ref = "tag/v0.19.0"
