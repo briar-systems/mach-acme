@@ -724,7 +724,7 @@ test "jose: rfc 8032 ed25519 account signing vector is exact" {
         value: contracts.Bytes{data: (?public_key_bytes[0]):~*u8, len: 32}};
     val private_key: jose.PrivateKey = jose.PrivateKey{algorithm: jose.EDDSA,
         secret_owner: ((?public_key_bytes[0]):~*u8)::ptr,
-        value: contracts.SecretBytes{data: ?seed[0], len: 32}};
+        value:        contracts.SecretBytes{data: ?seed[0], len: 32}};
     var jwk:     [80]u8;
     val encoded: jose.Operation = jose.key_encode_jwk(public_key,
         contracts.Buffer{data: ?jwk[0], capacity: 80});
@@ -4452,14 +4452,14 @@ fun cert_record(store: *CertStore, generation: u64,
     store.names[0] = identifier.Identifier{kind: identifier.DNS,
         value: view.view(?store.name_bytes[0], 18)};
     ret storage.CertificateRecord{
-        storage_key:     view.view(?store.key_bytes[0], 18),
-        certificate_url: view.view(?store.url_bytes[0], 26),
-        chain_der:       view.view(?store.chain_bytes[0], 256),
-        chain_len:       chain_len,
+        storage_key:       view.view(?store.key_bytes[0], 18),
+        certificate_url:   view.view(?store.url_bytes[0], 26),
+        chain_der:         view.view(?store.chain_bytes[0], 256),
+        chain_len:         chain_len,
         private_key_owner: (?store.secret_owner)::ptr,
-        identifiers:     ?store.names[0], identifier_len: 1,
-        not_before_unix: 1787955089, not_after_unix: 1795731089,
-        generation:      generation
+        identifiers:       ?store.names[0], identifier_len: 1,
+        not_before_unix:   1787955089, not_after_unix: 1795731089,
+        generation:        generation
     };
 }
 
