@@ -164,11 +164,12 @@ pub fun next(state: *State, reached: bool, terminal: bool,
 }
 
 # a fixed monotonic instant, nanoseconds after the clock's start
+#[testing]
 fun at(ns: i64) time.Instant {
     ret time.Instant{sec: ns / 1000000000, nsec: ns % 1000000000};
 }
 
-test "acme.poll: waits are bounded, advised, and deadline aware" {
+test next__bounded_advised_deadline_aware {
     var state:  State;
     var policy: Policy = policy_default();
     policy.min_delay_ns = 1000000000;

@@ -957,11 +957,12 @@ pub fun poll_next(state: *poll.State, current: u8, target: u8,
 }
 
 # a fixed monotonic instant, nanoseconds after the clock's start
+#[testing]
 fun at(ns: i64) time.Instant {
     ret time.Instant{sec: ns / 1000000000, nsec: ns % 1000000000};
 }
 
-test "acme.order: polling maps order statuses onto the bounded decision" {
+test poll_next__order_statuses {
     var state:  poll.State;
     var policy: poll.Policy = poll.policy_default();
     policy.min_delay_ns = 1000000000;

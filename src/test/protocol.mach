@@ -42,23 +42,28 @@ use std.types.string.str;
 use std.types.view;
 
 # a fixed monotonic instant, nanoseconds after the clock's start
+#[testing]
 fun at(ns: i64) time.Instant {
     ret time.Instant{sec: ns / 1000000000, nsec: ns % 1000000000};
 }
 
+#[testing]
 fun fixed_ok(outcome: err[A.Error]) bool {
     ret sel outcome.ok;
 }
 
+#[testing]
 fun fs_ok(outcome: err[fs.FsError]) bool {
     ret sel outcome.ok;
 }
 
+#[testing]
 fun file_exists(path: str) bool {
     val present: res[bool, IO.Error] = fs.exists(path);
     ret (sel present.ok) && present.ok;
 }
 
+#[testing]
 fun equal(first: *u8, second: *u8, len: usize) bool {
     var i: usize = 0;
     for (i < len) {
@@ -68,6 +73,7 @@ fun equal(first: *u8, second: *u8, len: usize) bool {
     ret true;
 }
 
+#[testing]
 fun filled(data: *u8, value: u8, len: usize) bool {
     var i: usize = 0;
     for (i < len) {
@@ -77,6 +83,7 @@ fun filled(data: *u8, value: u8, len: usize) bool {
     ret true;
 }
 
+#[testing]
 fun fill(data: *u8, value: u8, len: usize) {
     var i: usize = 0;
     for (i < len) {
@@ -85,6 +92,7 @@ fun fill(data: *u8, value: u8, len: usize) {
     }
 }
 
+#[testing]
 fun copy(data: *u8, source: *u8, len: usize) {
     var i: usize = 0;
     for (i < len) {
@@ -93,12 +101,14 @@ fun copy(data: *u8, source: *u8, len: usize) {
     }
 }
 
+#[testing]
 fun length(text: *u8) usize {
     var len: usize = 0;
     for (text[len] != 0) { len = len + 1; }
     ret len;
 }
 
+#[testing]
 fun deterministic_entropy(ctx: ptr, output: contracts.SecretBuffer) contracts.Error {
     if (output.data == nil || output.capacity < 32) { ret contracts.INVALID_INPUT; }
     var i: usize = 0;
@@ -109,10 +119,12 @@ fun deterministic_entropy(ctx: ptr, output: contracts.SecretBuffer) contracts.Er
     ret contracts.OK;
 }
 
+#[testing]
 rec ForeignEntropy {
     target: *u8;
 }
 
+#[testing]
 fun foreign_entropy(ctx: ptr,
     output: contracts.SecretBuffer) contracts.Error {
     val value: *ForeignEntropy = ctx::*ForeignEntropy;
@@ -128,14 +140,17 @@ fun foreign_entropy(ctx: ptr,
     ret contracts.OK;
 }
 
+#[testing]
 fun unavailable_entropy(ctx: ptr, output: contracts.SecretBuffer) contracts.Error {
     ret contracts.ENTROPY_UNAVAILABLE;
 }
 
+#[testing]
 fun entropy_aliases_nothing(ctx: ptr, data: *u8, len: usize) bool {
     ret false;
 }
 
+#[testing]
 fun entropy_mutates_foreign(ctx: ptr, data: *u8, len: usize) bool {
     val value: *ForeignEntropy = ctx::*ForeignEntropy;
     if (value.target != nil) {
@@ -145,22 +160,27 @@ fun entropy_mutates_foreign(ctx: ptr, data: *u8, len: usize) bool {
     ret false;
 }
 
+#[testing]
 fun entropy_aliases_no_secret(ctx: ptr, data: *^u8, len: usize) bool {
     ret false;
 }
 
+#[testing]
 fun entropy_still_valid(ctx: ptr) bool {
     ret true;
 }
 
+#[testing]
 fun entropy_invalid_after(ctx: ptr) bool {
     ret false;
 }
 
+#[testing]
 rec SecretAliasProbe {
     private_queried: bool;
 }
 
+#[testing]
 fun entropy_aliases_private(ctx: ptr, data: *^u8, len: usize) bool {
     val probe: *SecretAliasProbe = ctx::*SecretAliasProbe;
     if (len == 256) {
@@ -170,17 +190,20 @@ fun entropy_aliases_private(ctx: ptr, data: *^u8, len: usize) bool {
     ret false;
 }
 
+#[testing]
 rec HostileEntropy {
     owned:     *u8;
     owned_len: usize;
     mutate:    *u8;
 }
 
+#[testing]
 fun hostile_entropy_aliases(ctx: ptr, data: *u8, len: usize) bool {
     val hostile: *HostileEntropy = ctx::*HostileEntropy;
     ret memory_range.overlap(data, len, hostile.owned, hostile.owned_len);
 }
 
+#[testing]
 fun hostile_entropy_fill(ctx: ptr,
     output: contracts.SecretBuffer) contracts.Error {
     val hostile: *HostileEntropy = ctx::*HostileEntropy;
@@ -198,6 +221,7 @@ fun hostile_entropy_fill(ctx: ptr,
     ret contracts.OK;
 }
 
+#[testing]
 fun set_private(output: *^u8) {
     val value: [32]u8 = [32]u8{
         0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16,
@@ -212,6 +236,7 @@ fun set_private(output: *^u8) {
     }
 }
 
+#[testing]
 fun es_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
     private_bytes: *^u8, public_bytes: *u8) bool {
     set_private(private_bytes);
@@ -226,6 +251,7 @@ fun es_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
     ret true;
 }
 
+#[testing]
 fun ed_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
     private_bytes: *^u8, public_bytes: *u8) {
     val seed: [32]u8 = [32]u8{
@@ -253,6 +279,7 @@ fun ed_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
         value:        contracts.SecretBytes{data: private_bytes, len: 32}};
 }
 
+#[testing]
 fun rsa_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
     modulus: *u8, exponent: *u8, private_bytes: *^u8,
     decode_work: *u8) bool {
@@ -283,15 +310,18 @@ fun rsa_keys(public_key: *jose.PublicKey, private_key: *jose.PrivateKey,
     ret true;
 }
 
+#[testing]
 fun empty_fields(fields: *field.Fields) {
     @fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
 }
 
+#[testing]
 fun response(code: u16, fields: *field.Fields, body: view.View) client.Response {
     ret client.Response{status: code, fields: fields, body: body,
         retry_after_seconds: 0};
 }
 
+#[testing]
 fun awaiting(protocol: *client.Client, request: *client.SignedRequest) {
     request.state = client.REQUEST_EMPTY;
     client.begin_signed(protocol, request, client.SignedSpec{
@@ -304,6 +334,7 @@ fun awaiting(protocol: *client.Client, request: *client.SignedRequest) {
     request.state     = client.REQUEST_AWAITING;
 }
 
+#[testing]
 rec AcceptContext {
     protocol: *client.Client;
     request:  *client.SignedRequest;
@@ -311,6 +342,7 @@ rec AcceptContext {
     result:   *i64;
 }
 
+#[testing]
 fun accept_worker(arg: *u8) {
     val context:  *AcceptContext  = arg::*AcceptContext;
     val decision: client.Decision = client.accept_signed_response(
@@ -324,18 +356,30 @@ fun accept_worker(arg: *u8) {
     or { atomic.store(context.result, -1); }
 }
 
-val HOSTILE_NORMAL:        u8 = 0;
-val HOSTILE_OVERSIZED:     u8 = 1;
-val HOSTILE_FOREIGN:       u8 = 2;
-val HOSTILE_TAKE_REQUEST:  u8 = 3;
-val HOSTILE_TAKE_CLIENT:   u8 = 4;
-val HOSTILE_PUT_REQUEST:   u8 = 5;
+#[testing]
+val HOSTILE_NORMAL: u8 = 0;
+#[testing]
+val HOSTILE_OVERSIZED: u8 = 1;
+#[testing]
+val HOSTILE_FOREIGN: u8 = 2;
+#[testing]
+val HOSTILE_TAKE_REQUEST: u8 = 3;
+#[testing]
+val HOSTILE_TAKE_CLIENT: u8 = 4;
+#[testing]
+val HOSTILE_PUT_REQUEST: u8 = 5;
+#[testing]
 val HOSTILE_CLEAR_REQUEST: u8 = 6;
-val HOSTILE_PUT_FAIL:      u8 = 7;
-val HOSTILE_COMMIT_FAIL:   u8 = 8;
-val HOSTILE_RELEASE_FAIL:  u8 = 9;
-val HOSTILE_REENTER:       u8 = 10;
+#[testing]
+val HOSTILE_PUT_FAIL: u8 = 7;
+#[testing]
+val HOSTILE_COMMIT_FAIL: u8 = 8;
+#[testing]
+val HOSTILE_RELEASE_FAIL: u8 = 9;
+#[testing]
+val HOSTILE_REENTER: u8 = 10;
 
+#[testing]
 rec HostilePool {
     mode:          u8;
     protocol:      *client.Client;
@@ -348,15 +392,18 @@ rec HostilePool {
     reentered:     bool;
 }
 
+#[testing]
 fun hostile_ready(ctx: ptr) bool {
     ret ctx::*HostilePool != nil;
 }
 
+#[testing]
 fun hostile_aliases(ctx: ptr, data: *u8, len: usize) bool {
     val hostile: *HostilePool = ctx::*HostilePool;
     ret memory_range.overlap(data, len, hostile.owned, hostile.owned_len);
 }
 
+#[testing]
 fun hostile_reserve(ctx: ptr, output: *u8,
     capacity: usize) nonce.Reservation {
     val hostile: *HostilePool = ctx::*HostilePool;
@@ -387,6 +434,7 @@ fun hostile_reserve(ctx: ptr, output: *u8,
         value: view.view(output, 12)};
 }
 
+#[testing]
 fun hostile_commit(ctx: ptr, token: u64) problem.Error {
     val hostile: *HostilePool = ctx::*HostilePool;
     hostile.commit_count = hostile.commit_count + 1;
@@ -401,6 +449,7 @@ fun hostile_commit(ctx: ptr, token: u64) problem.Error {
     ret problem.none();
 }
 
+#[testing]
 fun hostile_release(ctx: ptr, token: u64) problem.Error {
     val hostile: *HostilePool = ctx::*HostilePool;
     hostile.release_count = hostile.release_count + 1;
@@ -411,11 +460,13 @@ fun hostile_release(ctx: ptr, token: u64) problem.Error {
     ret problem.none();
 }
 
+#[testing]
 fun hostile_owns_secret(ctx: ptr, owner: ptr) bool {
     val hostile: *HostilePool = ctx::*HostilePool;
     ret owner != nil && owner == hostile.secret_owner;
 }
 
+#[testing]
 fun hostile_put(ctx: ptr, value: view.View) problem.Error {
     val hostile: *HostilePool = ctx::*HostilePool;
     if (hostile.mode == HOSTILE_PUT_REQUEST && hostile.request != nil) {
@@ -428,6 +479,7 @@ fun hostile_put(ctx: ptr, value: view.View) problem.Error {
     ret problem.none();
 }
 
+#[testing]
 fun hostile_clear(ctx: ptr) problem.Error {
     val hostile: *HostilePool = ctx::*HostilePool;
     if (hostile.mode == HOSTILE_CLEAR_REQUEST && hostile.request != nil) {
@@ -436,6 +488,7 @@ fun hostile_clear(ctx: ptr) problem.Error {
     ret problem.none();
 }
 
+#[testing]
 fun hostile_pool(context: *HostilePool) nonce.Pool {
     ret nonce.Pool{ctx: context::ptr, reserve: hostile_reserve,
         commit:          hostile_commit, release: hostile_release, put: hostile_put,
@@ -444,7 +497,7 @@ fun hostile_pool(context: *HostilePool) nonce.Pool {
         max_nonce_bytes: 64, capacity: 4};
 }
 
-test "jose: rfc 7638 rsa jwk and sha-256 thumbprint are exact" {
+test jose__rsa_jwk_thumbprint_rfc_7638 {
     val modulus_text: *u8 = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw";
     var modulus:      [256]u8;
     var exponent:     [3]u8;
@@ -471,7 +524,7 @@ test "jose: rfc 7638 rsa jwk and sha-256 thumbprint are exact" {
     ret 0;
 }
 
-test "jose: rfc 8555 protected fields are canonical and output is transactional" {
+test jose__protected_fields_canonical {
     var private_bytes: [32]^u8;
     var public_bytes:  [65]u8;
     var public_key:    jose.PublicKey;
@@ -547,7 +600,7 @@ test "jose: rfc 8555 protected fields are canonical and output is transactional"
     ret 0;
 }
 
-test "jose and json: hostile aliases and overflowing views fail before mutation" {
+test jose__hostile_aliases_and_overflow {
     var private_bytes: [32]^u8;
     var public_bytes:  [65]u8;
     var public_key:    jose.PublicKey;
@@ -635,7 +688,7 @@ test "jose and json: hostile aliases and overflowing views fail before mutation"
     ret 0;
 }
 
-test "json: numeric grammar, key lookup, and duplicate work fail closed" {
+test json__numeric_grammar_and_duplicate_work {
     var scratch:    [8192]u8;
     val configured: json.Limits = json.Limits{max_bytes: 256,
         max_depth:           4, max_values: 16, max_key_bytes: 16,
@@ -697,7 +750,7 @@ test "json: numeric grammar, key lookup, and duplicate work fail closed" {
     ret 0;
 }
 
-test "jose: rfc 8032 ed25519 account signing vector is exact" {
+test jose__ed25519_vector_rfc_8032 {
     var seed: [32]^u8 = [32]^u8{
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60,
         0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
@@ -741,7 +794,7 @@ test "jose: rfc 8032 ed25519 account signing vector is exact" {
     ret 0;
 }
 
-test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures" {
+test jose__rsa_pss_entropy {
     val modulus_text:   *u8 = "p_teNxO8by2eprJiu3ngRFferEuSKek_LmzyJCkogfOvJaUhm7J_SNN3xzaNNHpDvwsnw1sucOIckxzOySA-fqApVBCRo6R4zQ45x_hThuOcqKLMs4Pv4NngoOq-lbu4To76FfOFwgdrqqKPoOopivLyo-CmvmrcEvT21uBl_MKNeJw_LdqkVE6YyHmnBdESgcGSamwFKwBeF5UAZrr3mDD7HTNFR6OO5HBNokQdOWZ_U_PFoZGhrYp36JhvnNAewm1MDaItjskRlOWaE3mRmcscE855_ttHe_T_St-0LxH5Ik0Urtio0HY58zUT0MiZKVKluFQvlKo9fm_Nor5esQ";
     val private_text:   *u8 = "eTcvHD0dE50cY23fSAUBQpkTfu6uBeKYAr8kMv0AQqF1qvknOaVZGMHt3zxVDVb2As8FXe6gfab1kyCNctT61hKzv_pHHfgMs8cUvTy5LfQIJZYLl7WGcW0Qr6Ai8CmcmlzSEOmbzhC6d5mWpqd3N2P9c3G2mBYyCtdVWh3TeoKHcutpJXAdfkWfc-aLeOuF46OMY-HdBYkL3uG77bgkdXbfgrhzDNMRWxRyUxOD_RRQ6UvzHy0Xb3KnN971VZFWydjrH_Hz-aj5T7Kmfu8h-dDMc_DonPEzhJ4SyO5vITdm_llR2MJJf8NhsXl4lQqKm1deNI2x04m6Kr6nzBaB";
     var modulus:        [256]u8;
@@ -853,7 +906,7 @@ test "jose: openssl rsa-pss fixture uses bounded entropy and preserves failures"
     ret 0;
 }
 
-test "client: wire requests bind exact body and transport policy" {
+test client__wire_request_binding {
     var configured: client.Limits = client.limits_default();
     configured.request_timeout_ns = 123456789;
     val directory_url: view.View          = view.view("https://example.com/acme/directory", 34);
@@ -951,7 +1004,7 @@ test "client: wire requests bind exact body and transport policy" {
     ret 0;
 }
 
-test "client: https scheme matching is ascii case insensitive" {
+test client__https_scheme_case_insensitive {
     val configured: client.Limits = client.limits_default();
     val mixed_url:  view.View     = view.view(
         "HtTpS://example.com/acme/directory", 34);
@@ -990,7 +1043,7 @@ test "client: https scheme matching is ascii case insensitive" {
     ret 0;
 }
 
-test "client: mutable state and parser aliases fail transactionally" {
+test client__state_and_parser_aliases {
     val configured: client.Limits = client.limits_default();
     var fields:     field.Fields;
     empty_fields(?fields);
@@ -1141,7 +1194,7 @@ test "client: mutable state and parser aliases fail transactionally" {
     ret 0;
 }
 
-test "client: ownership generations reject foreign and stale request handles" {
+test client__ownership_generations {
     var slots:         [2]nonce.Slot;
     var nonce_storage: [128]u8;
     var memory:        nonce.Memory;
@@ -1194,7 +1247,7 @@ test "client: ownership generations reject foreign and stale request handles" {
     ret 0;
 }
 
-test "client: lets encrypt staging directory fixture discovers bounded endpoints" {
+test client__staging_directory_fixture {
     val body:   *u8 = "{\"FrDPtXot1mU\":\"https://community.letsencrypt.org/t/adding-random-entries-to-the-directory/33417\",\"keyChange\":\"https://acme-staging-v02.api.letsencrypt.org/acme/key-change\",\"meta\":{\"caaIdentities\":[\"letsencrypt.org\"],\"profiles\":{\"classic\":\"https://letsencrypt.org/docs/profiles#classic\"},\"termsOfService\":\"https://letsencrypt.org/documents/LE-SA-v1.8-July-06-2026.pdf\",\"website\":\"https://letsencrypt.org/docs/staging-environment/\"},\"newAccount\":\"https://acme-staging-v02.api.letsencrypt.org/acme/new-acct\",\"newNonce\":\"https://acme-staging-v02.api.letsencrypt.org/acme/new-nonce\",\"newOrder\":\"https://acme-staging-v02.api.letsencrypt.org/acme/new-order\",\"renewalInfo\":\"https://acme-staging-v02.api.letsencrypt.org/acme/renewal-info\",\"revokeCert\":\"https://acme-staging-v02.api.letsencrypt.org/acme/revoke-cert\"}";
     var fields: field.Fields;
     empty_fields(?fields);
@@ -1220,7 +1273,7 @@ test "client: lets encrypt staging directory fixture discovers bounded endpoints
     ret 0;
 }
 
-test "client: hostile directory inputs preserve caller outputs" {
+test client__hostile_directory_inputs {
     val duplicate: *u8 = "{\"newNonce\":\"https://a.example/nonce\",\"newNonce\":\"https://b.example/nonce\",\"newAccount\":\"https://a.example/account\",\"newOrder\":\"https://a.example/order\"}";
     var fields:    field.Fields;
     empty_fields(?fields);
@@ -1256,7 +1309,7 @@ test "client: hostile directory inputs preserve caller outputs" {
     ret 0;
 }
 
-test "client: directory response policy rejects and sanitizes hostile shapes" {
+test client__directory_response_policy {
     var fields: field.Fields;
     empty_fields(?fields);
     var configured: client.Limits = client.limits_default();
@@ -1300,7 +1353,7 @@ test "client: directory response policy rejects and sanitizes hostile shapes" {
     ret 0;
 }
 
-test "client: badNonce consumes stale state and retries with the fresh response nonce" {
+test client__bad_nonce_retry {
     var slots:         [3]nonce.Slot;
     var nonce_storage: [192]u8;
     var memory:        nonce.Memory;
@@ -1364,7 +1417,7 @@ test "client: badNonce consumes stale state and retries with the fresh response 
     ret 0;
 }
 
-test "client: interleaved badNonce recovery remains bound to each request" {
+test client__bad_nonce_interleaved {
     var slots:         [4]nonce.Slot;
     var nonce_storage: [256]u8;
     var memory:        nonce.Memory;
@@ -1473,7 +1526,7 @@ test "client: interleaved badNonce recovery remains bound to each request" {
     ret 0;
 }
 
-test "client: badNonce acquisition and retry exhaustion preserve protocol causes" {
+test client__bad_nonce_exhaustion {
     var slots:         [2]nonce.Slot;
     var nonce_storage: [128]u8;
     var memory:        nonce.Memory;
@@ -1535,7 +1588,7 @@ test "client: badNonce acquisition and retry exhaustion preserve protocol causes
     ret 0;
 }
 
-test "client: malformed acme problems retain their http cause transactionally" {
+test client__malformed_problem_http_cause {
     var slots:         [1]nonce.Slot;
     var nonce_storage: [64]u8;
     var memory:        nonce.Memory;
@@ -1591,7 +1644,7 @@ test "client: malformed acme problems retain their http cause transactionally" {
     ret 0;
 }
 
-test "client: invalid and excess response nonces are ignored" {
+test client__invalid_response_nonces {
     var slots:         [1]nonce.Slot;
     var nonce_storage: [64]u8;
     var memory:        nonce.Memory;
@@ -1651,7 +1704,7 @@ test "client: invalid and excess response nonces are ignored" {
     ret 0;
 }
 
-test "client: nonce callbacks preserve immutable descriptors and exact state" {
+test client__nonce_callback_descriptors {
     var private_bytes: [32]^u8;
     var public_bytes:  [65]u8;
     var public_key:    jose.PublicKey;
@@ -1783,7 +1836,7 @@ test "client: nonce callbacks preserve immutable descriptors and exact state" {
     ret 0;
 }
 
-test "client: nonce provider ownership is disjoint at every callback boundary" {
+test client__nonce_provider_ownership {
     var context:  HostilePool;
     var pool:     nonce.Pool = hostile_pool(?context);
     var protocol: client.Client;
@@ -1824,7 +1877,7 @@ test "client: nonce provider ownership is disjoint at every callback boundary" {
     ret 0;
 }
 
-test "client: provider transactions fail closed before wire publication" {
+test client__provider_transactions_fail_closed {
     var private_bytes: [32]^u8;
     var public_bytes:  [65]u8;
     var public_key:    jose.PublicKey;
@@ -1980,7 +2033,7 @@ test "client: provider transactions fail closed before wire publication" {
     ret 0;
 }
 
-test "client: callback boundaries serialize concurrent requests" {
+test client__callbacks_serialize_concurrent_requests {
     var slots:         [4]nonce.Slot;
     var nonce_storage: [256]u8;
     var memory:        nonce.Memory;
@@ -2041,7 +2094,7 @@ test "client: callback boundaries serialize concurrent requests" {
     ret 0;
 }
 
-test "client: signed url payload and kid are immutably bound" {
+test client__signed_request_binding {
     var slots:         [1]nonce.Slot;
     var nonce_storage: [64]u8;
     var memory:        nonce.Memory;
@@ -2149,31 +2202,7 @@ test "client: signed url payload and kid are immutably bound" {
     ret 0;
 }
 
-test "nonce: hostile values, duplicates, and small outputs are transactional" {
-    var slots:   [1]nonce.Slot;
-    var storage: [16]u8;
-    var memory:  nonce.Memory;
-    if (problem.failed(nonce.init_memory(?memory, ?slots[0], 1, ?storage[0], 16, 16))) {
-        ret 1;
-    }
-    val pool: nonce.Pool = nonce.pool(?memory);
-    if (pool.put(pool.ctx, view.view("bad+nonce", 9)).code != problem.INVALID_INPUT ||
-        problem.failed(pool.put(pool.ctx, view.view("valid_nonce", 11))) ||
-        pool.put(pool.ctx, view.view("valid_nonce", 11)).code != problem.DUPLICATE_NONCE) {
-        ret 2;
-    }
-    var output: [16]u8;
-    fill(?output[0], 0xcc, 16);
-    val small: nonce.Taken = nonce.take(pool, ?output[0], 4);
-    if (small.error.code != problem.OUTPUT_TOO_SMALL || small.found ||
-        !filled(?output[0], 0xcc, 16)) { ret 3; }
-    val taken: nonce.Taken = nonce.take(pool, ?output[0], 16);
-    if (problem.failed(taken.error) || !taken.found || taken.value.len != 11) { ret 4; }
-    val exhausted: nonce.Taken = nonce.take(pool, ?output[0], 16);
-    if (problem.failed(exhausted.error) || exhausted.found) { ret 5; }
-    ret 0;
-}
-
+#[testing]
 rec AccountStore {
     anchor:                  u8;
     gate:                    storage.Gate;
@@ -2208,6 +2237,7 @@ rec AccountStore {
     path:                    *u8;
 }
 
+#[testing]
 fun disk_u64_write(data: *u8, offset: usize, value: u64) {
     var i: usize = 0;
     for (i < 8) {
@@ -2216,6 +2246,7 @@ fun disk_u64_write(data: *u8, offset: usize, value: u64) {
     }
 }
 
+#[testing]
 fun disk_u64_read(data: *u8, offset: usize) u64 {
     var value: u64   = 0;
     var i:     usize = 0;
@@ -2226,6 +2257,7 @@ fun disk_u64_read(data: *u8, offset: usize) u64 {
     ret value;
 }
 
+#[testing]
 fun disk_checksum(data: *u8, len: usize) u64 {
     var result: u64   = 0xcbf29ce484222325;
     var i:      usize = 0;
@@ -2236,6 +2268,7 @@ fun disk_checksum(data: *u8, len: usize) u64 {
     ret result;
 }
 
+#[testing]
 fun account_store_persist(value: *AccountStore) bool {
     if (!value.persistent) { ret true; }
     var record: [48]u8;
@@ -2261,6 +2294,7 @@ fun account_store_persist(value: *AccountStore) bool {
         ?record[0], 48, 384, 448));
 }
 
+#[testing]
 fun account_store_reload(value: *AccountStore) bool {
     if (!value.persistent || !file_exists(value.path)) { ret true; }
     val opened: res[fs.File, IO.Error] = fs.open(value.path);
@@ -2306,6 +2340,7 @@ fun account_store_reload(value: *AccountStore) bool {
     ret true;
 }
 
+#[testing]
 fun account_store_ready(ctx: ptr) bool {
     val value: *AccountStore = ctx::*AccountStore;
     if (value.mutate_output != nil) {
@@ -2319,6 +2354,7 @@ fun account_store_ready(ctx: ptr) bool {
     ret value.ready;
 }
 
+#[testing]
 fun account_store_aliases(ctx: ptr, data: *u8, len: usize) bool {
     val value: *AccountStore = ctx::*AccountStore;
     if (value.mutate_snapshot && value.snapshot_mutation_armed &&
@@ -2334,12 +2370,14 @@ fun account_store_aliases(ctx: ptr, data: *u8, len: usize) bool {
         account.credentials_overlap(value.pending, data, len));
 }
 
+#[testing]
 fun account_store_owns_secret(ctx: ptr, owner: ptr) bool {
     val value: *AccountStore = ctx::*AccountStore;
     ret (value.found && owner == value.current.secret_owner) ||
         (value.pending_ready && owner == value.pending.secret_owner);
 }
 
+#[testing]
 fun account_store_begin(ctx: ptr, url: view.View,
     generation: u64) storage.BeginResult {
     val value: *AccountStore = ctx::*AccountStore;
@@ -2370,6 +2408,7 @@ fun account_store_begin(ctx: ptr, url: view.View,
         generation:  generation}};
 }
 
+#[testing]
 fun account_store_stage(ctx: ptr, transaction: storage.Transaction,
     replacement: account.Credentials) storage.Status {
     val value: *AccountStore = ctx::*AccountStore;
@@ -2388,6 +2427,7 @@ fun account_store_stage(ctx: ptr, transaction: storage.Transaction,
     ret storage.SUCCESS;
 }
 
+#[testing]
 fun account_store_commit(ctx: ptr,
     transaction: storage.Transaction) storage.Status {
     val value: *AccountStore = ctx::*AccountStore;
@@ -2404,6 +2444,7 @@ fun account_store_commit(ctx: ptr,
     ret storage.SUCCESS;
 }
 
+#[testing]
 fun account_store_abort(ctx: ptr,
     transaction: storage.Transaction) storage.Status {
     val value: *AccountStore = ctx::*AccountStore;
@@ -2418,6 +2459,7 @@ fun account_store_abort(ctx: ptr,
     ret storage.SUCCESS;
 }
 
+#[testing]
 fun account_store_load(ctx: ptr, url: view.View,
     output: *storage.Snapshot) storage.Status {
     val value: *AccountStore = ctx::*AccountStore;
@@ -2470,6 +2512,7 @@ fun account_store_load(ctx: ptr, url: view.View,
     ret result.status;
 }
 
+#[testing]
 fun account_store(value: *AccountStore) storage.Store {
     ret storage.Store{ctx: value::ptr, context_anchor: ?value.anchor,
         context_size:     $size_of(AccountStore), gate: ?value.gate,
@@ -2481,6 +2524,7 @@ fun account_store(value: *AccountStore) storage.Store {
         load_certificate: nil};
 }
 
+#[testing]
 fun credentials(key: jose.PublicKey, owner: ptr,
     generation: u64) account.Credentials {
     ret account.Credentials{account: account.Account{
@@ -2492,6 +2536,7 @@ fun credentials(key: jose.PublicKey, owner: ptr,
         secret_owner: owner, generation: generation};
 }
 
+#[testing]
 rec RecoverContext {
     manager:  *storage.Manager;
     url:      view.View;
@@ -2499,6 +2544,7 @@ rec RecoverContext {
     result:   *i64;
 }
 
+#[testing]
 fun recover_worker(arg: *u8) {
     val context: *RecoverContext = arg::*RecoverContext;
     if (!problem.failed(storage.recover(context.manager, context.url,
@@ -2508,7 +2554,7 @@ fun recover_worker(arg: *u8) {
     or { atomic.store(context.result, -1); }
 }
 
-test "account: lifecycle payloads are exact and reject aliases" {
+test account__lifecycle_payloads {
     var contacts: [2]view.View = [2]view.View{
         view.view("mailto:one@example.com", 22),
         view.view("mailto:two@example.com", 22)
@@ -2523,6 +2569,14 @@ test "account: lifecycle payloads are exact and reject aliases" {
     if (problem.failed(create.error))                 { ret 10; }
     if (create.written != length(expected))           { ret 11; }
     if (!equal(?output[0], expected, create.written)) { ret 12; }
+    fill(?output[0], 0xa5, 512);
+    val small: account.Operation = account.encode(account.CREATE,
+        account.Request{contacts: ?contacts[0], contact_len: 2,
+        terms_of_service_agreed:  true, only_return_existing: false,
+        external_account_binding: external_account.none()},
+        contracts.Buffer{data: ?output[0], capacity: 16});
+    if (small.error.code != problem.OUTPUT_TOO_SMALL ||
+        !filled(?output[0], 0xa5, 512)) { ret 13; }
     val lookup: account.Operation = account.encode(account.LOOKUP,
         account.Request{contacts: nil, contact_len: 0,
         terms_of_service_agreed:  false, only_return_existing: true,
@@ -2644,40 +2698,7 @@ test "account: lifecycle payloads are exact and reject aliases" {
     ret 0;
 }
 
-test "account: public contact bounds encode without a hidden ceiling" {
-    var text: [4096]u8;
-    copy(?text[0], "https:", 6);
-    var i: usize = 6;
-    for (i < 4096) {
-        text[i] = 'a';
-        i       = i + 1;
-    }
-    var contacts: [64]view.View;
-    i = 0;
-    for (i < 64) {
-        contacts[i] = view.view(?text[0], 4096);
-        i           = i + 1;
-    }
-    var output:  [270000]u8;
-    val encoded: account.Operation = account.encode(account.CREATE,
-        account.Request{contacts: ?contacts[0], contact_len: 64,
-        terms_of_service_agreed:  false, only_return_existing: false,
-        external_account_binding: external_account.none()},
-        contracts.Buffer{data: ?output[0], capacity: 270000});
-    if (problem.failed(encoded.error) || encoded.written != 262349) { ret 1; }
-    fill(?output[0], 0xa5, 128);
-    val small: account.Operation = account.encode(account.CREATE,
-        account.Request{contacts: ?contacts[0], contact_len: 64,
-        terms_of_service_agreed:  false, only_return_existing: false,
-        external_account_binding: external_account.none()},
-        contracts.Buffer{data: ?output[0], capacity: 128});
-    if (small.error.kind != problem.LIMIT ||
-        small.error.code != problem.OUTPUT_TOO_SMALL ||
-        !filled(?output[0], 0xa5, 128)) { ret 2; }
-    ret 0;
-}
-
-test "account: response decoding is bounded and transactional" {
+test account__response_decoding {
     val body:     *u8            = "{\"status\":\"valid\",\"contact\":[\"mailto:one@example.com\"],\"orders\":\"https://example.com/acme/acct/1/orders\",\"termsOfServiceAgreed\":true}";
     var fields:   field.Fields   = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var scratch:  [8192]u8;
@@ -2748,7 +2769,7 @@ test "account: response decoding is bounded and transactional" {
     ret 0;
 }
 
-test "external account: configured mac algorithms and ownership are exact" {
+test external_account__mac_algorithms {
     val public_bytes: [32]u8 = [32]u8{
         0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
         0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
@@ -2863,7 +2884,7 @@ test "external account: configured mac algorithms and ownership are exact" {
     ret 0;
 }
 
-test "storage: replacement is durable across unknown commit and reentrancy" {
+test storage__unknown_commit_and_reentrancy {
     var old_secret:  [32]^u8;
     var old_public:  [65]u8;
     var old_key:     jose.PublicKey;
@@ -2990,7 +3011,7 @@ test "storage: replacement is durable across unknown commit and reentrancy" {
     ret 0;
 }
 
-test "storage: hostile transactions and recovery stay exactly bound" {
+test storage__hostile_transactions_and_recovery {
     var old_secret:  [32]^u8;
     var old_public:  [65]u8;
     var old_key:     jose.PublicKey;
@@ -3096,7 +3117,7 @@ test "storage: hostile transactions and recovery stay exactly bound" {
     ret 0;
 }
 
-test "storage: shared gates consume exact writes and preserve outputs" {
+test storage__shared_gates {
     var old_secret:  [32]^u8;
     var old_public:  [65]u8;
     var old_key:     jose.PublicKey;
@@ -3169,7 +3190,7 @@ test "storage: shared gates consume exact writes and preserve outputs" {
     ret 0;
 }
 
-test "storage: persistent provider survives restart and rejects torn state" {
+test storage__persistent_restart_and_torn_state {
     val path: *u8 = "/tmp/mach-acme-storage-conformance.bin";
     fs.remove_file(path);
     var old_secret:  [32]^u8;
@@ -3242,7 +3263,7 @@ test "storage: persistent provider survives restart and rejects torn state" {
     ret 0;
 }
 
-test "key change: interruption retains a recoverable nested rollover" {
+test key_change__interrupted_rollover {
     var old_secret:  [32]^u8;
     var old_public:  [65]u8;
     var old_key:     jose.PublicKey;
@@ -3421,6 +3442,7 @@ test "key change: interruption retains a recoverable nested rollover" {
     ret 0;
 }
 
+#[testing]
 fun order_limits() order.Limits {
     var configured: order.Limits = order.limits_default();
     configured.max_response_bytes = 65536;
@@ -3428,7 +3450,7 @@ fun order_limits() order.Limits {
     ret configured;
 }
 
-test "order: multi-identifier, partial failure, and expiry decode transactionally" {
+test order__partial_failure_and_expiry {
     var fields: field.Fields;
     empty_fields(?fields);
     val body:           *u8           = "{\"status\":\"invalid\",\"expires\":\"2026-01-01T00:00:00Z\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"a.example\"},{\"type\":\"dns\",\"value\":\"b.example\"}],\"authorizations\":[\"https://example.com/authz/1\",\"https://example.com/authz/2\"],\"finalize\":\"https://example.com/finalize/1\",\"error\":{\"type\":\"urn:ietf:params:acme:error:unauthorized\",\"detail\":\"one identifier failed\",\"status\":403}}";
@@ -3513,7 +3535,7 @@ test "order: multi-identifier, partial failure, and expiry decode transactionall
     ret 0;
 }
 
-test "order: authorization expiry, wildcard, and challenge decoding are bounded" {
+test order__authorization_decoding {
     var fields: field.Fields;
     empty_fields(?fields);
     var scratch:    [32768]u8;
@@ -3583,7 +3605,7 @@ test "order: authorization expiry, wildcard, and challenge decoding are bounded"
     ret 0;
 }
 
-test "order: newOrder payloads are exact and reject invalid identifiers" {
+test order__new_order_payloads {
     var names: [2]identifier.Identifier;
     names[0] = identifier.Identifier{kind: identifier.DNS,
         value: view.view("a.example", 9)};
@@ -3655,6 +3677,7 @@ test "order: newOrder payloads are exact and reject invalid identifiers" {
 
 # a provider that counts every boundary crossing, so exactly-once is observed
 # rather than inferred
+#[testing]
 rec CountingProvider {
     present_calls: usize;
     cleanup_calls: usize;
@@ -3667,12 +3690,14 @@ rec CountingProvider {
     seen_len:      usize;
 }
 
+#[testing]
 fun counting_supports(ctx: ptr, subject: identifier.Identifier,
     kind: u8) bool {
     val state: *CountingProvider = ctx::*CountingProvider;
     ret state.supported;
 }
 
+#[testing]
 fun counting_present(ctx: ptr, subject: identifier.Identifier,
     value: challenge.Challenge,
     key_authorization: view.View) res[challenge.Presentation, problem.Error] {
@@ -3695,6 +3720,7 @@ fun counting_present(ctx: ptr, subject: identifier.Identifier,
     ret res[challenge.Presentation, problem.Error].ok{challenge.Presentation{ctx: ctx}};
 }
 
+#[testing]
 fun counting_cleanup(ctx: ptr,
     presentation: challenge.Presentation) res[bool, problem.Error] {
     val state: *CountingProvider = ctx::*CountingProvider;
@@ -3706,6 +3732,7 @@ fun counting_cleanup(ctx: ptr,
     ret res[bool, problem.Error].ok{true};
 }
 
+#[testing]
 fun counting_provider(state: *CountingProvider) challenge.Provider {
     state.present_calls = 0;
     state.cleanup_calls = 0;
@@ -3719,6 +3746,7 @@ fun counting_provider(state: *CountingProvider) challenge.Provider {
         present: counting_present, cleanup: counting_cleanup};
 }
 
+#[testing]
 fun pending_challenge(kind: u8) challenge.Challenge {
     var value: challenge.Challenge;
     value.typ       = kind;
@@ -3729,11 +3757,12 @@ fun pending_challenge(kind: u8) challenge.Challenge {
     ret value;
 }
 
+#[testing]
 fun live_key_authorization() view.View {
     ret view.view("LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0.9jg46WB3rR_AHD-EBXdN7cBkH1WOu0tA3M9fm21mqTI", 87);
 }
 
-test "challenge: presentation and cleanup run exactly once on every exit" {
+test challenge__presentation_cleanup_once {
     val subject: identifier.Identifier = identifier.Identifier{
         kind: identifier.DNS, value: view.view("example.org", 11)
     };
@@ -3857,6 +3886,7 @@ test "challenge: presentation and cleanup run exactly once on every exit" {
     ret 0;
 }
 
+#[testing]
 rec ScriptedProbe {
     answers: [8]bool;
     len:     usize;
@@ -3864,6 +3894,7 @@ rec ScriptedProbe {
     calls:   usize;
 }
 
+#[testing]
 fun scripted_observe(ctx: ptr, name: view.View, expected: view.View) bool {
     val state: *ScriptedProbe = ctx::*ScriptedProbe;
     state.calls = state.calls + 1;
@@ -3873,7 +3904,7 @@ fun scripted_observe(ctx: ptr, name: view.View, expected: view.View) bool {
     ret answer;
 }
 
-test "challenge: dns propagation is bounded, injectable, and consecutive" {
+test challenge__dns_propagation {
     val name:     view.View = view.view("_acme-challenge.example.org", 27);
     val expected: view.View = view.view(
         "LPsIwTo7o8BoG0-vjCyGQGBWSVIPxI-i_X336eUOQZo", 43);
@@ -3964,6 +3995,7 @@ test "challenge: dns propagation is bounded, injectable, and consecutive" {
 
 # a signing provider resolves its own key material. the opaque context never
 # carries a secret, so no public alias to the scalar can exist.
+#[testing]
 fun csr_sign_p256(ctx: ptr, tbs: *u8, tbs_len: usize, output: *u8,
     capacity: usize) usize {
     var private_bytes: [32]^u8;
@@ -3976,6 +4008,7 @@ fun csr_sign_p256(ctx: ptr, tbs: *u8, tbs_len: usize, output: *u8,
     ret signed.written;
 }
 
+#[testing]
 fun p256_spki(point: *u8, output: *u8) usize {
     val prefix: [26]u8 = [26]u8{
         0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
@@ -3997,6 +4030,7 @@ fun p256_spki(point: *u8, output: *u8) usize {
 }
 
 # walks one der element so a test can reach the exact bytes a signature covers
+#[testing]
 fun der_element(data: *u8, len: usize, at: usize, tag: *u8,
     content_at: *usize, content_len: *usize, next: *usize) bool {
     if (at + 2 > len) { ret false; }
@@ -4025,7 +4059,7 @@ fun der_element(data: *u8, len: usize, at: usize, tag: *u8,
     ret true;
 }
 
-test "certificate: a csr is valid der and its signature covers the request info" {
+test certificate__csr_der_and_signature {
     var private_bytes: [32]^u8;
     var public_bytes:  [65]u8;
     var public_key:    jose.PublicKey;
@@ -4135,11 +4169,12 @@ test "certificate: a csr is valid der and its signature covers the request info"
 
 # an openssl-generated leaf carrying two dns names and one ip address, with a
 # validity window computed independently of this implementation
+#[testing]
 fun leaf_pem() *u8 {
     ret "-----BEGIN CERTIFICATE-----\nMIIBiTCCAS6gAwIBAgIUbnYIUfdvfMCkoKJt0Eea62OURk4wCgYIKoZIzj0EAwIw\nADAeFw0yNjA4MjgyMjExMjlaFw0yNjExMjYyMjExMjlaMAAwWTATBgcqhkjOPQIB\nBggqhkjOPQMBBwNCAASJaX667nSrQmHvMORhTY5bdMthaA5tWnTEYE4IZrGRhbzq\ndmGLpaxPUw2l8UZ/OxASnhHykrG+7YPh+yuKDkUBo4GFMIGCMB0GA1UdDgQWBBQk\n3YkQ9uZntNvhuTAiHiTkx0z1tTAfBgNVHSMEGDAWgBQk3YkQ9uZntNvhuTAiHiTk\nx0z1tTAPBgNVHRMBAf8EBTADAQH/MC8GA1UdEQQoMCaCDWEuZXhhbXBsZS5jb22C\nDyouYi5leGFtcGxlLmNvbYcEwAACBzAKBggqhkjOPQQDAgNJADBGAiEA1ZNxagn1\ndjiUbqFt2W5ldU/YCi5LDTf3T3q8GhZfu88CIQDDnxCeO5FxsOCAICYh80tWlbeB\nUGdTd19IAG7vYnuVDA==\n-----END CERTIFICATE-----";
 }
 
-test "certificate: chains decode and are verified against requested identifiers" {
+test certificate__chain_verification {
     val pem:          *u8       = leaf_pem();
     val body:         view.View = view.view(pem, length(pem));
     var certificates: [4]certificate.Certificate;
@@ -4227,7 +4262,7 @@ test "certificate: chains decode and are verified against requested identifiers"
     ret 0;
 }
 
-test "certificate: finalize, revocation, and alternate links encode exactly" {
+test certificate__finalize_revocation_links {
     # rfc 8555 section 7.4 finalize payload
     var output:   [256]u8;
     val csr:      *u8                   = "abcde";
@@ -4315,6 +4350,7 @@ test "certificate: finalize, revocation, and alternate links encode exactly" {
 
 # an in-memory certificate store. every returned range lives inside its own
 # declared context, so the manager's ownership checks are exercised for real.
+#[testing]
 rec CertStore {
     anchor:        u8;
     gate:          storage.Gate;
@@ -4335,10 +4371,12 @@ rec CertStore {
     ready_flag:    bool;
 }
 
+#[testing]
 fun cert_store_ready(ctx: ptr) bool {
     ret (ctx::*CertStore).ready_flag;
 }
 
+#[testing]
 fun cert_store_aliases(ctx: ptr, data: *u8, len: usize) bool {
     val store: *CertStore = ctx::*CertStore;
     if (len == 0)                       { ret true; }
@@ -4349,11 +4387,13 @@ fun cert_store_aliases(ctx: ptr, data: *u8, len: usize) bool {
     ret at >= start && at + len <= finish;
 }
 
+#[testing]
 fun cert_store_owns_secret(ctx: ptr, owner: ptr) bool {
     val store: *CertStore = ctx::*CertStore;
     ret owner == (?store.secret_owner)::ptr;
 }
 
+#[testing]
 fun cert_store_begin(ctx: ptr, key: view.View,
     generation: u64) storage.BeginResult {
     val store: *CertStore = ctx::*CertStore;
@@ -4366,6 +4406,7 @@ fun cert_store_begin(ctx: ptr, key: view.View,
     ret result;
 }
 
+#[testing]
 fun cert_store_stage(ctx: ptr, transaction: storage.Transaction,
     value: storage.CertificateRecord) storage.Status {
     val store: *CertStore = ctx::*CertStore;
@@ -4376,6 +4417,7 @@ fun cert_store_stage(ctx: ptr, transaction: storage.Transaction,
     ret storage.SUCCESS;
 }
 
+#[testing]
 fun cert_store_commit(ctx: ptr,
     transaction: storage.Transaction) storage.Status {
     val store: *CertStore = ctx::*CertStore;
@@ -4388,6 +4430,7 @@ fun cert_store_commit(ctx: ptr,
     ret storage.SUCCESS;
 }
 
+#[testing]
 fun cert_store_abort(ctx: ptr,
     transaction: storage.Transaction) storage.Status {
     val store: *CertStore = ctx::*CertStore;
@@ -4396,6 +4439,7 @@ fun cert_store_abort(ctx: ptr,
     ret storage.SUCCESS;
 }
 
+#[testing]
 fun cert_store_load(ctx: ptr, key: view.View,
     output: *storage.CertificateSnapshot) storage.Status {
     val store:  *CertStore = ctx::*CertStore;
@@ -4410,6 +4454,7 @@ fun cert_store_load(ctx: ptr, key: view.View,
     ret result.status;
 }
 
+#[testing]
 fun cert_store_account_begin(ctx: ptr, url: view.View,
     generation: u64) storage.BeginResult {
     var result: storage.BeginResult;
@@ -4417,16 +4462,19 @@ fun cert_store_account_begin(ctx: ptr, url: view.View,
     ret result;
 }
 
+#[testing]
 fun cert_store_account_stage(ctx: ptr, transaction: storage.Transaction,
     value: account.Credentials) storage.Status {
     ret storage.FAILED;
 }
 
+#[testing]
 fun cert_store_account_load(ctx: ptr, url: view.View,
     output: *storage.Snapshot) storage.Status {
     ret storage.FAILED;
 }
 
+#[testing]
 fun cert_store(value: *CertStore) storage.Store {
     ret storage.Store{ctx: value::ptr, context_anchor: ?value.anchor,
         context_size:      $size_of(CertStore), gate: ?value.gate,
@@ -4439,6 +4487,7 @@ fun cert_store(value: *CertStore) storage.Store {
 }
 
 # builds a record whose every range lives inside the store's own context
+#[testing]
 fun cert_record(store: *CertStore, generation: u64,
     chain_len: usize) storage.CertificateRecord {
     copy(?store.key_bytes[0], "issue.live.example", 18);
@@ -4463,6 +4512,7 @@ fun cert_record(store: *CertStore, generation: u64,
     };
 }
 
+#[testing]
 fun init_cert_store(store: *CertStore, manager: *storage.Manager) bool {
     store.token               = 0;
     store.has_current         = false;
@@ -4475,7 +4525,7 @@ fun init_cert_store(store: *CertStore, manager: *storage.Manager) bool {
     ret !problem.failed(storage.init_manager(manager, cert_store(store)));
 }
 
-test "certificate: private key and chain replacement is transactional" {
+test certificate__key_and_chain_replacement {
     var store:   CertStore;
     var manager: storage.Manager;
     if (!init_cert_store(?store, ?manager)) { ret 1; }
@@ -4575,6 +4625,7 @@ test "certificate: private key and chain replacement is transactional" {
     ret 0;
 }
 
+#[testing]
 fun read_raw(path: *u8, buffer: *u8, capacity: usize, len: *usize) bool {
     val opened: res[fs.File, IO.Error] = fs.open(path);
     if (sel opened.err) { ret false; }
@@ -4597,7 +4648,7 @@ fun read_raw(path: *u8, buffer: *u8, capacity: usize, len: *usize) bool {
     ret true;
 }
 
-test "file store: documents are versioned, checksummed, and atomically replaced" {
+test file_store__document_format {
     val path: *u8 = "/tmp/mach-acme-document.bin";
     fs.remove_file(path);
     var scratch:  [16384]u8;
@@ -4719,6 +4770,7 @@ test "file store: documents are versioned, checksummed, and atomically replaced"
     ret 0;
 }
 
+#[testing]
 fun store_credentials(key: jose.PublicKey, owner: ptr,
     generation: u64) account.Credentials {
     ret account.Credentials{account: account.Account{
@@ -4731,7 +4783,7 @@ fun store_credentials(key: jose.PublicKey, owner: ptr,
         generation: generation};
 }
 
-test "file store: durable records survive restart and an interrupted write" {
+test file_store__restart_and_interrupted_write {
     val account_path:     *u8 = "/tmp/mach-acme-fs-account.bin";
     val certificate_path: *u8 = "/tmp/mach-acme-fs-cert.bin";
     fs.remove_file(account_path);
@@ -4899,12 +4951,14 @@ test "file store: durable records survive restart and an interrupted write" {
     ret 0;
 }
 
+#[testing]
 rec StoreRaceContext {
     manager:     *storage.Manager;
     credentials: *account.Credentials;
     result:      *i64;
 }
 
+#[testing]
 fun store_race_worker(arg: *u8) {
     val context: *StoreRaceContext = arg::*StoreRaceContext;
     val write:   storage.Write     = storage.begin_save(context.manager, 0,
@@ -4920,7 +4974,7 @@ fun store_race_worker(arg: *u8) {
     atomic.store(context.result, 1);
 }
 
-test "file store: concurrent writers are serialized to one committed record" {
+test file_store__concurrent_writers {
     val account_path:     *u8 = "/tmp/mach-acme-fs-race-account.bin";
     val certificate_path: *u8 = "/tmp/mach-acme-fs-race-cert.bin";
     fs.remove_file(account_path);
@@ -4998,7 +5052,7 @@ test "file store: concurrent writers are serialized to one committed record" {
     ret 0;
 }
 
-test "renewal info: certificate identifiers, urls, and windows are exact" {
+test renewal_info__identifiers_urls_windows {
     val pem:          *u8 = leaf_pem();
     var certificates: [4]certificate.Certificate;
     var der:          [8192]u8;

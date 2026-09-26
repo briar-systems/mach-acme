@@ -30,7 +30,7 @@ pub fun size(count: usize, item_size: usize, output: *usize) bool {
     ret true;
 }
 
-test "acme.memory_range: overlap is safe at the address-space boundary" {
+test overlap__address_space_boundary {
     val low:  *u8 = 1::*u8;
     val high: *u8 = 0xffffffffffffffff::*u8;
     if (!valid(low, 0xffffffffffffffff) || !valid(high, 1)) { ret 1; }

@@ -133,7 +133,7 @@ pub fun token_valid(value: view.View) bool {
     ret true;
 }
 
-test "acme.challenge: type names and tokens round trip under strict syntax" {
+test type_name__strict_round_trip {
     if (kind_from_name(type_name(HTTP_01)) != HTTP_01 ||
         kind_from_name(type_name(DNS_01)) != DNS_01 ||
         kind_from_name(type_name(TLS_ALPN_01)) != TLS_ALPN_01) { ret 1; }
@@ -651,6 +651,7 @@ pub fun propagation_next(state: *Propagation, probe: Probe, name: view.View,
         state.confirmed >= state.policy.required_checks, false, 0, now);
 }
 
+#[testing]
 fun same_bytes(first: *u8, second: *u8, len: usize) bool {
     var i: usize = 0;
     for (i < len) {
@@ -660,7 +661,7 @@ fun same_bytes(first: *u8, second: *u8, len: usize) bool {
     ret true;
 }
 
-test "acme.challenge: rfc 8555 and rfc 8737 challenge data are exact" {
+test key_authorization__rfc_8555_and_8737 {
     # rfc 8555 section 8.3 worked example
     val token:         str   = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
     val thumbprint:    str   = "9jg46WB3rR_AHD-EBXdN7cBkH1WOu0tA3M9fm21mqTI";
