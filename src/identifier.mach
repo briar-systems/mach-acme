@@ -172,11 +172,12 @@ pub fun kind_from_name(value: view.View) u8 {
     ret 0;
 }
 
+#[testing]
 fun dns(value: str, len: usize) Identifier {
     ret Identifier{kind: DNS, value: view.view(value, len)};
 }
 
-test "acme.identifier: wildcard and ip admission follow explicit policy" {
+test valid__wildcard_and_ip_policy {
     var policy: Policy = policy_default();
     if (!valid(dns("example.com", 11), policy) ||
         !valid(dns("*.example.com", 13), policy)) { ret 1; }

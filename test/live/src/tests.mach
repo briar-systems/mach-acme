@@ -40,17 +40,23 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
 
-val ACME_PORT:      u16   = 14001;
-val MANAGE_PORT:    u16   = 8055;
+#[testing]
+val ACME_PORT: u16 = 14001;
+#[testing]
+val MANAGE_PORT: u16 = 8055;
+#[testing]
 val MAX_BODY_BYTES: usize = 65536;
-val MAX_FIELDS:     usize = 64;
+#[testing]
+val MAX_FIELDS: usize = 64;
 
+#[testing]
 fun length(text: *u8) usize {
     var i: usize = 0;
     for (text[i] != 0) { i = i + 1; }
     ret i;
 }
 
+#[testing]
 fun equal(first: *u8, second: *u8, len: usize) bool {
     var i: usize = 0;
     for (i < len) {
@@ -60,6 +66,7 @@ fun equal(first: *u8, second: *u8, len: usize) bool {
     ret true;
 }
 
+#[testing]
 fun copy(destination: *u8, source: *u8, len: usize) {
     var i: usize = 0;
     for (i < len) {
@@ -69,6 +76,7 @@ fun copy(destination: *u8, source: *u8, len: usize) {
 }
 
 # a bounded response buffer plus the parsed status line and fields
+#[testing]
 pub rec Exchange {
     status:  u16;
     body:    view.View;
@@ -78,12 +86,14 @@ pub rec Exchange {
     len:     usize;
 }
 
+#[testing]
 rec Writer {
     data: *u8;
     cap:  usize;
     pos:  usize;
 }
 
+#[testing]
 fun put(writer: *Writer, data: *u8, len: usize) bool {
     if (len > writer.cap - writer.pos) { ret false; }
     copy(?writer.data[writer.pos], data, len);
@@ -91,10 +101,12 @@ fun put(writer: *Writer, data: *u8, len: usize) bool {
     ret true;
 }
 
+#[testing]
 fun put_text(writer: *Writer, text: *u8) bool {
     ret put(writer, text, length(text));
 }
 
+#[testing]
 fun put_number(writer: *Writer, value: usize) bool {
     var digits:    [24]u8;
     var count:     usize = 0;
@@ -118,6 +130,7 @@ fun put_number(writer: *Writer, value: usize) bool {
 
 # the authority's urls are https and name the harness front end, so the
 # request line carries the exact path and the Host header the server echoes
+#[testing]
 fun split_url(url: view.View, host: *view.View, path: *view.View) bool {
     if (url.len < 9) { ret false; }
     var i: usize = 8;
@@ -131,6 +144,7 @@ fun split_url(url: view.View, host: *view.View, path: *view.View) bool {
     ret host.len != 0;
 }
 
+#[testing]
 fun method_name(value: method.Method) *u8 {
     if (value.kind == method.GET)  { ret "GET"; }
     if (value.kind == method.HEAD) { ret "HEAD"; }
@@ -138,10 +152,12 @@ fun method_name(value: method.Method) *u8 {
     ret nil;
 }
 
+#[testing]
 fun digit_value(value: u8) bool {
     ret value >= '0' && value <= '9';
 }
 
+#[testing]
 fun parse_status(data: *u8, len: usize, output: *u16) usize {
     if (len < 12 || data[0] != 'H' || data[1] != 'T' || data[2] != 'T' ||
         data[3] != 'P' || data[4] != '/') { ret 0; }
@@ -161,6 +177,7 @@ fun parse_status(data: *u8, len: usize, output: *u16) usize {
     ret j + 2;
 }
 
+#[testing]
 fun trim(data: *u8, start: usize, finish: usize, output: *view.View) {
     var first: usize = start;
     var last:  usize = finish;
@@ -173,6 +190,7 @@ fun trim(data: *u8, start: usize, finish: usize, output: *view.View) {
     @output = view.view(?data[first], last - first);
 }
 
+#[testing]
 fun parse_number(value: view.View) usize {
     var total: usize = 0;
     var i:     usize = 0;
@@ -184,12 +202,14 @@ fun parse_number(value: view.View) usize {
     ret total;
 }
 
+#[testing]
 fun name_is(value: view.View, expected: *u8) bool {
     ret field.name_equal(value, view.view(expected, length(expected)));
 }
 
 # parses the header block into the exchange's own field storage and returns
 # the offset of the body plus its declared length
+#[testing]
 fun parse_headers(exchange: *Exchange, start: usize, body_at: *usize,
     body_len: *usize, chunked: *bool) bool {
     var i:          usize = start;
@@ -242,6 +262,7 @@ fun parse_headers(exchange: *Exchange, start: usize, body_at: *usize,
     ret false;
 }
 
+#[testing]
 fun hex_value(value: u8, output: *usize) bool {
     if (value >= '0' && value <= '9') {
         @output = (value - '0')::usize;
@@ -259,6 +280,7 @@ fun hex_value(value: u8, output: *usize) bool {
 }
 
 # rewrites a chunked body in place so the exchange exposes one contiguous view
+#[testing]
 fun dechunk(exchange: *Exchange, body_at: usize, output: *usize) bool {
     var read:  usize = body_at;
     var write: usize = body_at;
@@ -293,6 +315,7 @@ fun dechunk(exchange: *Exchange, body_at: usize, output: *usize) bool {
     ret false;
 }
 
+#[testing]
 fun send_all(stream: *tcp.Stream, data: *u8, len: usize) bool {
     var sent: usize = 0;
     for (sent < len) {
@@ -308,6 +331,7 @@ fun send_all(stream: *tcp.Stream, data: *u8, len: usize) bool {
 
 # executes one wire request against the harness and fills the exchange. the
 # connection is not reused, so each acme request is independent.
+#[testing]
 pub fun execute(request: client.WireRequest, exchange: *Exchange) bool {
     if (problem.failed(request.error)) { ret false; }
     var host: view.View;
@@ -381,6 +405,7 @@ pub fun execute(request: client.WireRequest, exchange: *Exchange) bool {
     ret true;
 }
 
+#[testing]
 fun all_digits(value: view.View) bool {
     if (value.len == 0) { ret false; }
     var i: usize = 0;
@@ -391,6 +416,7 @@ fun all_digits(value: view.View) bool {
     ret true;
 }
 
+#[testing]
 fun month_index(data: *u8) i64 {
     val names: *u8 = "JanFebMarAprMayJunJulAugSepOctNovDec";
     var i:     i64 = 0;
@@ -403,12 +429,14 @@ fun month_index(data: *u8) i64 {
     ret 0;
 }
 
+#[testing]
 fun two_digits(data: *u8) i64 {
     ret ((data[0] - '0')::i64) * 10 + (data[1] - '0')::i64;
 }
 
 # proleptic gregorian days since 1970-01-01, so two server timestamps can be
 # differenced without consulting a client clock
+#[testing]
 fun days_from_civil(year: i64, month: i64, day: i64) i64 {
     var y: i64 = year;
     if (month <= 2) { y = y - 1; }
@@ -423,6 +451,7 @@ fun days_from_civil(year: i64, month: i64, day: i64) i64 {
 }
 
 # rfc 7231 imf-fixdate: "Fri, 28 Aug 2026 21:35:42 GMT"
+#[testing]
 fun parse_http_date(value: view.View, output: *i64) bool {
     if (value.len != 29 || value.data[3] != ',' || value.data[4] != ' ' ||
         value.data[7] != ' ' || value.data[11] != ' ' ||
@@ -450,6 +479,7 @@ fun parse_http_date(value: view.View, output: *i64) bool {
     ret true;
 }
 
+#[testing]
 fun header(exchange: *Exchange, name: *u8, output: *view.View) bool {
     var i: usize = 0;
     for (i < exchange.fields.len) {
@@ -464,6 +494,7 @@ fun header(exchange: *Exchange, name: *u8, output: *view.View) bool {
 
 # rfc 7231 allows delta-seconds or an imf-fixdate. the date form is resolved
 # against the response's own Date header, so no client clock is involved.
+#[testing]
 fun retry_after(exchange: *Exchange) u64 {
     var advised: view.View;
     if (!header(exchange, "retry-after", ?advised)) { ret 0; }
@@ -477,36 +508,15 @@ fun retry_after(exchange: *Exchange) u64 {
     ret (deadline - now)::u64;
 }
 
+#[testing]
 pub fun response(exchange: *Exchange) client.Response {
     ret client.Response{status: exchange.status, fields: ?exchange.fields,
         body: exchange.body, retry_after_seconds: retry_after(exchange)};
 }
 
-test "live: the harness reaches a real acme directory over http/1.1" {
-    var exchange:   Exchange;
-    val configured: client.Limits      = client.limits_default();
-    val discovery:  client.WireRequest = client.discovery_request(
-        view.view("https://127.0.0.1:14001/dir", 27), configured);
-    if (problem.failed(discovery.error))                        { ret 1; }
-    if (!execute(discovery, ?exchange))                         { ret 2; }
-    if (exchange.status != status.OK || exchange.body.len == 0) { ret 3; }
-    var scratch:   [65536]u8;
-    var text:      [16384]u8;
-    var caa:       [8]view.View;
-    var directory: client.Directory;
-    val parsed:    problem.Error = client.parse_directory(response(?exchange),
-        configured, ?scratch[0], 65536,
-        client.DirectoryStorage{data: ?text[0], capacity: 16384,
-        caa_items: ?caa[0], caa_capacity: 8}, ?directory);
-    if (problem.failed(parsed)) { ret 4; }
-    if (directory.new_nonce_url.len == 0 ||
-        directory.new_account_url.len == 0 ||
-        directory.new_order_url.len == 0) { ret 5; }
-    ret 0;
-}
-
 # an authenticated session against the live authority: account key, replay
 # nonce pool, discovered directory, and the registered account url
+#[testing]
 rec Session {
     protocol:       client.Client;
     pool:           nonce.Pool;
@@ -530,6 +540,7 @@ rec Session {
     subproblems:    [8]problem.Subproblem;
 }
 
+#[testing]
 fun set_private(output: *^u8) {
     val value: [32]u8 = [32]u8{
         0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16,
@@ -544,6 +555,7 @@ fun set_private(output: *^u8) {
     }
 }
 
+#[testing]
 fun session_keys(session: *Session) bool {
     set_private(?session.private_bytes[0]);
     val secret: contracts.SecretBytes = contracts.SecretBytes{
@@ -559,11 +571,13 @@ fun session_keys(session: *Session) bool {
     ret true;
 }
 
+#[testing]
 fun problem_storage(session: *Session) client.ProblemStorage {
     ret client.ProblemStorage{data: ?session.problem_text[0], capacity: 4096,
         subproblems: ?session.subproblems[0], subproblem_capacity: 8};
 }
 
+#[testing]
 fun session_begin(session: *Session, exchange: *Exchange) bool {
     if (!session_keys(session)) { ret false; }
     if (problem.failed(nonce.init_memory(?session.memory, ?session.slots[0], 8,
@@ -584,6 +598,7 @@ fun session_begin(session: *Session, exchange: *Exchange) bool {
 
 # drives one signed request to a final answer, acquiring a replay nonce and
 # following the protocol layer's badNonce recovery exactly as it directs
+#[testing]
 fun run_signed(session: *Session, request: *client.SignedRequest,
     exchange: *Exchange, decision: *client.Decision) bool {
     var rounds: usize = 0;
@@ -619,6 +634,7 @@ fun run_signed(session: *Session, request: *client.SignedRequest,
     ret false;
 }
 
+#[testing]
 fun account_limits() account.Limits {
     ret account.Limits{max_response_bytes: 65536, max_json_scratch: 32768,
         max_json_depth:           16, max_json_values: 4096, max_json_key_bytes: 128,
@@ -628,6 +644,7 @@ fun account_limits() account.Limits {
 }
 
 # registers the session's account key and retains the returned account url
+#[testing]
 fun session_account(session: *Session, exchange: *Exchange) bool {
     var payload: [1024]u8;
     var wanted:  account.Request;
@@ -653,11 +670,13 @@ fun session_account(session: *Session, exchange: *Exchange) bool {
         ?session.account));
 }
 
+#[testing]
 fun dns_name(value: str, len: usize) identifier.Identifier {
     ret identifier.Identifier{kind: identifier.DNS,
         value: view.view(value, len)};
 }
 
+#[testing]
 fun order_storage(text: *u8, names: *identifier.Identifier,
     authorizations: *view.View) order.Storage {
     ret order.Storage{data: text, capacity: 8192, identifiers: names,
@@ -666,6 +685,7 @@ fun order_storage(text: *u8, names: *identifier.Identifier,
 }
 
 # creates an order over the supplied identifiers and decodes the response
+#[testing]
 fun create_order(session: *Session, exchange: *Exchange,
     names: *identifier.Identifier, len: usize, policy: identifier.Policy,
     storage: order.Storage, created: *order.Order,
@@ -689,6 +709,7 @@ fun create_order(session: *Session, exchange: *Exchange,
         created));
 }
 
+#[testing]
 fun fetch_authorization(session: *Session, exchange: *Exchange,
     url: view.View, policy: identifier.Policy,
     storage: order.AuthorizationStorage, output: *order.Authorization) bool {
@@ -704,7 +725,7 @@ fun fetch_authorization(session: *Session, exchange: *Exchange,
         output));
 }
 
-test "live: a multi-identifier order returns one authorization per name" {
+test order__multi_identifier {
     var session:  Session;
     var exchange: Exchange;
     if (!session_begin(?session, ?exchange))   { ret 1; }
@@ -768,7 +789,7 @@ test "live: a multi-identifier order returns one authorization per name" {
     ret 0;
 }
 
-test "live: a wildcard order yields a dns-01 only authorization" {
+test order__wildcard_dns_01_only {
     var session:  Session;
     var exchange: Exchange;
     if (!session_begin(?session, ?exchange))   { ret 1; }
@@ -814,7 +835,7 @@ test "live: a wildcard order yields a dns-01 only authorization" {
     ret 0;
 }
 
-test "live: a rejected identifier surfaces as a structured acme problem" {
+test order__rejected_identifier_problem {
     var session:  Session;
     var exchange: Exchange;
     if (!session_begin(?session, ?exchange))   { ret 1; }
@@ -840,7 +861,7 @@ test "live: a rejected identifier surfaces as a structured acme problem" {
     ret 0;
 }
 
-test "live: post-as-get order polling drives the bounded poll decision" {
+test order__post_as_get_polling {
     var session:  Session;
     var exchange: Exchange;
     if (!session_begin(?session, ?exchange))   { ret 1; }
@@ -912,6 +933,7 @@ test "live: post-as-get order polling drives the bounded poll decision" {
 
 # posts a json document to the challenge test server's management api. that
 # server answers the authority's http-01, dns-01, and tls-alpn-01 validation.
+#[testing]
 fun manage(path: *u8, body: *u8, len: usize) bool {
     var head:   [1024]u8;
     var writer: Writer = Writer{data: ?head[0], cap: 1024, pos: 0};
@@ -949,6 +971,7 @@ fun manage(path: *u8, body: *u8, len: usize) bool {
     ret parse_status(?reply[0], total, ?code) != 0 && code == 200;
 }
 
+#[testing]
 fun put_json_string(writer: *Writer, value: view.View) bool {
     if (!put_text(writer, "\"")) { ret false; }
     var i: usize = 0;
@@ -961,6 +984,7 @@ fun put_json_string(writer: *Writer, value: view.View) bool {
 }
 
 # a live challenge provider backed by the challenge test server
+#[testing]
 rec LiveProvider {
     subject:      identifier.Identifier;
     key_auth:     view.View;
@@ -972,11 +996,13 @@ rec LiveProvider {
     published:    bool;
 }
 
+#[testing]
 fun live_supports(ctx: ptr, subject: identifier.Identifier, kind: u8) bool {
     ret kind == challenge.HTTP_01 || kind == challenge.DNS_01 ||
         kind == challenge.TLS_ALPN_01;
 }
 
+#[testing]
 fun live_present(ctx: ptr, subject: identifier.Identifier,
     value: challenge.Challenge,
     key_auth: view.View) res[challenge.Presentation, problem.Error] {
@@ -1030,6 +1056,7 @@ fun live_present(ctx: ptr, subject: identifier.Identifier,
     ret res[challenge.Presentation, problem.Error].ok{challenge.Presentation{ctx: ctx}};
 }
 
+#[testing]
 fun live_cleanup(ctx: ptr,
     presentation: challenge.Presentation) res[bool, problem.Error] {
     val state:  *LiveProvider = ctx::*LiveProvider;
@@ -1062,6 +1089,7 @@ fun live_cleanup(ctx: ptr,
     ret res[bool, problem.Error].ok{true};
 }
 
+#[testing]
 fun live_provider(state: *LiveProvider) challenge.Provider {
     state.published    = false;
     state.kind         = 0;
@@ -1072,6 +1100,7 @@ fun live_provider(state: *LiveProvider) challenge.Provider {
 
 # the order a completed challenge leaves ready to finalize, with the storage
 # its views point into
+#[testing]
 rec ReadyOrder {
     text:           [8192]u8;
     names:          [8]identifier.Identifier;
@@ -1083,6 +1112,7 @@ rec ReadyOrder {
 
 # a live run cannot bound a wait without the monotonic clock, so a refusal
 # ends the suite rather than degrading into a deadline at the clock's origin
+#[testing]
 fun instant_now() T.Instant {
     val clock: T.InstantClock = T.instant();
     if (sel clock.ok) { ret clock.ok; }
@@ -1091,11 +1121,13 @@ fun instant_now() T.Instant {
     ret T.Instant{sec: 0, nsec: 0};
 }
 
+#[testing]
 fun deadline_in(nanoseconds: i64) T.Instant {
     ret T.instant_add(instant_now(), nanoseconds);
 }
 
 # a fixed instant for decisions that depend only on the distance to a deadline
+#[testing]
 fun fixed(ns: i64) T.Instant {
     ret T.Instant{sec: ns / 1000000000, nsec: ns % 1000000000};
 }
@@ -1106,6 +1138,7 @@ fun fixed(ns: i64) T.Instant {
 # a run-unique identifier. the authority keeps order and authorization state
 # for the life of its process, so reusing a fixed name would make a second run
 # depend on what the first one left behind.
+#[testing]
 fun unique_name(prefix: str, prefix_len: usize, output: *u8) usize {
     var i: usize = 0;
     for (i < prefix_len) {
@@ -1136,6 +1169,7 @@ fun unique_name(prefix: str, prefix_len: usize, output: *u8) usize {
     ret prefix_len + 1 + count + 13;
 }
 
+#[testing]
 fun run_challenge(session: *Session, exchange: *Exchange, name: str,
     name_len: usize, kind: u8, provider: *LiveProvider,
     attempt: *challenge.Attempt, advised: *u64, ready: *ReadyOrder) i32 {
@@ -1246,7 +1280,7 @@ fun run_challenge(session: *Session, exchange: *Exchange, name: str,
     ret 0;
 }
 
-test "live: http-01 validates against the authority end to end" {
+test challenge__http_01 {
     var session:  Session;
     var exchange: Exchange;
     if (!session_begin(?session, ?exchange))   { ret 1; }
@@ -1261,7 +1295,7 @@ test "live: http-01 validates against the authority end to end" {
         challenge.HTTP_01, ?provider, ?attempt, ?advised, ?ready);
 }
 
-test "live: dns-01 validates the library's own record name and digest" {
+test challenge__dns_01 {
     var session:  Session;
     var exchange: Exchange;
     if (!session_begin(?session, ?exchange))   { ret 1; }
@@ -1282,7 +1316,7 @@ test "live: dns-01 validates the library's own record name and digest" {
     ret 0;
 }
 
-test "live: tls-alpn-01 validates against the authority end to end" {
+test challenge__tls_alpn_01 {
     var session:  Session;
     var exchange: Exchange;
     if (!session_begin(?session, ?exchange))   { ret 1; }
@@ -1300,6 +1334,7 @@ test "live: tls-alpn-01 validates against the authority end to end" {
 # the certificate key is distinct from the account key, as an authority
 # requires. a signing provider resolves it internally, so the opaque context
 # never carries a secret.
+#[testing]
 fun set_certificate_private(output: *^u8) {
     val value: [32]u8 = [32]u8{
         0x3b, 0x11, 0x9c, 0x4a, 0x77, 0x2e, 0x05, 0x91,
@@ -1314,6 +1349,7 @@ fun set_certificate_private(output: *^u8) {
     }
 }
 
+#[testing]
 fun certificate_sign(ctx: ptr, tbs: *u8, tbs_len: usize, output: *u8,
     capacity: usize) usize {
     var private_bytes: [32]^u8;
@@ -1326,6 +1362,7 @@ fun certificate_sign(ctx: ptr, tbs: *u8, tbs_len: usize, output: *u8,
     ret signed.written;
 }
 
+#[testing]
 fun certificate_spki(output: *u8, len: *usize) bool {
     var private_bytes: [32]^u8;
     var point:         [65]u8;
@@ -1354,7 +1391,7 @@ fun certificate_spki(output: *u8, len: *usize) bool {
     ret true;
 }
 
-test "live: an order is finalized, downloaded, verified, and revoked" {
+test certificate__finalize_download_verify_revoke {
     var session:  Session;
     var exchange: Exchange;
     if (!session_begin(?session, ?exchange))   { ret 1; }
