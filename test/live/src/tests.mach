@@ -25,9 +25,9 @@ use crypto.signature;
 use http.core.field;
 use http.core.method;
 use http.core.status;
-use T:  std.chrono.time;
-use IO: std.io.error;
+use T: std.chrono.time;
 use std.crypto.rand;
+use IO: std.io.error;
 use std.net.ip;
 use std.net.tcp;
 use std.runtime;
@@ -551,7 +551,7 @@ fun session_keys(session: *Session) bool {
     var attempts: usize = 0;
     for (attempts < 8) {
         attempts = attempts + 1;
-        var value: [32]u8;
+        var value:  [32]u8;
         val filled: err[IO.Error] = rand.fill(?value[0], 32);
         if (sel filled.err) { ret false; }
         var i: usize = 0;
