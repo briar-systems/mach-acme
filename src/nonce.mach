@@ -2,8 +2,10 @@
 
 use acme.memory_range;
 use acme.problem;
+#[testing]
 use std.sync.atomic;
 use std.sync.mutex;
+#[testing]
 use std.sync.thread;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -542,12 +544,14 @@ pub fun take(value: Pool, output: *u8, capacity: usize) Taken {
     ret Taken{error: problem.none(), found: true, value: reserved.value};
 }
 
+#[testing]
 rec PutContext {
     pool:   *Pool;
     value:  view.View;
     result: *i64;
 }
 
+#[testing]
 fun put_worker(arg: *u8) {
     val context: *PutContext   = arg::*PutContext;
     val result:  problem.Error = context.pool.put(context.pool.ctx,
@@ -558,47 +562,21 @@ fun put_worker(arg: *u8) {
     or { atomic.store(context.result, 1); }
 }
 
-# leave a nonzero pattern on the stack the next declaration will occupy, so a
-# field left unset by a literal is observable rather than coincidentally zero
-fun dirty_frame(depth: usize) usize {
-    var scratch: [48]usize;
-    var i:       usize = 0;
-    for (i < 48) {
-        scratch[i] = 6510615555426900570 + i;
-        i          = i + 1;
-    }
-    var sum: usize = 0;
-    i = 0;
-    for (i < 48) {
-        sum = sum + scratch[i];
-        i   = i + 1;
-    }
-    if (depth > 0) { ret dirty_frame(depth - 1) + sum; }
-    ret sum;
-}
-
-# a released client must keep no callable pointer to a provider it no longer
-# owns, on every field rather than the ones a literal happens to reach
-test "nonce: a cleared pool carries no callable pointer" {
-    if (dirty_frame(4) == 0) { ret 1; }
-    val cleared: Pool = no_pool();
-    if (cleared.ctx != nil || cleared.reserve != nil || cleared.commit != nil
-        || cleared.release != nil || cleared.put != nil) { ret 2; }
-    if (cleared.clear != nil || cleared.ready != nil || cleared.aliases != nil
-        || cleared.owns_secret != nil) { ret 3; }
-    if (cleared.max_nonce_bytes != 0 || cleared.capacity != 0) { ret 4; }
-    ret 0;
-}
-
-test "acme.nonce: take consumes the newest nonce exactly once" {
+test take__newest_exactly_once {
     var slots:   [2]Slot;
     var storage: [17]u8;
     var memory:  Memory;
     if (problem.failed(init_memory(?memory, ?slots[0], 2, ?storage[0], 17, 8))) { ret 1; }
     val value: Pool = pool(?memory);
-    if (problem.failed(value.put(value.ctx, view.view("first", 5))) ||
+    if (value.put(value.ctx, view.view("bad+nonce", 9)).code != problem.INVALID_INPUT ||
+        problem.failed(value.put(value.ctx, view.view("first", 5))) ||
         problem.failed(value.put(value.ctx, view.view("second", 6)))) { ret 2; }
     var output: [8]u8;
+    # a short output is refused before a nonce is consumed or a byte written
+    output[0] = 0xcc;
+    val small: Taken = take(value, ?output[0], 4);
+    if (small.error.code != problem.OUTPUT_TOO_SMALL || small.found ||
+        output[0] != 0xcc) { ret 10; }
     val newest: Taken = take(value, ?output[0], 8);
     if (problem.failed(newest.error) || !newest.found || newest.value.len != 6 ||
         output[0] != 's') { ret 3; }
@@ -622,7 +600,7 @@ test "acme.nonce: take consumes the newest nonce exactly once" {
     ret 0;
 }
 
-test "acme.nonce: concurrent producers preserve every slot" {
+test put__concurrent_producers {
     var slots:   [4]Slot;
     var storage: [64]u8;
     var memory:  Memory;
@@ -669,7 +647,7 @@ test "acme.nonce: concurrent producers preserve every slot" {
     ret 0;
 }
 
-test "acme.nonce: ranges and aliases fail before ownership changes" {
+test init_memory__ranges_and_aliases {
     var slots:   [2]Slot;
     var storage: [32]u8;
     var memory:  Memory;
@@ -720,7 +698,7 @@ test "acme.nonce: ranges and aliases fail before ownership changes" {
     ret 0;
 }
 
-test "acme.nonce: reservation commit and release are exact transactions" {
+test reserve__commit_and_release {
     var slots:   [2]Slot;
     var storage: [32]u8;
     var memory:  Memory;

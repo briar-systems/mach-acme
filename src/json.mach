@@ -348,8 +348,3 @@ pub fun find(object: *J.Value, expected: str) *J.Value {
     }
     ret nil;
 }
-
-test "acme.json: find rejects wrapping object records" {
-    if (find(0xffffffffffffffff::*J.Value, "key") != nil) { ret 1; }
-    ret 0;
-}

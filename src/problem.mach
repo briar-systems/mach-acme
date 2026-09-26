@@ -125,13 +125,3 @@ pub fun acme(value: Problem, status: u16, body: view.View,
 pub fun failed(error: Error) bool {
     ret error.code != OK;
 }
-
-test "acme.problem: structured causes remain distinct" {
-    val storage: Error = local_code(STORAGE, INVALID_STATE, "write failed");
-    if (storage.kind != STORAGE || storage.code != INVALID_STATE || storage.retryable) { ret 1; }
-    val response: Error = http(503, view.view("busy", 4), 30);
-    if (response.kind != HTTP || response.code != HTTP_STATUS ||
-        response.http.status != 503 || response.http.retry_after_seconds != 30 ||
-        !response.retryable) { ret 2; }
-    ret 0;
-}

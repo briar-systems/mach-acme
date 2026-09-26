@@ -348,27 +348,31 @@ pub fun select_next(schedules: *Schedule, len: usize,
     ret chosen;
 }
 
-test "acme.renewal: due avoids unsigned expiry underflow" {
+test regression__due_expiry_underflow {
     if (!due(200, 100, 30)) { ret 1; }
     if (!due(80, 100, 20))  { ret 1; }
     if (due(79, 100, 20))   { ret 1; }
     ret 0;
 }
 
+#[testing]
 rec FixedRandom {
     value: u64;
 }
 
+#[testing]
 fun fixed_random(ctx: ptr) u64 {
     ret (ctx::*FixedRandom).value;
 }
 
+#[testing]
 rec Recorder {
     count:    usize;
     previous: [16]State;
     current:  [16]State;
 }
 
+#[testing]
 fun record(ctx: ptr, value: Event) {
     val state: *Recorder = ctx::*Recorder;
     if (state.count >= 16) { ret; }
@@ -377,7 +381,7 @@ fun record(ctx: ptr, value: Event) {
     state.count                 = state.count + 1;
 }
 
-test "acme.renewal: scheduling honours advice, lifetime, skew, and budgets" {
+test schedule__advice_lifetime_skew_budgets {
     val day:     u64    = 86400;
     val issued:  u64    = 1700000000;
     val expires: u64    = issued + 90 * day;
