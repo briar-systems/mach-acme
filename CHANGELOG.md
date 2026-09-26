@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-26
+
+### Changed
+- **Breaking.** mach-acme builds on mach 6: `mach.toml` requires mach `^6` (was `^5.12`), and the dependencies move to mach-std `^9.0` (v9.0.0, was `^8.0` at v8.0.0), mach-crypto `^0.24` (v0.24.0, was `^0.22` at v0.22.0) and mach-http `^0.21` (v0.21.0, was `^0.20` at v0.20.0). Resolution is flat, so a consumer must move to mach 6, std 9, crypto 0.24 and http 0.21 with it. The public surface of mach-acme is unchanged. CI seeds mach v6.0.0, and the live conformance subproject pins std v9.0.0, crypto v0.24.0 and http v0.21.0 by tag (#114).
+- Every test is named by identifier (`test subject__case`), as mach 6 requires. Test-only helpers are marked `#[testing]`, as are the thread and atomic imports only the tests in `src/nonce.mach` use, so ordinary builds omit them. `test/selections/verify.sh` reads the identifier form and matches the qualified names `mach test --list` prints (#114).
+- The suite is pruned to mach's test policy, from 70 tests to 64 (61 to 56 under `src`, 9 to 8 in `test/live`). A trivial constructor check in `acme.problem`, pins on fixed problems in `acme.json`, `acme.nonce` and the account payloads, and a live smoke test that every other live test repeats are gone. The unique checks of the protocol nonce test (an invalid value and a short output) fold into `acme.nonce#take__newest_exactly_once`. Every hostile-input and parser corpus stays (#114).
+
 ## [0.9.0] - 2026-09-25
 
 ### Changed
