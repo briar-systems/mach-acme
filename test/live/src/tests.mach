@@ -25,7 +25,8 @@ use crypto.signature;
 use http.core.field;
 use http.core.method;
 use http.core.status;
-use T:  std.chrono.time;
+use T: std.chrono.time;
+use std.crypto.rand;
 use IO: std.io.error;
 use std.net.ip;
 use std.net.tcp;
@@ -35,6 +36,7 @@ use std.system.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -540,35 +542,38 @@ rec Session {
     subproblems:    [8]problem.Subproblem;
 }
 
-#[testing]
-fun set_private(output: *^u8) {
-    val value: [32]u8 = [32]u8{
-        0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16,
-        0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6, 0x93,
-        0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12,
-        0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f, 0x67, 0x21
-    };
-    var i: usize = 0;
-    for (i < 32) {
-        output[i] = value[i];
-        i         = i + 1;
-    }
-}
-
+# each session registers its own fresh account key. mach test runs every test
+# as its own process, and two concurrent newAccount requests for one key race
+# in the authority: both miss the existing-account lookup and the second
+# insert is refused.
 #[testing]
 fun session_keys(session: *Session) bool {
-    set_private(?session.private_bytes[0]);
-    val secret: contracts.SecretBytes = contracts.SecretBytes{
-        data: ?session.private_bytes[0], len: 32
-    };
-    val derived: contracts.Operation = p256.derive_public(secret,
-        contracts.Buffer{data: ?session.public_bytes[0], capacity: 65});
-    if (derived.error != contracts.OK) { ret false; }
-    session.public_key = jose.PublicKey{algorithm: jose.ES256,
-        value: contracts.Bytes{data: ?session.public_bytes[0], len: 65}};
-    session.private_key = jose.PrivateKey{algorithm: jose.ES256,
-        secret_owner: (?session.public_bytes[0])::ptr, value: secret};
-    ret true;
+    var attempts: usize = 0;
+    for (attempts < 8) {
+        attempts = attempts + 1;
+        var value:  [32]u8;
+        val filled: err[IO.Error] = rand.fill(?value[0], 32);
+        if (sel filled.err) { ret false; }
+        var i: usize = 0;
+        for (i < 32) {
+            session.private_bytes[i] = value[i];
+            i                        = i + 1;
+        }
+        val secret: contracts.SecretBytes = contracts.SecretBytes{
+            data: ?session.private_bytes[0], len: 32
+        };
+        val derived: contracts.Operation = p256.derive_public(secret,
+            contracts.Buffer{data: ?session.public_bytes[0], capacity: 65});
+        # a draw outside the scalar range is redrawn
+        if (derived.error == contracts.INVALID_KEY) { cnt; }
+        if (derived.error != contracts.OK)          { ret false; }
+        session.public_key = jose.PublicKey{algorithm: jose.ES256,
+            value: contracts.Bytes{data: ?session.public_bytes[0], len: 65}};
+        session.private_key = jose.PrivateKey{algorithm: jose.ES256,
+            secret_owner: (?session.public_bytes[0])::ptr, value: secret};
+        ret true;
+    }
+    ret false;
 }
 
 #[testing]

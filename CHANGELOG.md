@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-27
+
+### Changed
+- **Breaking.** Dependencies: mach-http `^0.23` at v0.23.0 (was `^0.21` at v0.21.0). Resolution is flat, so a consumer must move to http 0.23 with it. http 0.22 and 0.23 add the server runner in `http.server.server`, make `h1.connection.config_valid` public and stop a closing h1 engine from parsing input, and mach-acme reaches http only through `core.field`, `core.method` and `core.status`, so nothing it uses changes. The live conformance subproject pins http v0.23.0 by tag, and its suite passes against pebble (#122).
+- Three unused imports in `acme.json`, `acme.account` and `acme.file_store` are gone, so the library builds without warnings on mach 6.3 (#122).
+
+### Fixed
+- Each live conformance test registers its own random account key. The tests shared one fixed key, and two concurrent first registrations of it raced inside pebble and failed one test with a 500 on a fresh authority, which is every CI run (#120).
+
 ## [0.10.0] - 2026-09-26
 
 ### Changed
