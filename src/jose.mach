@@ -84,6 +84,8 @@ pub rec PublicKey {
     rsa:       signature.RsaPublicKey;
 }
 
+# secret_owner is compared, never dereferenced, so an owner record holding
+# secret storage names itself by the address of one of its public bytes
 pub rec PrivateKey {
     algorithm:    Algorithm;
     secret_owner: ptr;
