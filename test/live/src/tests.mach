@@ -1002,16 +1002,15 @@ rec LiveProvider {
 }
 
 #[testing]
-fun live_supports(ctx: ptr, subject: identifier.Identifier, kind: u8) bool {
+fun live_supports(state: *LiveProvider, subject: identifier.Identifier, kind: u8) bool {
     ret kind == challenge.HTTP_01 || kind == challenge.DNS_01 ||
         kind == challenge.TLS_ALPN_01;
 }
 
 #[testing]
-fun live_present(ctx: ptr, subject: identifier.Identifier,
+fun live_present(state: *LiveProvider, subject: identifier.Identifier,
     value: challenge.Challenge,
     key_auth: view.View) res[challenge.Presentation, problem.Error] {
-    val state: *LiveProvider = ctx::*LiveProvider;
     state.kind  = value.typ;
     state.token = value.token;
     var body:   [1024]u8;
@@ -1058,16 +1057,17 @@ fun live_present(ctx: ptr, subject: identifier.Identifier,
     state.subject   = subject;
     state.key_auth  = key_auth;
     state.published = true;
-    ret res[challenge.Presentation, problem.Error].ok{challenge.Presentation{ctx: ctx}};
+    ret res[challenge.Presentation, problem.Error].ok{challenge.Presentation{
+        ctx: (?state.published)::ptr
+    }};
 }
 
 #[testing]
-fun live_cleanup(ctx: ptr,
+fun live_cleanup(state: *LiveProvider,
     presentation: challenge.Presentation) res[bool, problem.Error] {
-    val state:  *LiveProvider = ctx::*LiveProvider;
     var body:   [1024]u8;
-    var writer: Writer        = Writer{data: ?body[0], cap: 1024, pos: 0};
-    var ok:     bool          = false;
+    var writer: Writer = Writer{data: ?body[0], cap: 1024, pos: 0};
+    var ok:     bool   = false;
     if (state.kind == challenge.HTTP_01) {
         ok = put_text(?writer, "{\"token\":") &&
             put_json_string(?writer, state.token) && put_text(?writer, "}") &&
@@ -1095,11 +1095,11 @@ fun live_cleanup(ctx: ptr,
 }
 
 #[testing]
-fun live_provider(state: *LiveProvider) challenge.Provider {
+fun live_provider(state: *LiveProvider) challenge.Provider[LiveProvider] {
     state.published    = false;
     state.kind         = 0;
     state.dns_name_len = 0;
-    ret challenge.Provider{ctx: state::ptr, supports: live_supports,
+    ret challenge.Provider[LiveProvider]{ctx: state, supports: live_supports,
         present: live_present, cleanup: live_cleanup};
 }
 
@@ -1177,7 +1177,7 @@ fun unique_name(prefix: str, prefix_len: usize, output: *u8) usize {
 #[testing]
 fun run_challenge(session: *Session, exchange: *Exchange, name: str,
     name_len: usize, kind: u8, provider: *LiveProvider,
-    attempt: *challenge.Attempt, advised: *u64, ready: *ReadyOrder) i32 {
+    attempt: *challenge.Attempt[LiveProvider], advised: *u64, ready: *ReadyOrder) i32 {
     var names: [1]identifier.Identifier;
     names[0] = dns_name(name, name_len);
     var text:           [8192]u8;
@@ -1213,11 +1213,11 @@ fun run_challenge(session: *Session, exchange: *Exchange, name: str,
         contracts.Buffer{data: ?key_auth_bytes[0], capacity: 256});
     if (problem.failed(key_auth.error)) { ret 15; }
 
-    if (problem.failed(challenge.attempt_init(attempt,
+    if (problem.failed(challenge.attempt_init[LiveProvider](attempt,
         live_provider(provider)))) { ret 16; }
-    if (problem.failed(challenge.begin(attempt, authorization.identifier,
+    if (problem.failed(challenge.begin[LiveProvider](attempt, authorization.identifier,
         @selected, key_auth.value))) { ret 17; }
-    if (attempt.present_calls != 1 || !challenge.presented(attempt)) { ret 18; }
+    if (attempt.present_calls != 1 || !challenge.presented[LiveProvider](attempt)) { ret 18; }
 
     # tell the authority the challenge is ready
     var respond: client.SignedRequest;
@@ -1258,9 +1258,9 @@ fun run_challenge(session: *Session, exchange: *Exchange, name: str,
     if (!settled || authorization.status != order.AUTH_VALID) { ret 24; }
 
     # cleanup runs exactly once on the success path too
-    if (problem.failed(challenge.finish(attempt)) ||
+    if (problem.failed(challenge.finish[LiveProvider](attempt)) ||
         attempt.cleanup_calls != 1 || provider.published) { ret 25; }
-    if (problem.failed(challenge.finish(attempt)) ||
+    if (problem.failed(challenge.finish[LiveProvider](attempt)) ||
         attempt.cleanup_calls != 1) { ret 26; }
 
     # every authorization is valid, so the order is ready to finalize
@@ -1291,7 +1291,7 @@ test challenge__http_01 {
     if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     var provider: LiveProvider;
-    var attempt:  challenge.Attempt;
+    var attempt:  challenge.Attempt[LiveProvider];
     var advised:  u64   = 0;
     var ready:    ReadyOrder;
     var name:     [64]u8;
@@ -1306,7 +1306,7 @@ test challenge__dns_01 {
     if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     var provider: LiveProvider;
-    var attempt:  challenge.Attempt;
+    var attempt:  challenge.Attempt[LiveProvider];
     var advised:  u64   = 0;
     var ready:    ReadyOrder;
     var name:     [64]u8;
@@ -1327,7 +1327,7 @@ test challenge__tls_alpn_01 {
     if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     var provider: LiveProvider;
-    var attempt:  challenge.Attempt;
+    var attempt:  challenge.Attempt[LiveProvider];
     var advised:  u64   = 0;
     var ready:    ReadyOrder;
     var name:     [64]u8;
@@ -1402,7 +1402,7 @@ test certificate__finalize_download_verify_revoke {
     if (!session_begin(?session, ?exchange))   { ret 1; }
     if (!session_account(?session, ?exchange)) { ret 2; }
     var provider: LiveProvider;
-    var attempt:  challenge.Attempt;
+    var attempt:  challenge.Attempt[LiveProvider];
     var advised:  u64   = 0;
     var ready:    ReadyOrder;
     var name:     [64]u8;

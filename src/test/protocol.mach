@@ -3677,31 +3677,32 @@ test order__new_order_payloads {
 
 # a provider that counts every boundary crossing, so exactly-once is observed
 # rather than inferred
+# the secret field welds the record, so every attempt below proves a provider
+# context may hold secret storage
 #[testing]
 rec CountingProvider {
+    secret:        [32]^u8;
     present_calls: usize;
     cleanup_calls: usize;
     supported:     bool;
     fail_present:  bool;
     fail_cleanup:  bool;
-    reenter:       *challenge.Attempt;
+    reenter:       *challenge.Attempt[CountingProvider];
     reentered:     bool;
     seen_key_auth: [256]u8;
     seen_len:      usize;
 }
 
 #[testing]
-fun counting_supports(ctx: ptr, subject: identifier.Identifier,
+fun counting_supports(state: *CountingProvider, subject: identifier.Identifier,
     kind: u8) bool {
-    val state: *CountingProvider = ctx::*CountingProvider;
     ret state.supported;
 }
 
 #[testing]
-fun counting_present(ctx: ptr, subject: identifier.Identifier,
+fun counting_present(state: *CountingProvider, subject: identifier.Identifier,
     value: challenge.Challenge,
     key_authorization: view.View) res[challenge.Presentation, problem.Error] {
-    val state: *CountingProvider = ctx::*CountingProvider;
     state.present_calls = state.present_calls + 1;
     state.seen_len      = key_authorization.len;
     if (key_authorization.len <= 256) {
@@ -3711,19 +3712,21 @@ fun counting_present(ctx: ptr, subject: identifier.Identifier,
     # a provider that re-enters the attempt from inside its own callback must
     # be refused before it can move the attempt's state
     if (state.reenter != nil) {
-        state.reentered = problem.failed(challenge.finish(state.reenter));
+        state.reentered = problem.failed(challenge.finish[CountingProvider](
+            state.reenter));
     }
     if (state.fail_present) {
         ret res[challenge.Presentation, problem.Error].err{problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
             "provider could not publish")};
     }
-    ret res[challenge.Presentation, problem.Error].ok{challenge.Presentation{ctx: ctx}};
+    ret res[challenge.Presentation, problem.Error].ok{challenge.Presentation{
+        ctx: (?state.present_calls)::ptr
+    }};
 }
 
 #[testing]
-fun counting_cleanup(ctx: ptr,
+fun counting_cleanup(state: *CountingProvider,
     presentation: challenge.Presentation) res[bool, problem.Error] {
-    val state: *CountingProvider = ctx::*CountingProvider;
     state.cleanup_calls = state.cleanup_calls + 1;
     if (state.fail_cleanup) {
         ret res[bool, problem.Error].err{problem.local_code(problem.CHALLENGE, problem.INVALID_STATE,
@@ -3733,7 +3736,7 @@ fun counting_cleanup(ctx: ptr,
 }
 
 #[testing]
-fun counting_provider(state: *CountingProvider) challenge.Provider {
+fun counting_provider(state: *CountingProvider) challenge.Provider[CountingProvider] {
     state.present_calls = 0;
     state.cleanup_calls = 0;
     state.supported     = true;
@@ -3742,8 +3745,9 @@ fun counting_provider(state: *CountingProvider) challenge.Provider {
     state.reenter       = nil;
     state.reentered     = false;
     state.seen_len      = 0;
-    ret challenge.Provider{ctx: state::ptr, supports: counting_supports,
-        present: counting_present, cleanup: counting_cleanup};
+    ret challenge.Provider[CountingProvider]{ctx: state,
+        supports: counting_supports,
+        present:  counting_present, cleanup: counting_cleanup};
 }
 
 #[testing]
@@ -3770,74 +3774,74 @@ test challenge__presentation_cleanup_once {
 
     # success, then a repeated finish that must not reach the provider again
     var state:   CountingProvider;
-    var attempt: challenge.Attempt;
-    if (problem.failed(challenge.attempt_init(?attempt,
+    var attempt: challenge.Attempt[CountingProvider];
+    if (problem.failed(challenge.attempt_init[CountingProvider](?attempt,
         counting_provider(?state)))) { ret 1; }
-    if (problem.failed(challenge.begin(?attempt, subject,
+    if (problem.failed(challenge.begin[CountingProvider](?attempt, subject,
         pending_challenge(challenge.HTTP_01), key_auth))) { ret 2; }
-    if (state.present_calls != 1 || !challenge.presented(?attempt) ||
+    if (state.present_calls != 1 || !challenge.presented[CountingProvider](?attempt) ||
         state.seen_len != 87 ||
         !equal(?state.seen_key_auth[0], key_auth.data, 87)) { ret 3; }
-    if (problem.failed(challenge.finish(?attempt)) ||
+    if (problem.failed(challenge.finish[CountingProvider](?attempt)) ||
         state.cleanup_calls != 1) { ret 4; }
-    if (problem.failed(challenge.finish(?attempt)) ||
-        problem.failed(challenge.finish(?attempt)) ||
+    if (problem.failed(challenge.finish[CountingProvider](?attempt)) ||
+        problem.failed(challenge.finish[CountingProvider](?attempt)) ||
         state.cleanup_calls != 1 || state.present_calls != 1) { ret 5; }
     # a retired attempt cannot be presented again
-    if (!problem.failed(challenge.begin(?attempt, subject,
+    if (!problem.failed(challenge.begin[CountingProvider](?attempt, subject,
         pending_challenge(challenge.HTTP_01), key_auth)) ||
         state.present_calls != 1) { ret 6; }
 
     # a presentation that failed owes no cleanup
     var failing:        CountingProvider;
-    var failed_attempt: challenge.Attempt;
-    if (problem.failed(challenge.attempt_init(?failed_attempt,
+    var failed_attempt: challenge.Attempt[CountingProvider];
+    if (problem.failed(challenge.attempt_init[CountingProvider](?failed_attempt,
         counting_provider(?failing)))) { ret 7; }
     failing.fail_present = true;
-    if (!problem.failed(challenge.begin(?failed_attempt, subject,
+    if (!problem.failed(challenge.begin[CountingProvider](?failed_attempt, subject,
         pending_challenge(challenge.DNS_01), key_auth)) ||
         failing.present_calls != 1 ||
-        challenge.presented(?failed_attempt)) { ret 8; }
-    if (problem.failed(challenge.finish(?failed_attempt)) ||
+        challenge.presented[CountingProvider](?failed_attempt)) { ret 8; }
+    if (problem.failed(challenge.finish[CountingProvider](?failed_attempt)) ||
         failing.cleanup_calls != 0) { ret 9; }
 
     # a declined challenge never reaches presentation
     var declined:         CountingProvider;
-    var declined_attempt: challenge.Attempt;
-    if (problem.failed(challenge.attempt_init(?declined_attempt,
+    var declined_attempt: challenge.Attempt[CountingProvider];
+    if (problem.failed(challenge.attempt_init[CountingProvider](?declined_attempt,
         counting_provider(?declined)))) { ret 10; }
     declined.supported = false;
-    if (challenge.supports(?declined_attempt, subject, challenge.HTTP_01) ||
-        !problem.failed(challenge.begin(?declined_attempt, subject,
+    if (challenge.supports[CountingProvider](?declined_attempt, subject, challenge.HTTP_01) ||
+        !problem.failed(challenge.begin[CountingProvider](?declined_attempt, subject,
         pending_challenge(challenge.HTTP_01), key_auth)) ||
         declined.present_calls != 0) { ret 11; }
-    if (problem.failed(challenge.finish(?declined_attempt)) ||
+    if (problem.failed(challenge.finish[CountingProvider](?declined_attempt)) ||
         declined.cleanup_calls != 0) { ret 12; }
 
     # a timeout exit: the poll deadline ends the wait and finish still retires
     # the presentation exactly once
     var timed:         CountingProvider;
-    var timed_attempt: challenge.Attempt;
-    if (problem.failed(challenge.attempt_init(?timed_attempt,
+    var timed_attempt: challenge.Attempt[CountingProvider];
+    if (problem.failed(challenge.attempt_init[CountingProvider](?timed_attempt,
         counting_provider(?timed))) ||
-        problem.failed(challenge.begin(?timed_attempt, subject,
+        problem.failed(challenge.begin[CountingProvider](?timed_attempt, subject,
         pending_challenge(challenge.DNS_01), key_auth))) { ret 13; }
     var waiting: poll.State;
     if (problem.failed(poll.begin(?waiting, poll.policy_default(), at(0))) ||
         poll.next(?waiting, false, false, 0, at(1)).action != poll.DEADLINE) {
         ret 14;
     }
-    if (problem.failed(challenge.finish(?timed_attempt)) ||
+    if (problem.failed(challenge.finish[CountingProvider](?timed_attempt)) ||
         timed.cleanup_calls != 1 ||
-        problem.failed(challenge.finish(?timed_attempt)) ||
+        problem.failed(challenge.finish[CountingProvider](?timed_attempt)) ||
         timed.cleanup_calls != 1) { ret 15; }
 
     # a cancellation exit behaves identically
     var cancelled:         CountingProvider;
-    var cancelled_attempt: challenge.Attempt;
-    if (problem.failed(challenge.attempt_init(?cancelled_attempt,
+    var cancelled_attempt: challenge.Attempt[CountingProvider];
+    if (problem.failed(challenge.attempt_init[CountingProvider](?cancelled_attempt,
         counting_provider(?cancelled))) ||
-        problem.failed(challenge.begin(?cancelled_attempt, subject,
+        problem.failed(challenge.begin[CountingProvider](?cancelled_attempt, subject,
         pending_challenge(challenge.TLS_ALPN_01), key_auth))) { ret 16; }
     var stopping: poll.State;
     if (problem.failed(poll.begin(?stopping, poll.policy_default(),
@@ -3845,42 +3849,42 @@ test challenge__presentation_cleanup_once {
         poll.next(?stopping, false, false, 0, at(0)).action != poll.CANCELLED) {
         ret 17;
     }
-    if (problem.failed(challenge.finish(?cancelled_attempt)) ||
+    if (problem.failed(challenge.finish[CountingProvider](?cancelled_attempt)) ||
         cancelled.cleanup_calls != 1 ||
-        problem.failed(challenge.finish(?cancelled_attempt)) ||
+        problem.failed(challenge.finish[CountingProvider](?cancelled_attempt)) ||
         cancelled.cleanup_calls != 1) { ret 18; }
 
     # a cleanup that fails reports the failure and is still never repeated
     var stubborn:         CountingProvider;
-    var stubborn_attempt: challenge.Attempt;
-    if (problem.failed(challenge.attempt_init(?stubborn_attempt,
+    var stubborn_attempt: challenge.Attempt[CountingProvider];
+    if (problem.failed(challenge.attempt_init[CountingProvider](?stubborn_attempt,
         counting_provider(?stubborn))) ||
-        problem.failed(challenge.begin(?stubborn_attempt, subject,
+        problem.failed(challenge.begin[CountingProvider](?stubborn_attempt, subject,
         pending_challenge(challenge.HTTP_01), key_auth))) { ret 19; }
     stubborn.fail_cleanup = true;
-    if (!problem.failed(challenge.finish(?stubborn_attempt)) ||
+    if (!problem.failed(challenge.finish[CountingProvider](?stubborn_attempt)) ||
         stubborn.cleanup_calls != 1) { ret 20; }
-    if (problem.failed(challenge.finish(?stubborn_attempt)) ||
+    if (problem.failed(challenge.finish[CountingProvider](?stubborn_attempt)) ||
         stubborn.cleanup_calls != 1) { ret 21; }
 
     # a provider that re-enters the attempt from its own callback fails closed
     var hostile:         CountingProvider;
-    var hostile_attempt: challenge.Attempt;
-    if (problem.failed(challenge.attempt_init(?hostile_attempt,
+    var hostile_attempt: challenge.Attempt[CountingProvider];
+    if (problem.failed(challenge.attempt_init[CountingProvider](?hostile_attempt,
         counting_provider(?hostile)))) { ret 22; }
     hostile.reenter = ?hostile_attempt;
-    if (problem.failed(challenge.begin(?hostile_attempt, subject,
+    if (problem.failed(challenge.begin[CountingProvider](?hostile_attempt, subject,
         pending_challenge(challenge.HTTP_01), key_auth)) ||
         !hostile.reentered || hostile.cleanup_calls != 0) { ret 23; }
-    if (problem.failed(challenge.finish(?hostile_attempt)) ||
+    if (problem.failed(challenge.finish[CountingProvider](?hostile_attempt)) ||
         hostile.cleanup_calls != 1) { ret 24; }
 
     # a malformed key authorization never reaches the provider
     var guarded:         CountingProvider;
-    var guarded_attempt: challenge.Attempt;
-    if (problem.failed(challenge.attempt_init(?guarded_attempt,
+    var guarded_attempt: challenge.Attempt[CountingProvider];
+    if (problem.failed(challenge.attempt_init[CountingProvider](?guarded_attempt,
         counting_provider(?guarded)))) { ret 25; }
-    if (!problem.failed(challenge.begin(?guarded_attempt, subject,
+    if (!problem.failed(challenge.begin[CountingProvider](?guarded_attempt, subject,
         pending_challenge(challenge.HTTP_01),
         view.view("no-dot", 6))) || guarded.present_calls != 0) { ret 26; }
     ret 0;
