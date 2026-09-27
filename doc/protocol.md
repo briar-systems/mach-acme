@@ -39,7 +39,10 @@ are rejected before output storage is changed.
 Private keys are passed separately as `jose.PrivateKey` for each signing operation.
 Each private key also carries a non-null opaque `secret_owner` identity. This keeps
 durable key ownership with the application or its secret provider without
-declassifying a secret-qualified address.
+declassifying a secret-qualified address. The library never dereferences the
+identity, only compares it, so an owner whose record holds secret storage names
+itself by the address of one of its public bytes, which erases to `ptr` as any
+public address does.
 
 Supported account algorithms are:
 
@@ -286,7 +289,9 @@ cancellation. It invokes cleanup exactly once and is idempotent afterwards: a
 repeated call is accepted and does not reach the provider again. A cleanup that
 fails reports that failure and is still never repeated, so a provider cannot be
 asked to withdraw the same state twice. The presentation and cleanup call
-counters are public so exactly-once is observed rather than inferred. Provider
+counters are public so exactly-once is observed rather than inferred.
+`Provider[C]` and `Attempt[C]` are generic over the provider's context, so the
+provider's state may be a record holding secret storage. Provider
 callbacks are serialized and same-thread reentrancy is rejected before a nested
 callback can move the attempt.
 
@@ -347,9 +352,12 @@ finished child is a prepend and no length needs a second measuring pass.
 Lengths use the minimal form, and a length that cannot be represented fails
 rather than truncating.
 
-The library never holds the certificate key. The caller's `SignFun` receives
-the exact certification request info bytes and returns a signature. Its context
-is a plain pointer, so secret memory cannot reach it. After signing, the
+The library never holds the certificate key. The caller's `sign` callback
+receives the exact certification request info bytes and returns a signature.
+`CsrSigner[C]` is generic over its context, so the context may be the record
+that holds the key in secret storage. The library only hands that typed pointer
+back to the callback, so nothing can reach the key except as its own secret
+type. After signing, the
 request info is re-encoded and compared, so a signer that disturbed its input
 publishes nothing. The returned signature is validated against the shape its
 algorithm names: the RFC 3279 DER sequence of two positive integers for ECDSA,

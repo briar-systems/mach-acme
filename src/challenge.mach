@@ -47,19 +47,17 @@ pub rec Presentation {
     ctx: ptr;
 }
 
-pub def SupportsFun: fun(ptr, identifier.Identifier, u8) bool;
-pub def PresentFun:  fun(ptr, identifier.Identifier, Challenge, view.View) res[Presentation, problem.Error];
-pub def CleanupFun:  fun(ptr, Presentation) res[bool, problem.Error];
-
-pub rec Provider {
-    ctx:      ptr;
-    supports: SupportsFun;
-    present:  PresentFun;
-    cleanup:  CleanupFun;
+# a provider is generic over its context type, so its state may be a record
+# that holds secret storage. such a record cannot be erased to `ptr`.
+pub rec Provider[C] {
+    ctx:      *C;
+    supports: fun(*C, identifier.Identifier, u8) bool;
+    present:  fun(*C, identifier.Identifier, Challenge, view.View) res[Presentation, problem.Error];
+    cleanup:  fun(*C, Presentation) res[bool, problem.Error];
 }
 
-pub rec Providers {
-    items: *Provider;
+pub rec Providers[C] {
+    items: *Provider[C];
     len:   usize;
 }
 
@@ -404,19 +402,19 @@ pub val ATTEMPT_FAILED:    AttemptState = 3;
 # exit for success, failure, timeout, and cancellation, so every path retires
 # the provider's state once and only once. The call counters are public so
 # exactly-once is observed rather than inferred.
-pub rec Attempt {
-    provider:       Provider;
+pub rec Attempt[C] {
+    provider:       Provider[C];
     presentation:   Presentation;
     subject:        identifier.Identifier;
     kind:           u8;
     state:          AttemptState;
     present_calls:  usize;
     cleanup_calls:  usize;
-    owner:          ptr;
+    owner:          *Attempt[C];
     callback_owner: i64;
 }
 
-pub fun provider_valid(value: Provider) bool {
+pub fun provider_valid[C](value: Provider[C]) bool {
     ret value.supports != nil && value.present != nil && value.cleanup != nil;
 }
 
@@ -424,14 +422,15 @@ fun challenge_error(code: problem.Code, detail: str) problem.Error {
     ret problem.local_code(problem.CHALLENGE, code, detail);
 }
 
-fun attempt_ready(attempt: *Attempt) bool {
-    ret attempt != nil &&
-        memory_range.valid(attempt::*u8, $size_of(Attempt)) &&
-        attempt.owner == attempt::ptr && provider_valid(attempt.provider);
+# an attempt over a secret-holding context is itself welded, so it is known
+# by its typed address and never measured as bytes
+fun attempt_ready[C](attempt: *Attempt[C]) bool {
+    ret attempt != nil && attempt.owner == attempt &&
+        provider_valid[C](attempt.provider);
 }
 
 # rejects same-thread reentry before a nested callback can move the attempt
-fun enter(attempt: *Attempt) bool {
+fun enter[C](attempt: *Attempt[C]) bool {
     val owner: i64 = os.thread_current_id();
     if (owner <= 0) { ret false; }
     for (true) {
@@ -448,15 +447,14 @@ fun enter(attempt: *Attempt) bool {
     ret false;
 }
 
-fun leave(attempt: *Attempt) {
+fun leave[C](attempt: *Attempt[C]) {
     atomic.store(?attempt.callback_owner, 0);
     os.thread_wake(?attempt.callback_owner);
 }
 
-pub fun attempt_init(attempt: *Attempt, provider: Provider) problem.Error {
-    if (attempt == nil ||
-        !memory_range.valid(attempt::*u8, $size_of(Attempt)) ||
-        !provider_valid(provider)) {
+pub fun attempt_init[C](attempt: *Attempt[C],
+    provider: Provider[C]) problem.Error {
+    if (attempt == nil || !provider_valid[C](provider)) {
         ret challenge_error(problem.INVALID_INPUT,
             "invalid challenge attempt or provider");
     }
@@ -467,26 +465,26 @@ pub fun attempt_init(attempt: *Attempt, provider: Provider) problem.Error {
     attempt.state         = ATTEMPT_IDLE;
     attempt.present_calls = 0;
     attempt.cleanup_calls = 0;
-    attempt.owner         = attempt::ptr;
+    attempt.owner         = attempt;
     atomic.store(?attempt.callback_owner, 0);
     ret problem.none();
 }
 
-pub fun supports(attempt: *Attempt, subject: identifier.Identifier,
+pub fun supports[C](attempt: *Attempt[C], subject: identifier.Identifier,
     kind: u8) bool {
-    if (!attempt_ready(attempt) || kind == 0) { ret false; }
-    if (!enter(attempt))                      { ret false; }
+    if (!attempt_ready[C](attempt) || kind == 0) { ret false; }
+    if (!enter[C](attempt))                      { ret false; }
     val answer: bool = attempt.provider.supports(attempt.provider.ctx, subject,
         kind);
-    leave(attempt);
+    leave[C](attempt);
     ret answer;
 }
 
 # presents the challenge exactly once. a provider that declines the challenge
 # is never asked to present, and a presentation that failed owes no cleanup.
-pub fun begin(attempt: *Attempt, subject: identifier.Identifier,
+pub fun begin[C](attempt: *Attempt[C], subject: identifier.Identifier,
     value: Challenge, key_authorization_value: view.View) problem.Error {
-    if (!attempt_ready(attempt) || value.typ == 0 ||
+    if (!attempt_ready[C](attempt) || value.typ == 0 ||
         !token_valid(value.token) ||
         !key_authorization_valid(key_authorization_value)) {
         ret challenge_error(problem.INVALID_INPUT,
@@ -496,12 +494,12 @@ pub fun begin(attempt: *Attempt, subject: identifier.Identifier,
         ret challenge_error(problem.INVALID_STATE,
             "challenge attempt has already been presented");
     }
-    if (!enter(attempt)) {
+    if (!enter[C](attempt)) {
         ret challenge_error(problem.INVALID_STATE,
             "challenge attempt is already inside a provider callback");
     }
     if (!attempt.provider.supports(attempt.provider.ctx, subject, value.typ)) {
-        leave(attempt);
+        leave[C](attempt);
         ret problem.local_code(problem.POLICY, problem.INVALID_INPUT,
             "provider does not support this challenge and identifier");
     }
@@ -515,35 +513,35 @@ pub fun begin(attempt: *Attempt, subject: identifier.Identifier,
         key_authorization_value);
     if (sel result.err) {
         attempt.state = ATTEMPT_FAILED;
-        leave(attempt);
+        leave[C](attempt);
         ret result.err;
     }
     attempt.presentation = result.ok;
     attempt.state        = ATTEMPT_PRESENTED;
-    leave(attempt);
+    leave[C](attempt);
     ret problem.none();
 }
 
-pub fun presented(attempt: *Attempt) bool {
-    ret attempt_ready(attempt) && attempt.state == ATTEMPT_PRESENTED;
+pub fun presented[C](attempt: *Attempt[C]) bool {
+    ret attempt_ready[C](attempt) && attempt.state == ATTEMPT_PRESENTED;
 }
 
 # the single exit for success, failure, timeout, and cancellation. calling it
 # again is accepted and does not reach the provider a second time.
-pub fun finish(attempt: *Attempt) problem.Error {
-    if (!attempt_ready(attempt)) {
+pub fun finish[C](attempt: *Attempt[C]) problem.Error {
+    if (!attempt_ready[C](attempt)) {
         ret challenge_error(problem.INVALID_INPUT,
             "invalid challenge attempt");
     }
     if (attempt.state == ATTEMPT_CLEANED) { ret problem.none(); }
-    if (!enter(attempt)) {
+    if (!enter[C](attempt)) {
         ret challenge_error(problem.INVALID_STATE,
             "challenge attempt is already inside a provider callback");
     }
     if (attempt.state != ATTEMPT_PRESENTED) {
         # nothing was ever published, so nothing is owed
         attempt.state = ATTEMPT_CLEANED;
-        leave(attempt);
+        leave[C](attempt);
         ret problem.none();
     }
     attempt.cleanup_calls = attempt.cleanup_calls + 1;
@@ -553,7 +551,7 @@ pub fun finish(attempt: *Attempt) problem.Error {
     # its own state reports that, but is never asked twice.
     attempt.state        = ATTEMPT_CLEANED;
     attempt.presentation = Presentation{ctx: nil};
-    leave(attempt);
+    leave[C](attempt);
     if (sel result.err) {
         ret result.err;
     }

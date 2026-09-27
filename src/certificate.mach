@@ -55,17 +55,18 @@ pub rec Chain {
     len:          usize;
 }
 
-# the provider owns the key material behind this opaque reference
-pub rec PrivateKey {
-    ctx:       ptr;
+# the provider owns the key material behind this typed reference, which may be
+# a record holding secret storage
+pub rec PrivateKey[C] {
+    ctx:       *C;
     algorithm: Algorithm;
 }
 
-pub rec Issued {
+pub rec Issued[C] {
     storage_key:     view.View;
     certificate_url: view.View;
     chain:           Chain;
-    private_key:     PrivateKey;
+    private_key:     PrivateKey[C];
     identifiers:     *identifier.Identifier;
     identifier_len:  usize;
     not_before_unix: u64;
@@ -74,11 +75,10 @@ pub rec Issued {
 
 # the caller owns the key. it signs the exact certification request info this
 # module produced and returns a raw signature, so no secret ever reaches here.
-pub def SignFun: fun(ptr, *u8, usize, *u8, usize) usize;
-
-pub rec CsrSigner {
-    ctx:            ptr;
-    sign:           SignFun;
+# the context is typed, so it may be the record that holds the key itself.
+pub rec CsrSigner[C] {
+    ctx:            *C;
+    sign:           fun(*C, *u8, usize, *u8, usize) usize;
     algorithm:      Algorithm;
     public_key_der: view.View;
 }
@@ -285,7 +285,7 @@ fun extension_request(writer: *Back, names: *identifier.Identifier,
     ret wrap(writer, TAG_CONTEXT_0, since(writer, attributes));
 }
 
-fun signer_valid(value: CsrSigner) bool {
+fun signer_valid[C](value: CsrSigner[C]) bool {
     ret value.sign != nil &&
         (value.algorithm == ECDSA_P256_SHA256 || value.algorithm == ED25519 ||
         value.algorithm == RSA_SHA256) &&
@@ -362,8 +362,8 @@ fun signature_shape_valid(algorithm: Algorithm, data: *u8, len: usize) bool {
 # produces a complete rfc 2986 certification request. work holds the exact
 # certification request info handed to the caller's signer; output receives the
 # finished request only after signing succeeds.
-pub fun encode_csr(names: *identifier.Identifier, len: usize,
-    policy: identifier.Policy, signer: CsrSigner, work: contracts.Buffer,
+pub fun encode_csr[C](names: *identifier.Identifier, len: usize,
+    policy: identifier.Policy, signer: CsrSigner[C], work: contracts.Buffer,
     output: contracts.Buffer) Operation {
     if (work.data == nil || output.data == nil ||
         !memory_range.valid(work.data, work.capacity) ||
@@ -371,7 +371,7 @@ pub fun encode_csr(names: *identifier.Identifier, len: usize,
         work.capacity > MAX_CSR_BYTES || output.capacity > MAX_CSR_BYTES ||
         memory_range.overlap(work.data, work.capacity, output.data,
         output.capacity) ||
-        !signer_valid(signer) || !names_valid(names, len, policy) ||
+        !signer_valid[C](signer) || !names_valid(names, len, policy) ||
         memory_range.overlap(work.data, work.capacity,
         signer.public_key_der.data, signer.public_key_der.len) ||
         memory_range.overlap(output.data, output.capacity,
