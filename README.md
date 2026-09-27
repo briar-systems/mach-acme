@@ -104,7 +104,7 @@ The manifest selects releases by version range, with the resolved release
 committed as a gitlink under `dep/`, and builds with mach 6.0.0 or later:
 
 - `mach-std` `^9.0` (v9.0.0)
-- `mach-http` `^0.23` (v0.23.0)
+- `mach-http` `^0.24` (v0.24.0)
 - `mach-crypto` `^0.24` (v0.24.0)
 
 Build output uses Mach's repository-local `out/` path. `mach test` runs the
