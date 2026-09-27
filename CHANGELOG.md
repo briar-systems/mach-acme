@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-27
+
+### Changed
+- **Breaking.** The challenge and certificate seams take a typed context instead of `ptr`, so an embedder can hand mach-acme a record that holds secret storage, which cannot erase to `ptr` (#126). `challenge.Provider[C]` carries `ctx: *C` and its callbacks take `*C`, and `Providers[C]`, `Attempt[C]`, `provider_valid`, `attempt_init`, `supports`, `begin`, `presented` and `finish` are generic over it. `Attempt.owner` is `*Attempt[C]` instead of `ptr`. `certificate.CsrSigner[C]` carries `ctx: *C` with `sign: fun(*C, *u8, usize, *u8, usize) usize`, the call is `encode_csr[C]`, and `certificate.PrivateKey[C]` and `Issued[C]` take the same typed `ctx`. `challenge.SupportsFun`, `PresentFun`, `CleanupFun` and `certificate.SignFun` are removed, since mach has no generic `def`. `jose.PrivateKey.secret_owner` and `Presentation.ctx` stay `ptr`, as identity and token only, and a welded owner names itself with the address of one of its public fields. `attempt_init` and `attempt_ready` no longer check the attempt's byte range, since a welded attempt cannot be measured as bytes, and keep the nil and typed self-pointer checks. The unit and live suites run the seams over welded contexts, and README and `doc/protocol.md` document the typed seams.
+- **Breaking.** Dependencies: mach-http `^0.24` at v0.24.0 (was `^0.23` at v0.23.0). Resolution is flat, so a consumer must move to http 0.24 with it. http 0.24 adds the server tunnel and the response and tunnel timeouts and breaks only `server.Handler` literals, and mach-acme reaches http only through `core.field`, `core.method` and `core.status`, so nothing it uses changes. The live conformance subproject pins http v0.24.0 by tag, and its suite passes against pebble (#128).
+
 ## [0.11.0] - 2026-09-27
 
 ### Changed
