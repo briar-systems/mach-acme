@@ -215,7 +215,8 @@ TLS-ALPN-01 digest and `acmeIdentifier` extension octet string. A wildcard
 order is validated against its base domain, so a DNS-01 record name never
 carries the wildcard label.
 
-`challenge.Attempt` owns one presentation through one provider. Cleanup is owed
+`challenge.Attempt[C]` owns one presentation through one `Provider[C]`, generic
+over the provider's context so that context may hold secret storage. Cleanup is owed
 exactly when presentation succeeded: a provider that declined the challenge is
 never asked to present, and a presentation that failed owes nothing.
 `challenge.finish` is the single exit for success, failure, timeout, and
@@ -240,8 +241,8 @@ renewal share. It is status agnostic: callers reduce their own status to
 `certificate.encode_csr` produces a complete RFC 2986 certification request.
 The library owns the DER encoding, which is the error-prone half, and never
 owns the key: the caller's signer receives the exact certification request info
-bytes and returns a signature. The signer's context is a plain pointer, so
-secret memory cannot be laundered through it. The returned signature's shape is
+bytes and returns a signature. `CsrSigner[C]` is generic over its context, so
+the context may be the record that holds the key in secret storage. The returned signature's shape is
 validated against the algorithm it claims, and the request info is re-encoded
 and compared after signing, so a signer that disturbed its input cannot publish
 a request.
