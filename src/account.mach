@@ -17,7 +17,6 @@ use std.types.bool.true;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
-use std.types.string.str;
 use std.types.view;
 
 # an element by index, nil when absent, as std 1.x returned it
