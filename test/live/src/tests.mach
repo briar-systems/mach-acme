@@ -1354,13 +1354,17 @@ fun set_certificate_private(output: *^u8) {
     }
 }
 
+# the csr signer's context is the record that holds the key in secret storage
 #[testing]
-fun certificate_sign(ctx: ptr, tbs: *u8, tbs_len: usize, output: *u8,
-    capacity: usize) usize {
-    var private_bytes: [32]^u8;
-    set_certificate_private(?private_bytes[0]);
+rec CertificateKey {
+    private_bytes: [32]^u8;
+}
+
+#[testing]
+fun certificate_sign(key: *CertificateKey, tbs: *u8, tbs_len: usize,
+    output: *u8, capacity: usize) usize {
     val signed: contracts.Operation = signature.sign_ecdsa_p256_sha256(
-        contracts.SecretBytes{data: ?private_bytes[0], len: 32},
+        contracts.SecretBytes{data: ?key.private_bytes[0], len: 32},
         contracts.Bytes{data: tbs, len: tbs_len},
         contracts.Buffer{data: output, capacity: capacity});
     if (signed.error != contracts.OK) { ret 0; }
@@ -1416,12 +1420,15 @@ test certificate__finalize_download_verify_revoke {
     var spki:     [128]u8;
     var spki_len: usize = 0;
     if (!certificate_spki(?spki[0], ?spki_len)) { ret 3; }
+    var csr_key: CertificateKey;
+    set_certificate_private(?csr_key.private_bytes[0]);
     var csr_work:   [4096]u8;
     var csr_output: [4096]u8;
-    val csr:        certificate.Operation = certificate.encode_csr(
+    val csr:        certificate.Operation = certificate.encode_csr[CertificateKey](
         ready.value.identifiers, ready.value.identifier_len,
         identifier.policy_default(),
-        certificate.CsrSigner{ctx: nil, sign: certificate_sign,
+        certificate.CsrSigner[CertificateKey]{ctx: ?csr_key,
+        sign:           certificate_sign,
         algorithm:      certificate.ECDSA_P256_SHA256,
         public_key_der: view.view(?spki[0], spki_len)},
         contracts.Buffer{data: ?csr_work[0], capacity: 4096},

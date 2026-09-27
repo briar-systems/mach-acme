@@ -3997,15 +3997,17 @@ test challenge__dns_propagation {
     ret 0;
 }
 
-# a signing provider resolves its own key material. the opaque context never
-# carries a secret, so no public alias to the scalar can exist.
+# the signer's context is the record that holds the key in secret storage
 #[testing]
-fun csr_sign_p256(ctx: ptr, tbs: *u8, tbs_len: usize, output: *u8,
+rec CsrKey {
+    private_bytes: [32]^u8;
+}
+
+#[testing]
+fun csr_sign_p256(key: *CsrKey, tbs: *u8, tbs_len: usize, output: *u8,
     capacity: usize) usize {
-    var private_bytes: [32]^u8;
-    set_private(?private_bytes[0]);
     val signed: contracts.Operation = signature.sign_ecdsa_p256_sha256(
-        contracts.SecretBytes{data: ?private_bytes[0], len: 32},
+        contracts.SecretBytes{data: ?key.private_bytes[0], len: 32},
         contracts.Bytes{data: tbs, len: tbs_len},
         contracts.Buffer{data: output, capacity: capacity});
     if (signed.error != contracts.OK) { ret 0; }
@@ -4077,12 +4079,16 @@ test certificate__csr_der_and_signature {
         value: view.view("a.example.com", 13)};
     names[1] = identifier.Identifier{kind: identifier.DNS,
         value: view.view("*.b.example.com", 15)};
-    var work:   [4096]u8;
-    var output: [4096]u8;
-    val signer: certificate.CsrSigner = certificate.CsrSigner{ctx: nil,
-        sign:           csr_sign_p256, algorithm: certificate.ECDSA_P256_SHA256,
-        public_key_der: view.view(?spki[0], spki_len)};
-    val csr: certificate.Operation = certificate.encode_csr(?names[0], 2,
+    var work:    [4096]u8;
+    var output:  [4096]u8;
+    var csr_key: CsrKey;
+    set_private(?csr_key.private_bytes[0]);
+    val signer: certificate.CsrSigner[CsrKey] = certificate.CsrSigner[CsrKey]{
+        ctx:            ?csr_key, sign: csr_sign_p256,
+        algorithm:      certificate.ECDSA_P256_SHA256,
+        public_key_der: view.view(?spki[0], spki_len)
+    };
+    val csr: certificate.Operation = certificate.encode_csr[CsrKey](?names[0], 2,
         identifier.policy_default(), signer,
         contracts.Buffer{data: ?work[0], capacity: 4096},
         contracts.Buffer{data: ?output[0], capacity: 4096});
@@ -4143,9 +4149,9 @@ test certificate__csr_der_and_signature {
 
     # a signer that returns a shape the algorithm does not admit is refused
     fill(?output[0], 0xa5, 4096);
-    var wrong: certificate.CsrSigner = signer;
+    var wrong: certificate.CsrSigner[CsrKey] = signer;
     wrong.algorithm = certificate.ED25519;
-    if (certificate.encode_csr(?names[0], 2, identifier.policy_default(),
+    if (certificate.encode_csr[CsrKey](?names[0], 2, identifier.policy_default(),
         wrong, contracts.Buffer{data: ?work[0], capacity: 4096},
         contracts.Buffer{data: ?output[0], capacity: 4096}).error.code !=
         problem.SIGNATURE_FAILED || !filled(?output[0], 0xa5, 4096)) {
@@ -4154,15 +4160,15 @@ test certificate__csr_der_and_signature {
     # a denied wildcard, an empty request, and a short output all fail closed
     var strict: identifier.Policy = identifier.policy_default();
     strict.allow_wildcard = false;
-    if (certificate.encode_csr(?names[0], 2, strict, signer,
+    if (certificate.encode_csr[CsrKey](?names[0], 2, strict, signer,
         contracts.Buffer{data: ?work[0], capacity: 4096},
         contracts.Buffer{data: ?output[0], capacity: 4096}).error.code !=
         problem.INVALID_INPUT ||
-        certificate.encode_csr(?names[0], 0, identifier.policy_default(),
+        certificate.encode_csr[CsrKey](?names[0], 0, identifier.policy_default(),
         signer, contracts.Buffer{data: ?work[0], capacity: 4096},
         contracts.Buffer{data: ?output[0], capacity: 4096}).error.code !=
         problem.INVALID_INPUT ||
-        certificate.encode_csr(?names[0], 2, identifier.policy_default(),
+        certificate.encode_csr[CsrKey](?names[0], 2, identifier.policy_default(),
         signer, contracts.Buffer{data: ?work[0], capacity: 32},
         contracts.Buffer{data: ?output[0], capacity: 4096}).error.code !=
         problem.OUTPUT_TOO_SMALL || !filled(?output[0], 0xa5, 4096)) {
