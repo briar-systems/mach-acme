@@ -1,0 +1,1 @@
+{"type":"urn:ietf:params:acme:error:malformed","detail":"some identifiers were rejected","instance":"https://example.com/docs/1","subproblems":[{"type":"urn:ietf:params:acme:error:rejectedIdentifier","detail":"this ca will not issue for example.net","identifier":{"type":"dns","value":"example.net"}},{"type":"urn:ietf:params:acme:error:caa"}]}

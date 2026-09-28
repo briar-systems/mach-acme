@@ -1,0 +1,1 @@
+{"status":"valid","identifier":{"type":"ip","value":"2001:db8::1"},"challenges":[{"type":"tls-sni-99","url":"https://example.com/chall/9","token":"tok-9","status":"pending"},{"type":"tls-alpn-01","url":"https://example.com/chall/1","token":"DGyRejmCefe7v4NfDGDKfA","status":"valid","validated":"2026-01-01T00:00:00.123+02:00"}]}
