@@ -1,0 +1,283 @@
+# the protocol layer: the directory, a problem document, and the Replay-Nonce
+# field, each read through the client state a real exchange would hold
+
+use acme.client;
+use acme.nonce;
+use acme.problem;
+use http.core.field;
+use http.core.status;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+use fuzz.verdict;
+
+val TEXT_BYTES:  usize = 65536;
+val CAA_ITEMS:   usize = 64;
+val SUBPROBLEMS: usize = 64;
+val NONCE_SLOTS: usize = 4;
+val NONCE_BYTES: usize = 512;
+
+var scratch:     [262144]u8;
+var text:        [TEXT_BYTES]u8;
+var caa:         [CAA_ITEMS]view.View;
+var subproblems: [SUBPROBLEMS]problem.Subproblem;
+var directory:   client.Directory;
+
+var slots:         [NONCE_SLOTS]nonce.Slot;
+var nonce_storage: [NONCE_SLOTS * NONCE_BYTES]u8;
+var memory:        nonce.Memory;
+var pool:          nonce.Pool;
+var protocol:      client.Client;
+var request:       client.SignedRequest;
+var taken:         [NONCE_BYTES]u8;
+
+var items:  [8]field.Field;
+var fields: field.Fields;
+
+pub fun response(code: status.Status, headers: *field.Fields, data: *u8,
+    len: usize) client.Response {
+    ret client.Response{status: code, fields: headers, body: view.view(data, len),
+        retry_after_seconds: 0};
+}
+
+pub fun no_fields(headers: *field.Fields) {
+    @headers = field.init(nil, 0, field.limits(0, 0, 0, 0));
+}
+
+# a field block the response limits admit, holding one named value
+pub fun one_field(headers: *field.Fields, storage: *field.Field, name: str,
+    name_len: usize, value: view.View) field.AddStatus {
+    @headers = field.init(storage, 1, field.limits(1, 65536, 256, 8192));
+    ret field.append(headers, field.Field{name: view.view(name, name_len),
+        value: value, sensitive: false});
+}
+
+fun error_outcome(cause: problem.Error) u64 {
+    ret (cause.kind::u64 << 8) | cause.code::u64;
+}
+
+fun optional_url(value: view.View) bool {
+    ret value.len == 0 || client.url_valid(value, 4096);
+}
+
+pub fun answer_directory(data: *u8, len: usize) verdict.Verdict {
+    var headers: field.Fields;
+    no_fields(?headers);
+    verdict.fill((?directory)::*u8, $size_of(client.Directory), 0xa5);
+    val result: problem.Error = client.parse_directory(
+        response(status.OK, ?headers, data, len), client.limits_default(),
+        ?scratch[0], 262144, client.DirectoryStorage{data: ?text[0],
+        capacity: TEXT_BYTES, caa_items: ?caa[0], caa_capacity: CAA_ITEMS},
+        ?directory);
+    if (problem.failed(result)) {
+        if (!verdict.untouched((?directory)::*u8, $size_of(client.Directory), 0xa5)) {
+            ret verdict.violated("directory: a refused directory wrote its output");
+        }
+        ret verdict.answered(error_outcome(result));
+    }
+    verdict.accept();
+    # every endpoint is an https url copied into the text storage, and the
+    # three the protocol cannot run without are present
+    if (!client.url_valid(directory.new_nonce_url, 4096) ||
+        !client.url_valid(directory.new_account_url, 4096) ||
+        !client.url_valid(directory.new_order_url, 4096) ||
+        !optional_url(directory.new_authz_url) ||
+        !optional_url(directory.revoke_cert_url) ||
+        !optional_url(directory.key_change_url) ||
+        !optional_url(directory.renewal_info_url) ||
+        !verdict.view_inside(directory.new_nonce_url, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(directory.new_account_url, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(directory.new_order_url, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(directory.new_authz_url, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(directory.revoke_cert_url, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(directory.key_change_url, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(directory.renewal_info_url, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(directory.terms_url, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(directory.website_url, ?text[0], TEXT_BYTES)) {
+        ret verdict.violated("directory: an accepted endpoint is not an https url in the text storage");
+    }
+    if (directory.caa_identity_len > CAA_ITEMS ||
+        (directory.caa_identity_len != 0 && directory.caa_identities != ?caa[0])) {
+        ret verdict.violated("directory: the caa identities overran their storage");
+    }
+    var i: usize = 0;
+    for (i < directory.caa_identity_len) {
+        if (directory.caa_identities[i].len == 0 ||
+            !verdict.view_inside(directory.caa_identities[i], ?text[0], TEXT_BYTES)) {
+            ret verdict.violated("directory: a caa identity is empty or outside the text storage");
+        }
+        i = i + 1;
+    }
+    var shape: u64 = 1::u64 << 40;
+    if (directory.new_authz_url.len != 0)    { shape = shape | 1; }
+    if (directory.revoke_cert_url.len != 0)  { shape = shape | 2; }
+    if (directory.key_change_url.len != 0)   { shape = shape | 4; }
+    if (directory.renewal_info_url.len != 0) { shape = shape | 8; }
+    if (directory.terms_url.len != 0)        { shape = shape | 16; }
+    if (directory.website_url.len != 0)      { shape = shape | 32; }
+    if (directory.external_account_required) { shape = shape | 64; }
+    ret verdict.answered(verdict.mix(shape, verdict.bucket(directory.caa_identity_len)));
+}
+
+fun zero(data: *u8, len: usize) {
+    verdict.fill(data, len, 0);
+}
+
+# a fresh client with a signed request in the given state, as the exchange
+# that sent it leaves them
+fun exchange(state: client.RequestState) bool {
+    zero((?memory)::*u8, $size_of(nonce.Memory));
+    zero((?protocol)::*u8, $size_of(client.Client));
+    zero((?request)::*u8, $size_of(client.SignedRequest));
+    if (problem.failed(nonce.init_memory(?memory, ?slots[0], NONCE_SLOTS,
+        ?nonce_storage[0], NONCE_SLOTS * NONCE_BYTES, NONCE_BYTES))) { ret false; }
+    pool = nonce.pool(?memory);
+    if (problem.failed(client.init(?protocol, ?pool, client.limits_default()))) {
+        ret false;
+    }
+    request.state = client.REQUEST_EMPTY;
+    if (problem.failed(client.begin_signed(?protocol, ?request, client.SignedSpec{
+        url:     view.view("https://example.com/acme/order", 30),
+        payload: view.view("{}", 2),
+        kid:     view.view("https://example.com/acme/acct/1", 31), use_jwk: false
+    }))) { ret false; }
+    request.wire_body = view.view("prepared", 8);
+    request.state     = state;
+    ret true;
+}
+
+fun problem_inside(value: problem.Problem) bool {
+    if (value.typ.len == 0 || value.subproblem_len > SUBPROBLEMS ||
+        (value.status != 0 && (value.status < 100 || value.status > 599)) ||
+        !verdict.view_inside(value.typ, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(value.title, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(value.detail, ?text[0], TEXT_BYTES) ||
+        !verdict.view_inside(value.instance, ?text[0], TEXT_BYTES)) { ret false; }
+    if (value.subproblem_len != 0 && value.subproblems != ?subproblems[0]) { ret false; }
+    var i: usize = 0;
+    for (i < value.subproblem_len) {
+        val item: problem.Subproblem = value.subproblems[i];
+        if (item.typ.len == 0 ||
+            !verdict.view_inside(item.typ, ?text[0], TEXT_BYTES) ||
+            !verdict.view_inside(item.detail, ?text[0], TEXT_BYTES) ||
+            !verdict.view_inside(item.identifier.typ, ?text[0], TEXT_BYTES) ||
+            !verdict.view_inside(item.identifier.value, ?text[0], TEXT_BYTES)) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the body of an error response to a signed request, which carries a fresh
+# Replay-Nonce so a badNonce problem can be retried at once
+pub fun answer_problem(data: *u8, len: usize) verdict.Verdict {
+    if (!exchange(client.REQUEST_AWAITING)) {
+        ret verdict.violated("fuzz: the signed request could not be set up");
+    }
+    if (one_field(?fields, ?items[0], "Replay-Nonce", 12,
+        view.view("fresh_nonce", 11)) != field.ADD_OK) {
+        ret verdict.violated("fuzz: the Replay-Nonce field could not be set up");
+    }
+    val decision: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.BAD_REQUEST, ?fields, data, len), ?scratch[0],
+        262144, client.ProblemStorage{data: ?text[0], capacity: TEXT_BYTES,
+        subproblems: ?subproblems[0], subproblem_capacity: SUBPROBLEMS});
+    val cause:   problem.Error = decision.cause;
+    var outcome: u64           = verdict.mix(decision.action::u64, error_outcome(cause));
+    if (cause.http.status != status.BAD_REQUEST || !problem.failed(cause)) {
+        ret verdict.violated("problem: an error response lost its status or its failure");
+    }
+    if (cause.code == problem.BAD_NONCE) {
+        verdict.accept();
+        # a badNonce problem retries with the nonce this response carried
+        if (decision.action != client.ACTION_RETRY_SIGNED ||
+            request.state != client.REQUEST_RETRY || !request.retry_nonce_ready ||
+            request.retry_nonce_len != 11 || !problem_inside(cause.problem)) {
+            ret verdict.violated("problem: a badNonce problem did not retry with the fresh nonce");
+        }
+        ret verdict.answered(verdict.mix(outcome, verdict.bucket(cause.problem.subproblem_len)));
+    }
+    if (decision.action != client.ACTION_FAILED || request.state != client.REQUEST_FAILED) {
+        ret verdict.violated("problem: a problem other than badNonce did not end the request");
+    }
+    if (cause.code == problem.ACME_PROBLEM) {
+        verdict.accept();
+        # an accepted problem is copied whole into the problem storage
+        if (!problem_inside(cause.problem)) {
+            ret verdict.violated("problem: an accepted problem publishes a view outside its storage");
+        }
+        outcome = verdict.mix(outcome, verdict.bucket(cause.problem.subproblem_len));
+        if (cause.problem.status != 0) { outcome = verdict.mix(outcome, 1); }
+    }
+    ret verdict.answered(outcome);
+}
+
+fun nonce_byte(byte: u8) bool {
+    ret (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+        (byte >= '0' && byte <= '9') || byte == '-' || byte == '_';
+}
+
+fun same(first: *u8, second: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the value of a Replay-Nonce field, read by a nonce response and by a
+# successful signed response
+pub fun answer_replay_nonce(data: *u8, len: usize) verdict.Verdict {
+    val value:  view.View       = view.view(data, len);
+    val placed: field.AddStatus = one_field(?fields, ?items[0], "Replay-Nonce", 12, value);
+    # a value the field layer refuses never reaches a nonce reader
+    if (placed != field.ADD_OK) { ret verdict.answered(placed::u64); }
+    var expected: bool  = len != 0 && len <= NONCE_BYTES;
+    var i:        usize = 0;
+    for (i < len && expected) {
+        expected = nonce_byte(data[i]);
+        i        = i + 1;
+    }
+    if (!exchange(client.REQUEST_NEEDS_NONCE)) {
+        ret verdict.violated("fuzz: the signed request could not be set up");
+    }
+    val bound: problem.Error = client.accept_nonce_response(?protocol, ?request,
+        response(status.OK, ?fields, nil, 0));
+    # the nonce is taken exactly when it is a nonce, and it is the bytes sent
+    if (problem.failed(bound)) {
+        if (expected || request.state != client.REQUEST_FAILED) {
+            ret verdict.violated("replay-nonce: a nonce response refused a valid nonce or kept the request");
+        }
+    }
+    or {
+        verdict.accept();
+        if (!expected || request.state != client.REQUEST_RETRY ||
+            !request.retry_nonce_ready || request.retry_nonce_len != len ||
+            !same(?request.retry_nonce[0], data, len)) {
+            ret verdict.violated("replay-nonce: a nonce response bound a nonce that is not the one sent");
+        }
+    }
+    if (!exchange(client.REQUEST_AWAITING)) {
+        ret verdict.violated("fuzz: the signed request could not be set up");
+    }
+    val decision: client.Decision = client.accept_signed_response(?protocol,
+        ?request, response(status.OK, ?fields, nil, 0), ?scratch[0], 262144,
+        client.ProblemStorage{data: ?text[0], capacity: TEXT_BYTES,
+        subproblems: ?subproblems[0], subproblem_capacity: SUBPROBLEMS});
+    if (decision.action != client.ACTION_COMPLETE) {
+        ret verdict.violated("replay-nonce: a successful response did not complete for its nonce");
+    }
+    val stored: nonce.Taken = nonce.take(pool, ?taken[0], NONCE_BYTES);
+    if (stored.found != expected ||
+        (stored.found && (stored.value.len != len ||
+        !same(stored.value.data::*u8, data, len)))) {
+        ret verdict.violated("replay-nonce: the pool holds a nonce other than the valid one sent");
+    }
+    ret verdict.answered(verdict.mix(1::u64 << 40, expected::u64));
+}

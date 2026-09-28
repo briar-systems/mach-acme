@@ -1,0 +1,97 @@
+# the bounded json tree every response document is read through, and the https
+# url grammar every url the authority names is held to
+
+use acme.client;
+use acme.json;
+use acme.problem;
+use J: std.data.json;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.verdict;
+
+val MAX_DEPTH:  usize = 16;
+val MAX_VALUES: usize = 4096;
+
+var scratch: [262144]u8;
+
+fun limits() json.Limits {
+    ret json.Limits{max_bytes: 65536, max_depth: MAX_DEPTH,
+        max_values:          MAX_VALUES, max_key_bytes: 128,
+        max_key_comparisons: 65536};
+}
+
+# walks the accepted tree, bounded by the limits it was accepted under
+fun walk(value: *J.Value, depth: usize, count: *usize, kinds: *u64) bool {
+    if (value == nil || depth > MAX_DEPTH || @count >= MAX_VALUES) { ret false; }
+    @count = @count + 1;
+    @kinds = @kinds | (1::u64 << value.kind::u64);
+    if (value.kind != J.ARRAY && value.kind != J.OBJECT) { ret true; }
+    val n: usize = J.value_count(value);
+    var i: usize = 0;
+    for (i < n) {
+        val child: opt[*J.Value] = J.value_get(value, i);
+        if (sel child.none)                             { ret false; }
+        if (!walk(child.some, depth + 1, count, kinds)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    val document: json.Document = json.parse(view.view(data, len), ?scratch[0],
+        262144, limits());
+    if (!document.valid) {
+        if (!problem.failed(document.error)) {
+            ret verdict.violated("json: a refused document carries no error");
+        }
+        ret verdict.answered((document.error.kind::u64 << 8) | document.error.code::u64);
+    }
+    verdict.accept();
+    var root:  J.Value = document.root;
+    var count: usize   = 0;
+    var kinds: u64     = 0;
+    # an accepted tree holds no more values and no deeper nesting than its limits
+    if (!walk(?root, 1, ?count, ?kinds)) {
+        ret verdict.violated("json: an accepted tree breaks the depth or value limit it was held to");
+    }
+    var shape: u64 = verdict.mix(1::u64 << 40, root.kind::u64);
+    shape = verdict.mix(shape, kinds);
+    ret verdict.answered(verdict.mix(shape, verdict.bucket(count)));
+}
+
+fun scheme(byte: u8, lower: u8) bool {
+    ret byte == lower || byte == lower - 32;
+}
+
+pub fun answer_url(data: *u8, len: usize) verdict.Verdict {
+    val url: view.View = view.view(data, len);
+    if (!client.url_valid(url, 4096)) { ret verdict.answered(0); }
+    verdict.accept();
+    # an accepted url is an https url of printable bytes with no fragment, and
+    # a maximum below its length refuses it
+    if (len < 9 || !scheme(data[0], 'h') || !scheme(data[1], 't') ||
+        !scheme(data[2], 't') || !scheme(data[3], 'p') || !scheme(data[4], 's') ||
+        data[5] != ':' || data[6] != '/' || data[7] != '/' ||
+        client.url_valid(url, len - 1)) {
+        ret verdict.violated("url: an accepted url is not an https url within its maximum");
+    }
+    var shape: u64   = 1::u64 << 40;
+    var i:     usize = 0;
+    for (i < len) {
+        val byte: u8 = data[i];
+        if (byte <= ' ' || byte >= 127 || byte == '#') {
+            ret verdict.violated("url: an accepted url holds a space, control, non-ascii or fragment byte");
+        }
+        if (byte == '[')          { shape = shape | 1; }
+        or (byte == '%')          { shape = shape | 2; }
+        or (byte == '?')          { shape = shape | 4; }
+        or (byte == ':' && i > 5) { shape = shape | 8; }
+        i = i + 1;
+    }
+    ret verdict.answered(shape);
+}

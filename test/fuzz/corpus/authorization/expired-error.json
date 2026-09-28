@@ -1,0 +1,1 @@
+{"status":"expired","identifier":{"type":"dns","value":"a.example"},"challenges":[{"type":"http-01","url":"https://example.com/chall/1","token":"tok-1","status":"invalid","error":{"type":"urn:ietf:params:acme:error:connection","detail":"no answer","status":400}}]}

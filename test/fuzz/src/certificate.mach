@@ -1,0 +1,207 @@
+# an issued certificate: the pem chain a download returns, the der fields acme
+# decisions read from the leaf, the renewal identifier, and the Link fields
+# that name alternate chains
+
+use acme.certificate;
+use acme.client;
+use acme.identifier;
+use acme.problem;
+use acme.renewal_info;
+use crypto.contracts;
+use http.core.field;
+use http.core.status;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.protocol;
+use fuzz.verdict;
+
+val NAMES:      usize = 16;
+val DER_BYTES:  usize = 16384;
+val TEXT_BYTES: usize = 16384;
+
+var names:        [NAMES]identifier.Identifier;
+var certificates: [certificate.MAX_CHAIN_LENGTH]certificate.Certificate;
+var der:          [DER_BYTES]u8;
+var chain:        certificate.Chain;
+var id:           [renewal_info.MAX_CERTIFICATE_ID_BYTES]u8;
+var text:         [TEXT_BYTES]u8;
+var urls:         [certificate.MAX_ALTERNATES]view.View;
+var alternates:   certificate.Alternates;
+var items:        [certificate.MAX_ALTERNATES]field.Field;
+
+fun unpadded(len: usize) usize {
+    val whole:     usize = len / 3;
+    val remainder: usize = len - whole * 3;
+    if (remainder == 0) { ret whole * 4; }
+    ret whole * 4 + remainder + 1;
+}
+
+fun terminated(len: usize) usize {
+    ret (len + 2) / 3 * 4 + 1;
+}
+
+fun url_byte(byte: u8) bool {
+    ret (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+        (byte >= '0' && byte <= '9') || byte == '-' || byte == '_';
+}
+
+# answers one der certificate through every reader acme applies to a leaf,
+# folding what each answered into the outcome. false is a broken promise
+fun leaf(data: *u8, len: usize, outcome: *u64) bool {
+    val encoded: view.View     = view.view(data, len);
+    var parsed:  certificate.Parsed;
+    val decoded: problem.Error = certificate.parse_certificate(encoded, ?names[0],
+        NAMES, ?parsed);
+    if (problem.failed(decoded)) {
+        @outcome = verdict.mix(@outcome, (decoded.kind::u64 << 8) | decoded.code::u64);
+    }
+    or {
+        verdict.accept();
+        # every name is a dns name or a four or sixteen octet address inside
+        # the certificate, and the validity window is not inverted
+        if (parsed.names != ?names[0] || parsed.name_len > NAMES ||
+            parsed.not_after_unix <= parsed.not_before_unix) { ret false; }
+        var kinds: u64   = 0;
+        var i:     usize = 0;
+        for (i < parsed.name_len) {
+            val name: identifier.Identifier = parsed.names[i];
+            if (!verdict.view_inside(name.value, data, len) ||
+                (name.kind != identifier.DNS && name.kind != identifier.IP) ||
+                (name.kind == identifier.IP && name.value.len != 4 &&
+                name.value.len != 16)) { ret false; }
+            kinds = kinds | (1::u64 << name.kind::u64);
+            i     = i + 1;
+        }
+        @outcome = verdict.mix(@outcome, (1::u64 << 40) | (kinds << 4) |
+            verdict.bucket(parsed.name_len));
+    }
+    var key_id: view.View;
+    var serial: view.View;
+    val parts:  problem.Error          = certificate.renewal_id_parts(encoded, ?key_id, ?serial);
+    val named:  renewal_info.Operation = renewal_info.certificate_id(encoded,
+        contracts.Buffer{data: ?id[0], capacity: renewal_info.MAX_CERTIFICATE_ID_BYTES});
+    if (problem.failed(parts)) {
+        @outcome = verdict.mix(@outcome, (parts.kind::u64 << 8) | parts.code::u64);
+        # the identifier is built from the parts, so it cannot exist without them
+        ret problem.failed(named.error);
+    }
+    verdict.accept();
+    # the serial and key identifier are the der content octets inside the leaf
+    if (serial.len == 0 || serial.len > 20 || key_id.len == 0 ||
+        !verdict.view_inside(serial, data, len) ||
+        !verdict.view_inside(key_id, data, len)) { ret false; }
+    if (problem.failed(named.error)) {
+        @outcome = verdict.mix(@outcome, (named.error.kind::u64 << 8) |
+            named.error.code::u64);
+        # only parts whose encoding outgrows the output are refused, and the
+        # encoder asks for room for a padded, terminated encoding
+        val bound:     usize = renewal_info.MAX_CERTIFICATE_ID_BYTES;
+        val key_bytes: usize = unpadded(key_id.len);
+        ret terminated(key_id.len) > bound || key_bytes >= bound - 2 ||
+            terminated(serial.len) > bound - key_bytes - 1;
+    }
+    # the identifier is base64url(key id) "." base64url(serial), unpadded
+    val dot: usize = unpadded(key_id.len);
+    if (named.written != dot + 1 + unpadded(serial.len) ||
+        named.written > renewal_info.MAX_CERTIFICATE_ID_BYTES ||
+        named.value.data::*u8 != ?id[0] || named.value.len != named.written ||
+        id[dot] != '.') { ret false; }
+    var i: usize = 0;
+    for (i < named.written) {
+        if (i != dot && !url_byte(id[i])) { ret false; }
+        i = i + 1;
+    }
+    @outcome = verdict.mix(@outcome, (2::u64 << 40) | serial.len::u64);
+    ret true;
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    if (!leaf(data, len, ?outcome)) {
+        ret verdict.violated("certificate: an accepted leaf publishes a name, serial or key identifier outside it, or a malformed renewal identifier");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_chain(data: *u8, len: usize) verdict.Verdict {
+    verdict.fill((?chain)::*u8, $size_of(certificate.Chain), 0xa5);
+    val result: problem.Error = certificate.parse_chain(view.view(data, len),
+        ?certificates[0], certificate.MAX_CHAIN_LENGTH, ?der[0], DER_BYTES, ?chain);
+    if (problem.failed(result)) {
+        if (!verdict.untouched((?chain)::*u8, $size_of(certificate.Chain), 0xa5)) {
+            ret verdict.violated("chain: a refused chain wrote its output");
+        }
+        ret verdict.answered((result.kind::u64 << 8) | result.code::u64);
+    }
+    verdict.accept();
+    if (chain.len == 0 || chain.len > certificate.MAX_CHAIN_LENGTH ||
+        chain.certificates != ?certificates[0]) {
+        ret verdict.violated("chain: an accepted chain is empty or overran its storage");
+    }
+    # each certificate is decoded into the der storage, one after the other
+    var used:    usize = 0;
+    var outcome: u64   = verdict.mix(1::u64 << 40, verdict.bucket(chain.len));
+    var i:       usize = 0;
+    for (i < chain.len) {
+        val item: view.View = chain.certificates[i].der;
+        if (item.len == 0 || item.data::*u8 != ?der[used] ||
+            !verdict.view_inside(item, ?der[0], DER_BYTES)) {
+            ret verdict.violated("chain: a decoded certificate is empty or not where the storage left off");
+        }
+        used = used + item.len;
+        if (!leaf(item.data::*u8, item.len, ?outcome)) {
+            ret verdict.violated("chain: a certificate of an accepted chain broke a leaf reader's promise");
+        }
+        i = i + 1;
+    }
+    ret verdict.answered(outcome);
+}
+
+# the input is one Link field value per line
+pub fun answer_alternates(data: *u8, len: usize) verdict.Verdict {
+    var headers: field.Fields = field.init(?items[0], certificate.MAX_ALTERNATES,
+        field.limits(certificate.MAX_ALTERNATES, 65536, 256, 8192));
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (i <= len) {
+        if (i == len || (data[i] == '\n' && headers.len + 1 < certificate.MAX_ALTERNATES)) {
+            val added: field.AddStatus = field.append(?headers, field.Field{
+                name:  view.view("Link", 4),
+                value: view.view(?data[start], i - start), sensitive: false
+            });
+            # a value the field layer refuses never reaches the link reader
+            if (added != field.ADD_OK) { ret verdict.answered(added::u64); }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    verdict.fill((?alternates)::*u8, $size_of(certificate.Alternates), 0xa5);
+    val result: problem.Error = certificate.parse_alternates(
+        protocol.response(status.OK, ?headers, nil, 0), 4096, ?text[0], TEXT_BYTES,
+        ?urls[0], certificate.MAX_ALTERNATES, ?alternates);
+    if (problem.failed(result)) {
+        if (!verdict.untouched((?alternates)::*u8, $size_of(certificate.Alternates), 0xa5)) {
+            ret verdict.violated("alternates: a refused Link field wrote its output");
+        }
+        ret verdict.answered((result.kind::u64 << 8) | result.code::u64);
+    }
+    verdict.accept();
+    # every alternate is an https url copied into the text storage
+    if (alternates.len > certificate.MAX_ALTERNATES || alternates.urls != ?urls[0]) {
+        ret verdict.violated("alternates: the alternates overran their storage");
+    }
+    i = 0;
+    for (i < alternates.len) {
+        if (!verdict.view_inside(alternates.urls[i], ?text[0], TEXT_BYTES) ||
+            !client.url_valid(alternates.urls[i], 4096)) {
+            ret verdict.violated("alternates: an alternate is not an https url in the text storage");
+        }
+        i = i + 1;
+    }
+    ret verdict.answered(verdict.mix(1::u64 << 40,
+        (verdict.bucket(headers.len) << 4) | verdict.bucket(alternates.len)));
+}

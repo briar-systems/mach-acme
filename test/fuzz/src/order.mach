@@ -1,0 +1,169 @@
+# an order resource, as creation and polling read it, and an authorization
+# with its challenges
+
+use acme.challenge;
+use acme.client;
+use acme.identifier;
+use acme.order;
+use acme.problem;
+use http.core.field;
+use http.core.status;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.protocol;
+use fuzz.verdict;
+
+val TEXT_BYTES: usize = 65536;
+
+var scratch:        [262144]u8;
+var text:           [TEXT_BYTES]u8;
+var identifiers:    [order.MAX_IDENTIFIERS]identifier.Identifier;
+var authorizations: [order.MAX_IDENTIFIERS]view.View;
+var challenges:     [order.MAX_CHALLENGES]challenge.Challenge;
+var parsed:         order.Order;
+var authorization:  order.Authorization;
+var items:          [1]field.Field;
+
+# wildcards and ip identifiers both admitted, so every identifier branch is reached
+fun policy() identifier.Policy {
+    ret identifier.Policy{allow_wildcard: true, allow_ip: true,
+        max_value_bytes: identifier.MAX_VALUE_BYTES};
+}
+
+fun limits() order.Limits {
+    var configured: order.Limits = order.limits_default();
+    configured.max_response_bytes = 65536;
+    configured.max_json_scratch   = 262144;
+    ret configured;
+}
+
+fun in_text(value: view.View) bool {
+    ret verdict.view_inside(value, ?text[0], TEXT_BYTES);
+}
+
+fun problem_in_text(value: problem.Problem) bool {
+    ret in_text(value.typ) && in_text(value.title) && in_text(value.detail) &&
+        in_text(value.instance) && value.status <= 599 && value.subproblem_len == 0;
+}
+
+fun url_in_text(value: view.View) bool {
+    ret in_text(value) && client.url_valid(value, 4096);
+}
+
+fun parse_one(code: status.Status, headers: *field.Fields, order_url: view.View,
+    data: *u8, len: usize, outcome: *u64) bool {
+    verdict.fill((?parsed)::*u8, $size_of(order.Order), 0xa5);
+    val result: problem.Error = order.parse(
+        protocol.response(code, headers, data, len), order_url, policy(), limits(),
+        ?scratch[0], 262144, order.Storage{data: ?text[0], capacity: TEXT_BYTES,
+        identifiers:            ?identifiers[0], identifier_capacity: order.MAX_IDENTIFIERS,
+        authorizations:         ?authorizations[0],
+        authorization_capacity: order.MAX_IDENTIFIERS}, ?parsed);
+    if (problem.failed(result)) {
+        @outcome = verdict.mix(@outcome, (result.kind::u64 << 8) | result.code::u64);
+        # a refused response leaves the caller's record as it was
+        ret verdict.untouched((?parsed)::*u8, $size_of(order.Order), 0xa5);
+    }
+    verdict.accept();
+    # an accepted order names a known status, only a valid order names its
+    # certificate, and every url and identifier is copied into the text storage
+    if (parsed.status < order.PENDING || parsed.status > order.INVALID ||
+        (parsed.status == order.VALID) != (parsed.certificate_url.len != 0) ||
+        (parsed.certificate_url.len != 0 && !url_in_text(parsed.certificate_url)) ||
+        !url_in_text(parsed.finalize_url) || !in_text(parsed.expires) ||
+        (order_url.len == 0 && !url_in_text(parsed.url)) ||
+        (order_url.len != 0 && (parsed.url.data != order_url.data ||
+        parsed.url.len != order_url.len)) ||
+        parsed.identifier_len == 0 || parsed.identifier_len > order.MAX_IDENTIFIERS ||
+        parsed.identifiers != ?identifiers[0] ||
+        parsed.authorization_len > order.MAX_IDENTIFIERS ||
+        (parsed.authorization_len != 0 && parsed.authorization_urls != ?authorizations[0]) ||
+        !problem_in_text(parsed.failure)) { ret false; }
+    var i: usize = 0;
+    for (i < parsed.identifier_len) {
+        if (!in_text(parsed.identifiers[i].value) ||
+            !identifier.valid(parsed.identifiers[i], policy())) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < parsed.authorization_len) {
+        if (!url_in_text(parsed.authorization_urls[i])) { ret false; }
+        i = i + 1;
+    }
+    @outcome = verdict.mix(@outcome, (1::u64 << 40) | (parsed.status::u64 << 8) |
+        (verdict.bucket(parsed.identifier_len) << 4) |
+        verdict.bucket(parsed.authorization_len));
+    ret true;
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    var created: field.Fields;
+    if (protocol.one_field(?created, ?items[0], "Location", 8,
+        view.view("https://example.com/acme/order/2", 32)) != field.ADD_OK) {
+        ret verdict.violated("fuzz: the Location field could not be set up");
+    }
+    var none: field.Fields;
+    protocol.no_fields(?none);
+    var outcome: u64 = 0;
+    if (!parse_one(status.CREATED, ?created, view.view(nil, 0), data, len, ?outcome) ||
+        !parse_one(status.OK, ?none, view.view("https://example.com/acme/order/1", 32),
+        data, len, ?outcome)) {
+        ret verdict.violated("order: a parse wrote a refused record or published an order outside its storage or policy");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_authorization(data: *u8, len: usize) verdict.Verdict {
+    var none: field.Fields;
+    protocol.no_fields(?none);
+    val url: view.View = view.view("https://example.com/acme/authz/1", 32);
+    verdict.fill((?authorization)::*u8, $size_of(order.Authorization), 0xa5);
+    val result: problem.Error = order.parse_authorization(
+        protocol.response(status.OK, ?none, data, len), url, policy(), limits(),
+        ?scratch[0], 262144, order.AuthorizationStorage{data: ?text[0],
+        capacity:           TEXT_BYTES, challenges: ?challenges[0],
+        challenge_capacity: order.MAX_CHALLENGES}, ?authorization);
+    if (problem.failed(result)) {
+        if (!verdict.untouched((?authorization)::*u8, $size_of(order.Authorization), 0xa5)) {
+            ret verdict.violated("authorization: a refused authorization wrote its output");
+        }
+        ret verdict.answered((result.kind::u64 << 8) | result.code::u64);
+    }
+    verdict.accept();
+    # an accepted authorization names a valid identifier, marks only a dns
+    # identifier as a wildcard, and every challenge is copied into the text
+    # storage with an https url and, for a known type, a valid token
+    if (authorization.url.data != url.data || authorization.url.len != url.len ||
+        authorization.status < order.AUTH_PENDING ||
+        authorization.status > order.AUTH_REVOKED ||
+        !in_text(authorization.identifier.value) ||
+        !identifier.valid(authorization.identifier, policy()) ||
+        (authorization.wildcard && authorization.identifier.kind != identifier.DNS) ||
+        !in_text(authorization.expires) || authorization.challenge_len == 0 ||
+        authorization.challenge_len > order.MAX_CHALLENGES ||
+        authorization.challenges != ?challenges[0]) {
+        ret verdict.violated("authorization: an accepted authorization is outside its storage or policy");
+    }
+    var kinds: u64   = 0;
+    var i:     usize = 0;
+    for (i < authorization.challenge_len) {
+        val entry: challenge.Challenge = authorization.challenges[i];
+        if (!url_in_text(entry.url) || !in_text(entry.token) ||
+            !in_text(entry.validated) ||
+            entry.status < challenge.PENDING || entry.status > challenge.INVALID ||
+            (entry.typ != 0 && !challenge.token_valid(entry.token)) ||
+            !problem_in_text(entry.failure)) {
+            ret verdict.violated("authorization: an accepted challenge is outside its storage or has an invalid token");
+        }
+        kinds = kinds | (1::u64 << entry.typ::u64);
+        i     = i + 1;
+    }
+    var shape: u64 = (1::u64 << 40) | (authorization.status::u64 << 8) |
+        (authorization.identifier.kind::u64 << 4) | authorization.wildcard::u64;
+    shape = verdict.mix(shape, kinds);
+    ret verdict.answered(verdict.mix(shape, verdict.bucket(authorization.challenge_len)));
+}
