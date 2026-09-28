@@ -377,27 +377,27 @@ fun accept_worker(arg: *u8) {
 }
 
 #[testing]
-val HOSTILE_NORMAL: u8 = 0;
+val HOSTILE_NORMAL:        u8 = 0;
 #[testing]
-val HOSTILE_OVERSIZED: u8 = 1;
+val HOSTILE_OVERSIZED:     u8 = 1;
 #[testing]
-val HOSTILE_FOREIGN: u8 = 2;
+val HOSTILE_FOREIGN:       u8 = 2;
 #[testing]
-val HOSTILE_TAKE_REQUEST: u8 = 3;
+val HOSTILE_TAKE_REQUEST:  u8 = 3;
 #[testing]
-val HOSTILE_TAKE_CLIENT: u8 = 4;
+val HOSTILE_TAKE_CLIENT:   u8 = 4;
 #[testing]
-val HOSTILE_PUT_REQUEST: u8 = 5;
+val HOSTILE_PUT_REQUEST:   u8 = 5;
 #[testing]
 val HOSTILE_CLEAR_REQUEST: u8 = 6;
 #[testing]
-val HOSTILE_PUT_FAIL: u8 = 7;
+val HOSTILE_PUT_FAIL:      u8 = 7;
 #[testing]
-val HOSTILE_COMMIT_FAIL: u8 = 8;
+val HOSTILE_COMMIT_FAIL:   u8 = 8;
 #[testing]
-val HOSTILE_RELEASE_FAIL: u8 = 9;
+val HOSTILE_RELEASE_FAIL:  u8 = 9;
 #[testing]
-val HOSTILE_REENTER: u8 = 10;
+val HOSTILE_REENTER:       u8 = 10;
 
 #[testing]
 rec HostilePool {
