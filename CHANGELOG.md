@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-27
+
+### Changed
+- **Breaking.** Dependencies: mach-std `^9.3` at v9.3.0, mach-crypto `^0.25` at v0.25.0 and mach-http `^0.25` at v0.25.0 (were `^9.0`, `^0.24` and `^0.24`). Resolution is flat, so a consumer must move to the new std, crypto and http with it. http 0.25 adds a lingering server close and breaks only `h1.connection.Config` literals, and crypto 0.25 adds public secret-tag HMAC, and mach-acme builds no `Config` literal, so nothing it uses changes. The live conformance subproject pins the three by tag, and its suite passes against pebble (#132).
+
 ## [0.12.0] - 2026-09-27
 
 ### Changed
