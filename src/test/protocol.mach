@@ -39,6 +39,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.view;
 
 # a fixed monotonic instant, nanoseconds after the clock's start
@@ -55,6 +56,25 @@ fun fixed_ok(outcome: err[A.Error]) bool {
 #[testing]
 fun fs_ok(outcome: err[fs.FsError]) bool {
     ret sel outcome.ok;
+}
+
+# a fresh path under the temp directory, unique to this run: temp_create claims
+# the name, and the file is removed so each test starts from nothing on disk
+#[testing]
+fun unique_path(output: *u8, capacity: usize, prefix: str) bool {
+    var bytes: [1024]u8;
+    var state: fixed.FixedState;
+    var heap:  A.Allocator;
+    if (!fixed_ok(fixed.make(?heap, ?state, ?bytes[0], 1024))) { ret false; }
+    val made: res[fs.TempFile, fs.FsError] = fs.temp_create(?heap, prefix);
+    if (sel made.err) { ret false; }
+    var temp:   fs.TempFile = made.ok;
+    val name:   str         = fs.temp_path(?temp);
+    val length: usize       = str_len(name);
+    val fits:   bool        = length < capacity;
+    if (fits) { copy(output, name, length + 1); }
+    val removed: err[IO.Error] = fs.temp_close_and_remove(?temp);
+    ret fits && (sel removed.ok);
 }
 
 #[testing]
@@ -3191,8 +3211,9 @@ test storage__shared_gates {
 }
 
 test storage__persistent_restart_and_torn_state {
-    val path: *u8 = "/tmp/mach-acme-storage-conformance.bin";
-    fs.remove_file(path);
+    var path_bytes: [512]u8;
+    if (!unique_path(?path_bytes[0], 512, "mach-acme-storage")) { ret 99; }
+    val path:        *u8 = ?path_bytes[0];
     var old_secret:  [32]^u8;
     var old_public:  [65]u8;
     var old_key:     jose.PublicKey;
@@ -4659,8 +4680,15 @@ fun read_raw(path: *u8, buffer: *u8, capacity: usize, len: *usize) bool {
 }
 
 test file_store__document_format {
-    val path: *u8 = "/tmp/mach-acme-document.bin";
-    fs.remove_file(path);
+    var path_bytes:   [512]u8;
+    var locked_bytes: [512]u8;
+    var backup_bytes: [512]u8;
+    if (!unique_path(?path_bytes[0], 512, "mach-acme-document")
+        || !unique_path(?locked_bytes[0], 512, "mach-acme-preserve")
+        || !unique_path(?backup_bytes[0], 512, "mach-acme-backup")) { ret 99; }
+    val path:     *u8 = ?path_bytes[0];
+    val locked:   *u8 = ?locked_bytes[0];
+    val backup:   *u8 = ?backup_bytes[0];
     var scratch:  [16384]u8;
     var buffer:   [8192]u8;
     val payload:  *u8 = "durable acme state";
@@ -4726,8 +4754,6 @@ test file_store__document_format {
     # temporary-path storage, so the write fails before the destination is
     # touched, which is the path a full disk would also take.
     if (!fs_ok(fs.write_bytes(path, ?raw[0], raw_len, 384))) { ret 15; }
-    val locked: *u8 = "/tmp/mach-acme-preserve.bin";
-    fs.remove_file(locked);
     if (problem.failed(file_store.write_document(locked,
         file_store.DOC_ORDER, view.view(payload, 18), ?scratch[0],
         16384))) { ret 16; }
@@ -4742,8 +4768,6 @@ test file_store__document_format {
         !equal(document.payload.data, payload, 18)) { ret 18; }
 
     # backup and restore round trip through a fully validated document
-    val backup: *u8 = "/tmp/mach-acme-document-backup.bin";
-    fs.remove_file(backup);
     if (problem.failed(file_store.copy_document(locked, backup,
         file_store.DOC_ORDER, ?buffer[0], 8192, ?scratch[0], 16384))) {
         ret 22;
@@ -4794,14 +4818,16 @@ fun store_credentials(key: jose.PublicKey, owner: ptr,
 }
 
 test file_store__restart_and_interrupted_write {
-    val account_path:     *u8 = "/tmp/mach-acme-fs-account.bin";
-    val certificate_path: *u8 = "/tmp/mach-acme-fs-cert.bin";
-    fs.remove_file(account_path);
-    fs.remove_file(certificate_path);
-    var public_bytes:  [65]u8;
-    var private_bytes: [32]^u8;
-    var public_key:    jose.PublicKey;
-    var private_key:   jose.PrivateKey;
+    var account_bytes:     [512]u8;
+    var certificate_bytes: [512]u8;
+    if (!unique_path(?account_bytes[0], 512, "mach-acme-fs-account")
+        || !unique_path(?certificate_bytes[0], 512, "mach-acme-fs-cert")) { ret 99; }
+    val account_path:     *u8 = ?account_bytes[0];
+    val certificate_path: *u8 = ?certificate_bytes[0];
+    var public_bytes:     [65]u8;
+    var private_bytes:    [32]^u8;
+    var public_key:       jose.PublicKey;
+    var private_key:      jose.PrivateKey;
     if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
         ?public_bytes[0])) { ret 1; }
 
@@ -4985,14 +5011,16 @@ fun store_race_worker(arg: *u8) {
 }
 
 test file_store__concurrent_writers {
-    val account_path:     *u8 = "/tmp/mach-acme-fs-race-account.bin";
-    val certificate_path: *u8 = "/tmp/mach-acme-fs-race-cert.bin";
-    fs.remove_file(account_path);
-    fs.remove_file(certificate_path);
-    var public_bytes:  [65]u8;
-    var private_bytes: [32]^u8;
-    var public_key:    jose.PublicKey;
-    var private_key:   jose.PrivateKey;
+    var account_bytes:     [512]u8;
+    var certificate_bytes: [512]u8;
+    if (!unique_path(?account_bytes[0], 512, "mach-acme-fs-race-account")
+        || !unique_path(?certificate_bytes[0], 512, "mach-acme-fs-race-cert")) { ret 99; }
+    val account_path:     *u8 = ?account_bytes[0];
+    val certificate_path: *u8 = ?certificate_bytes[0];
+    var public_bytes:     [65]u8;
+    var private_bytes:    [32]^u8;
+    var public_key:       jose.PublicKey;
+    var private_key:      jose.PrivateKey;
     if (!es_keys(?public_key, ?private_key, ?private_bytes[0],
         ?public_bytes[0])) { ret 1; }
     var store: file_store.Store;
