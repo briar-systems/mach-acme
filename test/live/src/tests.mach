@@ -43,13 +43,13 @@ use std.types.string.str;
 use std.types.view;
 
 #[testing]
-val ACME_PORT: u16 = 14001;
+val ACME_PORT:      u16   = 14001;
 #[testing]
-val MANAGE_PORT: u16 = 8055;
+val MANAGE_PORT:    u16   = 8055;
 #[testing]
 val MAX_BODY_BYTES: usize = 65536;
 #[testing]
-val MAX_FIELDS: usize = 64;
+val MAX_FIELDS:     usize = 64;
 
 #[testing]
 fun length(text: *u8) usize {

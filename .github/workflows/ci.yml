@@ -27,7 +27,8 @@ jobs:
     uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
     with:
       heavy: ${{ inputs.heavy }}
-      mach-version: v6.0.0
+      # http 0.25.1 requires mach 6.5
+      mach-version: v6.5.0
       # mach tests one artifact's closure, and src/test/protocol.mach is reached only by the tests artifact
       test-selections: '[["--lib", "tests"]]'
       # crypto 0.17+ links a secret multiply, so the aarch64 tests need FEAT_DIT
@@ -49,7 +50,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: briar-systems/.github/.github/actions/seed-mach@main
         with:
-          tag: v6.0.0
+          tag: v6.5.0
       - name: build the lane
         run: |
           mach dep pull test/fuzz
