@@ -1,0 +1,38 @@
+# the renewal information an authority suggests for a certificate
+
+use acme.client;
+use acme.problem;
+use acme.renewal_info;
+use http.core.field;
+use http.core.status;
+use std.types.size.usize;
+
+use fuzz.protocol;
+use fuzz.verdict;
+
+var scratch: [262144]u8;
+var window:  renewal_info.Window;
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    var none: field.Fields;
+    protocol.no_fields(?none);
+    verdict.fill((?window)::*u8, $size_of(renewal_info.Window), 0xa5);
+    val result: problem.Error = renewal_info.parse(
+        protocol.response(status.OK, ?none, data, len), client.limits_default(),
+        ?scratch[0], 262144, ?window);
+    if (problem.failed(result)) {
+        if (!verdict.untouched((?window)::*u8, $size_of(renewal_info.Window), 0xa5)) {
+            ret verdict.violated("renewal-info: a refused window wrote its output");
+        }
+        ret verdict.answered((result.kind::u64 << 8) | result.code::u64);
+    }
+    verdict.accept();
+    # an accepted window is present, ordered, and carries only the advice the
+    # response did
+    if (!renewal_info.window_valid(window) || window.retry_after_seconds != 0) {
+        ret verdict.violated("renewal-info: an accepted window is absent or inverted");
+    }
+    var shape: u64 = 1::u64 << 40;
+    if (window.end_unix - window.start_unix > 86400) { shape = shape | 1; }
+    ret verdict.answered(shape);
+}

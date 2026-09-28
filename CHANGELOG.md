@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-28
+
+### Added
+- A fuzz lane in `test/fuzz`, on the same driver as mach-tls's, with boundaries over every parser of server input: `json`, `url`, `directory`, `problem`, `replay-nonce`, `account`, `order`, `authorization`, `chain`, `certificate`, `alternates` and `renewal-info`, and a checked-in corpus. `mach build test/fuzz` runs on every pull request and the replay runs on the heavy tier. It found nothing, so the library is unchanged (#115).
+
+### Changed
+- **Breaking.** Dependencies: mach-std `^9.4` at v9.4.1, mach-crypto `^0.26` at v0.26.0 and mach-http `^0.25` at v0.25.1 (were `^9.3`, `^0.25` and v0.25.0). Resolution is flat, so a consumer must move to the new std and crypto with it. std 9.4.1 maps a guard page below every linux thread stack, crypto 0.26 lets the system allocators own the only secret wipe and zeroing, and http 0.25.1 is fixes only. The fuzz and live subprojects pin the three by tag.
+- **Breaking.** Requires mach 6.5 (`mach = "^6.5"`), since http 0.25.1 does, and CI seeds mach v6.5.0. The 6.5 formatter is applied.
+
+### Fixed
+- The storage conformance and file-store tests claim a unique temp path per run, so parallel runs no longer race on fixed `/tmp` paths (#117).
+
 ## [0.13.0] - 2026-09-27
 
 ### Changed

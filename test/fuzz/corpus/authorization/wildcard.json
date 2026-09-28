@@ -1,0 +1,1 @@
+{"status":"pending","wildcard":true,"expires":"2026-01-01T00:00:00Z","identifier":{"type":"dns","value":"a.example"},"challenges":[{"type":"dns-01","url":"https://example.com/chall/1","token":"tok-1","status":"pending"}]}

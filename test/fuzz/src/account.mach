@@ -1,0 +1,102 @@
+# an account resource, as a creation, a contact update and a deactivation
+# read it
+
+use acme.account;
+use acme.client;
+use acme.problem;
+use http.core.field;
+use http.core.status;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.protocol;
+use fuzz.verdict;
+
+val TEXT_BYTES: usize = 65536;
+
+var scratch:  [262144]u8;
+var text:     [TEXT_BYTES]u8;
+var contacts: [account.MAX_CONTACTS]view.View;
+var result:   account.Account;
+var items:    [1]field.Field;
+
+fun limits() account.Limits {
+    ret account.Limits{max_response_bytes: 65536, max_json_scratch: 262144,
+        max_json_depth:           16, max_json_values: 4096, max_json_key_bytes: 128,
+        max_json_key_comparisons: 65536, max_url_bytes: 4096,
+        max_contacts:             account.MAX_CONTACTS,
+        max_contact_bytes:        account.MAX_CONTACT_BYTES,
+        response_fields:          field.limits(128, 65536, 256, 8192)};
+}
+
+fun contact_shaped(value: view.View) bool {
+    if (value.len < 3 || !verdict.view_inside(value, ?text[0], TEXT_BYTES)) { ret false; }
+    var i: usize = 1;
+    for (i < value.len) {
+        if (value.data[i] == ':') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun parse_one(action: account.Action, code: status.Status, headers: *field.Fields,
+    account_url: view.View, data: *u8, len: usize, outcome: *u64) bool {
+    verdict.fill((?result)::*u8, $size_of(account.Account), 0xa5);
+    val parsed: problem.Error = account.parse(action,
+        protocol.response(code, headers, data, len), account_url, limits(),
+        ?scratch[0], 262144, account.Storage{data: ?text[0], capacity: TEXT_BYTES,
+        contacts: ?contacts[0], contact_capacity: account.MAX_CONTACTS}, ?result);
+    if (problem.failed(parsed)) {
+        @outcome = verdict.mix(@outcome, (parsed.kind::u64 << 8) | parsed.code::u64);
+        # a refused response leaves the caller's record as it was
+        ret verdict.untouched((?result)::*u8, $size_of(account.Account), 0xa5);
+    }
+    verdict.accept();
+    # an accepted account names a status the action admits, an https orders
+    # url and account url, and contacts copied into the text storage
+    if ((action == account.DEACTIVATE && result.status != account.DEACTIVATED) ||
+        (action != account.DEACTIVATE && result.status != account.VALID) ||
+        !client.url_valid(result.url, 4096) ||
+        !client.url_valid(result.orders_url, 4096) ||
+        !verdict.view_inside(result.orders_url, ?text[0], TEXT_BYTES) ||
+        (action == account.CREATE &&
+        !verdict.view_inside(result.url, ?text[0], TEXT_BYTES)) ||
+        (action != account.CREATE && (result.url.data != account_url.data ||
+        result.url.len != account_url.len)) ||
+        result.contact_len > account.MAX_CONTACTS ||
+        (result.contact_len != 0 && result.contacts != ?contacts[0])) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < result.contact_len) {
+        if (!contact_shaped(result.contacts[i])) { ret false; }
+        i = i + 1;
+    }
+    @outcome = verdict.mix(@outcome, (1::u64 << 40) | (result.status::u64 << 8) |
+        (result.terms_of_service_agreed::u64 << 4) | verdict.bucket(result.contact_len));
+    ret true;
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    var created: field.Fields;
+    if (protocol.one_field(?created, ?items[0], "Location", 8,
+        view.view("https://example.com/acme/acct/2", 31)) != field.ADD_OK) {
+        ret verdict.violated("fuzz: the Location field could not be set up");
+    }
+    var none: field.Fields;
+    protocol.no_fields(?none);
+    val known:   view.View = view.view("https://example.com/acme/acct/1", 31);
+    var outcome: u64       = 0;
+    if (!parse_one(account.CREATE, status.CREATED, ?created, view.view(nil, 0),
+        data, len, ?outcome) ||
+        !parse_one(account.UPDATE_CONTACT, status.OK, ?none, known, data, len,
+        ?outcome) ||
+        !parse_one(account.DEACTIVATE, status.OK, ?none, known, data, len,
+        ?outcome)) {
+        ret verdict.violated("account: a parse wrote a refused record or published an account its action does not admit");
+    }
+    ret verdict.answered(outcome);
+}

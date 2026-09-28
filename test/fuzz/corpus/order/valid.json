@@ -1,0 +1,1 @@
+{"status":"valid","identifiers":[{"type":"dns","value":"a.example"}],"authorizations":["https://example.com/authz/1"],"finalize":"https://example.com/finalize/1","certificate":"https://example.com/cert/1"}

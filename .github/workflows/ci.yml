@@ -14,7 +14,7 @@ on:
         description: heavy work to run on this ref
         type: choice
         default: none
-        options: [none, all, aarch64-linux, x86_64-windows, aarch64-darwin, x86_64-darwin]
+        options: [none, all, aarch64-linux, x86_64-windows, aarch64-darwin, x86_64-darwin, fuzz]
 
 permissions:
   contents: read
@@ -27,19 +27,44 @@ jobs:
     uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
     with:
       heavy: ${{ inputs.heavy }}
-      mach-version: v6.0.0
+      # http 0.25.1 requires mach 6.5
+      mach-version: v6.5.0
       # mach tests one artifact's closure, and src/test/protocol.mach is reached only by the tests artifact
       test-selections: '[["--lib", "tests"]]'
       # crypto 0.17+ links a secret multiply, so the aarch64 tests need FEAT_DIT
       dit: required
+      # the fuzz lane is built so it cannot rot, and replayed by the fuzz job
       subprojects: >-
-        [{"path": "test/live", "clean-dep": true, "legs": ["x86_64-linux"]}]
+        [{"path": "test/live", "clean-dep": true, "legs": ["x86_64-linux"]},
+         {"path": "test/fuzz", "build": true, "test": false, "legs": ["x86_64-linux"]}]
       evidence: |
         .tools/run/*.log
 
+  # the fuzz lane's deterministic replay: every retained input in
+  # test/fuzz/corpus answered by its boundary's harness, on the heavy tier
+  fuzz:
+    if: github.base_ref == 'main' || inputs.heavy == 'all' || inputs.heavy == 'fuzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: briar-systems/.github/.github/actions/seed-mach@main
+        with:
+          tag: v6.5.0
+      - name: build the lane
+        run: |
+          mach dep pull test/fuzz
+          mach build test/fuzz --profile debug
+          mach build test/fuzz --profile release
+      # both profiles, because optimisation has changed observable behaviour before
+      - name: replay the corpus
+        run: |
+          timeout 10m test/fuzz/out/linux-x86_64/debug/bin/fuzz replay
+          timeout 10m test/fuzz/out/linux-x86_64/release/bin/fuzz replay
+
   gate:
     if: always()
-    needs: [lib]
+    needs: [lib, fuzz]
     runs-on: ubuntu-latest
     steps:
       - uses: briar-systems/.github/.github/actions/gate@main

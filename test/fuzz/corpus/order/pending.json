@@ -1,0 +1,1 @@
+{"status":"pending","expires":"2026-01-01T00:00:00Z","identifiers":[{"type":"dns","value":"*.a.example"},{"type":"ip","value":"192.0.2.7"}],"authorizations":["https://example.com/authz/1","https://example.com/authz/2"],"finalize":"https://example.com/finalize/1"}

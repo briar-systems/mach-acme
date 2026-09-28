@@ -1,0 +1,1 @@
+<https://example.com/cert/alt/3>; rel=alternate
