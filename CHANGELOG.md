@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-30
+
+### Fixed
+- Builds on mach 6.8. The all-ones and near-all-ones addresses in the memory-range, nonce and protocol tests are cast to a pointer through `usize`, where mach 6.8 refuses an unsuffixed literal past `i64` with `const.out_of_range`. What the tests check is unchanged.
+
 ## [0.14.0] - 2026-09-28
 
 ### Added

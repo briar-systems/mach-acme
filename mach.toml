@@ -1,12 +1,11 @@
 [project]
 id = "acme"
 mach = "^6.5"
-version = "0.14.0"
+version = "0.14.1"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-default = true
 isa = "x86_64"
 os = "linux"
 abi = "sysv64"
@@ -51,7 +50,7 @@ simd = "scalarize"
 vectorize = true
 float_reassoc = false
 
-# the library, and the only artifact `mach build .` and `--all-targets` select
+# the library, and the only artifact `mach build .` selects
 [artifact.acme]
 kind = "static"
 default = true
@@ -61,7 +60,7 @@ targets = ["*"]
 link = []
 need = []
 
-# test-only: reaches the modules whose tests the library does not, for `mach test . --lib tests`
+# test-only: reaches the modules whose tests the library does not, for `mach test . -a tests`
 [artifact.tests]
 kind = "static"
 entry = "lib/tests.mach"

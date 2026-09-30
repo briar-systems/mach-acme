@@ -32,7 +32,7 @@ pub fun size(count: usize, item_size: usize, output: *usize) bool {
 
 test overlap__address_space_boundary {
     val low:  *u8 = 1::*u8;
-    val high: *u8 = 0xffffffffffffffff::*u8;
+    val high: *u8 = 0xffffffffffffffff::usize::*u8;
     if (!valid(low, 0xffffffffffffffff) || !valid(high, 1)) { ret 1; }
     if (!overlap(low, 0xffffffffffffffff, high, 1) ||
         !overlap(high, 1, low, 0xffffffffffffffff)) { ret 2; }
@@ -40,7 +40,7 @@ test overlap__address_space_boundary {
     if (!overlap(high, 2, low, 1)) { ret 4; }
     var result: usize = 0;
     if (!size(3, 7, ?result) || result != 21 ||
-        size(1, 1, 0xffffffffffffffff::*usize) ||
+        size(1, 1, 0xffffffffffffffff::usize::*usize) ||
         size(0xffffffffffffffff, 2, ?result) || result != 21) { ret 5; }
     ret 0;
 }
