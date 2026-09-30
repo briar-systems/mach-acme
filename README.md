@@ -110,13 +110,10 @@ committed as a gitlink under `dep/`, and builds with mach 6.0.0 or later:
 Build output uses Mach's repository-local `out/` path. `mach test` runs the
 tests of one artifact's closure. The library artifact, `acme`, is the default.
 The protocol vectors in `src/test` are reached only by the test-only `tests`
-artifact, so run both selections:
+artifact, which `--all` selects along with the library:
 
 ```text
-mach test . --profile debug
-mach test . --lib tests --profile debug
-mach test . --profile release
-mach test . --lib tests --profile release
+mach test . --all
 ```
 
 `test/selections/verify.sh` fails when a test declared under `src` is collected
