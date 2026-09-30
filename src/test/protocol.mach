@@ -35,7 +35,6 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
-use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -685,7 +684,7 @@ test jose__hostile_aliases_and_overflow {
     if (signing_alias.error.code != problem.INVALID_INPUT ||
         !filled(?message[0], 0x72, 64)) { ret 6; }
 
-    val near_end: *u8 = 0xfffffffffffffff0::*u8;
+    val near_end: *u8 = 0xfffffffffffffff0::usize::*u8;
     fill(?output[0], 0xa5, 512);
     val overflowing: jose.Operation = jose.key_sign(private_key,
         jose.no_entropy(), contracts.Bytes{data: near_end, len: 32},
@@ -1109,7 +1108,7 @@ test client__state_and_parser_aliases {
         !filled(?response_storage[0], 'v', 512) ||
         directory.new_nonce_url.len != 8) { ret 4; }
 
-    val near_end: *u8           = 0xfffffffffffffff0::*u8;
+    val near_end: *u8           = 0xfffffffffffffff0::usize::*u8;
     val overflow: problem.Error = client.parse_directory(
         response(status.OK, ?fields, view.view(body, length(body))), configured,
         near_end, 32, client.DirectoryStorage{data: ?response_storage[0],

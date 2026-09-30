@@ -657,7 +657,7 @@ test init_memory__ranges_and_aliases {
         problem.INVALID_INPUT || memory.initialized ||
         init_memory(?memory, ?slots[0], 1, (?slots[0])::*u8, 16, 16).code !=
         problem.INVALID_INPUT || memory.initialized) { ret 1; }
-    val near_end: *u8 = 0xfffffffffffffff0::*u8;
+    val near_end: *u8 = 0xfffffffffffffff0::usize::*u8;
     if (init_memory(?memory, near_end::*Slot, 2, ?storage[0], 32, 16).code !=
         problem.INVALID_INPUT) { ret 2; }
     if (problem.failed(init_memory(?memory, ?slots[0], 2,
