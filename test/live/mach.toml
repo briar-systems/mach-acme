@@ -1,35 +1,30 @@
 [project]
-id = "acme-live-test"
-mach = "^6.5"
+id = "acme_live"
+mach = "^7"
 version = "0.0.0"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-default = true
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [profile.release]
-opt = 2
+optimize = true
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.acme-live-test]
 kind = "static"
 entry = "tests.mach"
-out = "lib/acme-live-test"
+out = "{project.work}/lib/acme-live-test{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
@@ -37,16 +32,20 @@ need = []
 [dep.acme]
 path = "../.."
 
-# std, crypto and http are pinned here because a path dependency carries no
-# pin for a dependency it selects by version, and this tree is not committed
+# std, crypto, json and http are pinned here because a path dependency carries no
+# pin for a dependency it selects by ref, and this tree is not committed
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v9.4.1"
+ref = "branch/dev"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.26.0"
+ref = "branch/dev"
+
+[dep.json]
+git = "https://github.com/briar-systems/mach-json"
+ref = "branch/dev"
 
 [dep.http]
 git = "https://github.com/briar-systems/mach-http"
-ref = "tag/v0.25.1"
+ref = "branch/dev"

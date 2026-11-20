@@ -12,7 +12,9 @@ use acme.problem;
 use crypto.contracts;
 use http.core.field;
 use http.core.status;
-use J: std.data.json;
+use JD: json.decode;
+use JE: json.error;
+use JV: json.value;
 use std.encoding.base64;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -218,9 +220,9 @@ fun parse_timestamp(value: view.View, output: *u64) bool {
     ret true;
 }
 
-fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
-    if (value == nil || value.kind != J.STRING || output == nil) { ret false; }
-    val result: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+fun decoded_len(value: *JV.Value, maximum: usize, output: *usize) bool {
+    if (value == nil || value.kind != JV.STRING || output == nil) { ret false; }
+    val result: res[usize, JE.JsonError] = JD.value_string_decode(value, nil, 0);
     if (sel result.err) { ret false; }
     val len: usize = result.ok;
     if (len > maximum) { ret false; }
@@ -228,11 +230,11 @@ fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
     ret true;
 }
 
-fun decode_timestamp(value: *J.Value, output: *u64) bool {
+fun decode_timestamp(value: *JV.Value, output: *u64) bool {
     var len: usize = 0;
     if (!decoded_len(value, MAX_TIME_BYTES, ?len)) { ret false; }
     var decoded: [64]u8;
-    val result:  res[usize, J.JsonError] = J.value_string_decode(value,
+    val result:  res[usize, JE.JsonError] = JD.value_string_decode(value,
         ?decoded[0], 64);
     if (sel result.err) { ret false; }
     ret parse_timestamp(view.view(?decoded[0], len), output);
@@ -271,13 +273,13 @@ pub fun parse(response: client.Response, configured: client.Limits,
         max_key_bytes:       configured.max_json_key_bytes,
         max_key_comparisons: configured.max_json_key_comparisons});
     if (!document.valid) { ret document.error; }
-    var root: J.Value = document.root;
-    if (root.kind != J.OBJECT) {
+    var root: JV.Value = document.root;
+    if (root.kind != JV.OBJECT) {
         ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
             "renewal information is not an object");
     }
-    val suggested: *J.Value = json.find(?root, "suggestedWindow");
-    if (suggested == nil || suggested.kind != J.OBJECT) {
+    val suggested: *JV.Value = json.find(?root, "suggestedWindow");
+    if (suggested == nil || suggested.kind != JV.OBJECT) {
         ret problem.local_code(problem.PROTOCOL, problem.MALFORMED_JSON,
             "renewal information has no suggested window");
     }

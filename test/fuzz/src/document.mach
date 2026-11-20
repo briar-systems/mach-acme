@@ -4,7 +4,7 @@
 use acme.client;
 use acme.json;
 use acme.problem;
-use J: std.data.json;
+use JV: json.value;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -26,15 +26,15 @@ fun limits() json.Limits {
 }
 
 # walks the accepted tree, bounded by the limits it was accepted under
-fun walk(value: *J.Value, depth: usize, count: *usize, kinds: *u64) bool {
+fun walk(value: *JV.Value, depth: usize, count: *usize, kinds: *u64) bool {
     if (value == nil || depth > MAX_DEPTH || @count >= MAX_VALUES) { ret false; }
     @count = @count + 1;
     @kinds = @kinds | (1::u64 << value.kind::u64);
-    if (value.kind != J.ARRAY && value.kind != J.OBJECT) { ret true; }
-    val n: usize = J.value_count(value);
+    if (value.kind != JV.ARRAY && value.kind != JV.OBJECT) { ret true; }
+    val n: usize = JV.value_count(value);
     var i: usize = 0;
     for (i < n) {
-        val child: opt[*J.Value] = J.value_get(value, i);
+        val child: opt[*JV.Value] = JV.value_get(value, i);
         if (sel child.none)                             { ret false; }
         if (!walk(child.some, depth + 1, count, kinds)) { ret false; }
         i = i + 1;
@@ -52,9 +52,9 @@ pub fun answer(data: *u8, len: usize) verdict.Verdict {
         ret verdict.answered((document.error.kind::u64 << 8) | document.error.code::u64);
     }
     verdict.accept();
-    var root:  J.Value = document.root;
-    var count: usize   = 0;
-    var kinds: u64     = 0;
+    var root:  JV.Value = document.root;
+    var count: usize    = 0;
+    var kinds: u64      = 0;
     # an accepted tree holds no more values and no deeper nesting than its limits
     if (!walk(?root, 1, ?count, ?kinds)) {
         ret verdict.violated("json: an accepted tree breaks the depth or value limit it was held to");

@@ -8,8 +8,10 @@ use acme.poll;
 use acme.problem;
 use crypto.contracts;
 use crypto.hash;
+use JD: json.decode;
+use JE: json.error;
+use JV: json.value;
 use std.chrono.time;
-use J: std.data.json;
 use std.encoding.base64;
 use std.sync.atomic;
 use std.system.os;
@@ -90,14 +92,14 @@ pub fun kind_from_name(value: view.View) u8 {
     ret 0;
 }
 
-fun value_equals(value: *J.Value, expected: *u8) bool {
-    if (value == nil || value.kind != J.STRING) { ret false; }
+fun value_equals(value: *JV.Value, expected: *u8) bool {
+    if (value == nil || value.kind != JV.STRING) { ret false; }
     var decoded:  [32]u8;
-    val measured: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+    val measured: res[usize, JE.JsonError] = JD.value_string_decode(value, nil, 0);
     if (sel measured.err) { ret false; }
     val len: usize = measured.ok;
     if (len > 31) { ret false; }
-    val result: res[usize, J.JsonError] = J.value_string_decode(value,
+    val result: res[usize, JE.JsonError] = JD.value_string_decode(value,
         ?decoded[0], 32);
     if (sel result.err) { ret false; }
     var i: usize = 0;
@@ -108,7 +110,7 @@ fun value_equals(value: *J.Value, expected: *u8) bool {
     ret expected[len] == 0;
 }
 
-pub fun status_from(value: *J.Value) u8 {
+pub fun status_from(value: *JV.Value) u8 {
     if (value_equals(value, "pending"))    { ret PENDING; }
     if (value_equals(value, "processing")) { ret PROCESSING; }
     if (value_equals(value, "valid"))      { ret VALID; }
@@ -195,10 +197,10 @@ fun sha256(data: *u8, len: usize, digest: *u8) bool {
     if (!memory_range.valid(data, len) ||
         !memory_range.valid(digest, DIGEST_BYTES)) { ret false; }
     var context: hash.Sha256 = hash.empty_sha256();
-    if (hash.init_sha256(?context) != contracts.OK ||
+    if (hash.sha256_init(?context) != contracts.OK ||
         hash.update_sha256(?context,
         contracts.Bytes{data: data, len: len}) != contracts.OK) {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
         ret false;
     }
     val result: contracts.Operation = hash.final_sha256(?context,

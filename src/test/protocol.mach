@@ -21,10 +21,10 @@ use crypto.signature;
 use http.core.field;
 use http.core.method;
 use http.core.status;
-use A: std.allocator;
+use JV: json.value;
+use A:  std.allocator;
 use std.allocator.fixed;
 use std.chrono.time;
-use J: std.data.json;
 use std.encoding.base64;
 use fs: std.filesystem;
 use IO: std.io.error;
@@ -731,8 +731,8 @@ test json__numeric_grammar_and_duplicate_work {
     val valid_text: *u8           = "{\"n\":9223372036854775807,\"f\":1.5e+2}";
     val valid:      json.Document = json.parse(view.view(valid_text,
         length(valid_text)), ?scratch[0], 8192, configured);
-    var root:   J.Value  = valid.root;
-    val number: *J.Value = json.find(?root, "n");
+    var root:   JV.Value  = valid.root;
+    val number: *JV.Value = json.find(?root, "n");
     if (!valid.valid || number == nil || json.find(nil, "n") != nil ||
         json.find(number, "n") != nil || json.find(?root, nil) != nil) { ret 2; }
 

@@ -139,10 +139,10 @@ fun digest(value: view.View, output: *u8) bool {
     if (!memory_range.valid(value.data, value.len) ||
         !memory_range.valid(output, 32)) { ret false; }
     var context: hash.Sha256 = hash.empty_sha256();
-    if (hash.init_sha256(?context) != contracts.OK ||
+    if (hash.sha256_init(?context) != contracts.OK ||
         hash.update_sha256(?context, contracts.Bytes{data: value.data,
         len: value.len}) != contracts.OK) {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
         ret false;
     }
     val result: contracts.Operation = hash.final_sha256(?context,

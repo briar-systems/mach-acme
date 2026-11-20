@@ -357,13 +357,13 @@ fun sha256_bytes(data: *u8, len: usize, output: *u8) bool {
     if (!memory_range.valid(data, len) || output == nil ||
         !memory_range.valid(output, 32)) { ret false; }
     var context: hash.Sha256     = hash.empty_sha256();
-    var status:  contracts.Error = hash.init_sha256(?context);
+    var status:  contracts.Error = hash.sha256_init(?context);
     if (status == contracts.OK) {
         status = hash.update_sha256(?context,
             contracts.Bytes{data: data, len: len});
     }
     if (status != contracts.OK) {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
         ret false;
     }
     val result: contracts.Operation = hash.final_sha256(?context,
@@ -524,7 +524,7 @@ pub fun key_thumbprint(key: PublicKey, output: contracts.Buffer) Operation {
     if (problem.failed(encoded.error)) { ret encoded; }
     var context: hash.Sha256     = hash.empty_sha256();
     var digest:  [32]u8;
-    var status:  contracts.Error = hash.init_sha256(?context);
+    var status:  contracts.Error = hash.sha256_init(?context);
     if (status == contracts.OK) {
         status = hash.update_sha256(?context,
             contracts.Bytes{data: ?jwk[0], len: encoded.written});
@@ -536,7 +536,7 @@ pub fun key_thumbprint(key: PublicKey, output: contracts.Buffer) Operation {
         status = hashed.error;
     }
     or {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
     }
     if (status != contracts.OK) {
         ret Operation{error: crypto_error(status), written: 0};
