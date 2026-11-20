@@ -100,17 +100,19 @@ buffer requirements.
 
 ## Dependencies
 
-The manifest selects releases by version range, with the resolved release
-committed as a gitlink under `dep/`, and builds with mach 6.0.0 or later:
+The project builds with mach 7. Each dependency is pinned by the gitlink
+committed under `dep/`, and follows its `dev` branch until its mach 7 release:
 
-- `mach-std` `^9.0` (v9.0.0)
-- `mach-http` `^0.24` (v0.24.0)
-- `mach-crypto` `^0.24` (v0.24.0)
+- `mach-std`
+- `mach-http`
+- `mach-crypto`
+- `mach-json`, the JSON reader that left std as its own package
 
 Build output uses Mach's repository-local `out/` path. `mach test` runs the
 tests of one artifact's closure. The library artifact, `acme`, is the default.
 The protocol vectors in `src/test` are reached only by the test-only `tests`
-artifact, which `--all` selects along with the library:
+artifact, which `--all` selects along with the library. `--all` also selects
+every declared target and profile, building the targets this host cannot run:
 
 ```text
 mach test . --all
@@ -332,18 +334,9 @@ selected before its delay elapses.
 
 ## Record literals
 
-A record literal leaves every field it does not name holding the previous stack
-frame's contents rather than zero, which covers `T{}` as well as any partial
-form (briar-systems/mach#3108). Clearing a record that holds callbacks or
-pointers with a literal therefore does not clear it.
-
-Name every field of every literal. A record containing an array cannot satisfy
-that, because an array field cannot be named in a literal at all, so those are
-built by declaring `var value: T;` — which does zero the whole record including
-its arrays — and assigning each field. `nonce.no_pool` and `client.no_limits`
-return a value cleared by declaration, and `client.release` copies from them
-rather than assigning a literal.
-
-Nothing enforces this automatically. Enumerating the violations was a
-workaround for briar-systems/mach#3108, and that defect is being fixed in the
-compiler, so the constructors above are what keep the rule.
+A record literal zeroes every field it does not name, and `T{}` is all zero
+(mach 7, `doc/language/rec.md`). Before mach 7 an omitted field could hold the
+previous stack frame's contents (briar-systems/mach#3108), which is why
+`nonce.no_pool` and `client.no_limits` return a value cleared by declaration and
+`client.release` copies from them. Under mach 7 a literal clears a record that
+holds callbacks or pointers just as well.
