@@ -32,8 +32,8 @@ need = []
 [dep.acme]
 path = "../.."
 
-# std, crypto, json and http are pinned here because a path dependency carries no
-# pin for a dependency it selects by ref, and this tree is not committed
+# std, crypto, json, http and encoding are pinned here because a path dependency
+# carries no pin for a dependency it selects by ref, and this tree is not committed
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
 ref = "branch/dev"
@@ -48,4 +48,8 @@ ref = "branch/dev"
 
 [dep.http]
 git = "https://github.com/briar-systems/mach-http"
+ref = "branch/dev"
+
+[dep.encoding]
+git = "https://github.com/briar-systems/mach-encoding"
 ref = "branch/dev"
