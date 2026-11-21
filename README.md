@@ -107,6 +107,7 @@ committed under `dep/`, and follows its `dev` branch until its mach 7 release:
 - `mach-http`
 - `mach-crypto`
 - `mach-json`, the JSON reader that left std as its own package
+- `mach-encoding`, the base64 codec that left std as its own package
 
 Build output uses Mach's repository-local `out/` path. `mach test` runs the
 tests of one artifact's closure. The library artifact, `acme`, is the default.
