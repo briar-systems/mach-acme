@@ -435,7 +435,7 @@ fun attempt_ready[C](attempt: *Attempt[C]) bool {
 fun enter[C](attempt: *Attempt[C]) bool {
     val owner: i64 = os.thread_current_id();
     if (owner <= 0) { ret false; }
-    for (true) {
+    for {
         var expected: i64 = atomic.load(?attempt.callback_owner);
         if (expected == owner) { ret false; }
         if (expected == 0 &&

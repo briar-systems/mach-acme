@@ -355,7 +355,7 @@ fun callback_begin(client: *Client) bool {
     if (client == nil) { ret false; }
     val owner: i64 = os.thread_current_id();
     if (owner <= 0) { ret false; }
-    for (true) {
+    for {
         var expected: i64 = atomic.load(?client.callback_owner);
         if (expected == owner) { ret false; }
         if (expected == 0 && atomic.cas(?client.callback_owner,
