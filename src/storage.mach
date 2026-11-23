@@ -256,7 +256,7 @@ pub fun credentials_digest(value: account.Credentials, output: *u8) bool {
     if (!account.credentials_valid(value) ||
         !memory_range.valid(output, 32)) { ret false; }
     var context: hash.Sha256 = hash.empty_sha256();
-    if (hash.init_sha256(?context) != contracts.OK) { ret false; }
+    if (hash.sha256_init(?context) != contracts.OK) { ret false; }
     var generation:     u64   = value.generation;
     var algorithm:      u8    = value.signer.algorithm;
     var account_status: u8    = value.account.status;
@@ -282,7 +282,7 @@ pub fun credentials_digest(value: account.Credentials, output: *u8) bool {
         !digest_update(?context, (?max_jwk)::*u8, $size_of(usize)) ||
         !digest_update(?context, (?max_thumb)::*u8, $size_of(usize)) ||
         !digest_update(?context, (?max_signature)::*u8, $size_of(usize))) {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
         ret false;
     }
     var i: usize = 0;
@@ -291,7 +291,7 @@ pub fun credentials_digest(value: account.Credentials, output: *u8) bool {
         if (!digest_update(?context, value.account.contacts[i].data,
             value.account.contacts[i].len) ||
             !digest_update(?context, (?item_len)::*u8, $size_of(usize))) {
-            hash.destroy_sha256(?context);
+            hash.sha256_dnit(?context);
             ret false;
         }
         i = i + 1;
@@ -303,7 +303,7 @@ pub fun credentials_digest(value: account.Credentials, output: *u8) bool {
     if (key.algorithm == jose.ES256 || key.algorithm == jose.EDDSA) {
         if (!digest_update(?context, key.value.data, key.value.len) ||
             !digest_update(?context, (?value_len)::*u8, $size_of(usize))) {
-            hash.destroy_sha256(?context);
+            hash.sha256_dnit(?context);
             ret false;
         }
     }
@@ -312,7 +312,7 @@ pub fun credentials_digest(value: account.Credentials, output: *u8) bool {
             !digest_update(?context, (?modulus_len)::*u8, $size_of(usize)) ||
             !digest_update(?context, key.rsa.exponent.data, key.rsa.exponent.len) ||
             !digest_update(?context, (?exponent_len)::*u8, $size_of(usize))) {
-            hash.destroy_sha256(?context);
+            hash.sha256_dnit(?context);
             ret false;
         }
     }
@@ -336,10 +336,10 @@ fun view_digest(value: view.View, output: *u8) bool {
     if (!memory_range.valid(value.data, value.len) ||
         !memory_range.valid(output, 32)) { ret false; }
     var context: hash.Sha256 = hash.empty_sha256();
-    if (hash.init_sha256(?context) != contracts.OK ||
+    if (hash.sha256_init(?context) != contracts.OK ||
         hash.update_sha256(?context, contracts.Bytes{data: value.data,
         len: value.len}) != contracts.OK) {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
         ret false;
     }
     val result: contracts.Operation = hash.final_sha256(?context,
@@ -410,7 +410,7 @@ fun enter(manager: *Manager) bool {
     if (!manager_ready(manager)) { ret false; }
     val owner: i64 = os.thread_current_id();
     if (owner <= 0) { ret false; }
-    for (true) {
+    for {
         var expected: i64 = atomic.load(?manager.gate.callback_owner);
         if (expected == owner) { ret false; }
         if (expected == 0 && atomic.cas(?manager.gate.callback_owner,
@@ -1514,7 +1514,7 @@ pub fun certificate_digest(value: CertificateRecord, output: *u8) bool {
     if (!certificate_record_valid(value) ||
         !memory_range.valid(output, 32)) { ret false; }
     var context: hash.Sha256 = hash.empty_sha256();
-    if (hash.init_sha256(?context) != contracts.OK) { ret false; }
+    if (hash.sha256_init(?context) != contracts.OK) { ret false; }
     var ok: bool = digest_update(?context, value.storage_key.data,
         value.storage_key.len) &&
         digest_u64(?context, value.storage_key.len::u64) &&
@@ -1538,7 +1538,7 @@ pub fun certificate_digest(value: CertificateRecord, output: *u8) bool {
         i = i + 1;
     }
     if (!ok) {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
         ret false;
     }
     val result: contracts.Operation = hash.final_sha256(?context,

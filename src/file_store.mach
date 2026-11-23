@@ -103,10 +103,10 @@ fun sha256(data: *u8, len: usize, digest: *u8) bool {
         ret false;
     }
     var context: hash.Sha256 = hash.empty_sha256();
-    if (hash.init_sha256(?context) != contracts.OK) { ret false; }
+    if (hash.sha256_init(?context) != contracts.OK) { ret false; }
     if (len != 0 && hash.update_sha256(?context,
         contracts.Bytes{data: data, len: len}) != contracts.OK) {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
         ret false;
     }
     val result: contracts.Operation = hash.final_sha256(?context,

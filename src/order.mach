@@ -12,8 +12,10 @@ use crypto.contracts;
 use crypto.hash;
 use http.core.field;
 use http.core.status;
+use JD: json.decode;
+use JE: json.error;
+use JV: json.value;
 use std.chrono.time;
-use J: std.data.json;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -24,8 +26,8 @@ use std.types.string.str;
 use std.types.view;
 
 # an element by index, nil when absent, as std 1.x returned it
-fun element(value: *J.Value, index: usize) *J.Value {
-    val got: opt[*J.Value] = J.value_get(value, index);
+fun element(value: *JV.Value, index: usize) *JV.Value {
+    val got: opt[*JV.Value] = JV.value_get(value, index);
     if (sel got.some) { ret got.some; }
     ret nil;
 }
@@ -218,10 +220,10 @@ fun digest(value: view.View, output: *u8) bool {
     if (!memory_range.valid(value.data, value.len) ||
         !memory_range.valid(output, 32)) { ret false; }
     var context: hash.Sha256 = hash.empty_sha256();
-    if (hash.init_sha256(?context) != contracts.OK ||
+    if (hash.sha256_init(?context) != contracts.OK ||
         hash.update_sha256(?context, contracts.Bytes{data: value.data,
         len: value.len}) != contracts.OK) {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
         ret false;
     }
     val result: contracts.Operation = hash.final_sha256(?context,
@@ -398,9 +400,9 @@ rec Cursor {
     short: bool;
 }
 
-fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
-    if (value == nil || value.kind != J.STRING || output == nil) { ret false; }
-    val result: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+fun decoded_len(value: *JV.Value, maximum: usize, output: *usize) bool {
+    if (value == nil || value.kind != JV.STRING || output == nil) { ret false; }
+    val result: res[usize, JE.JsonError] = JD.value_string_decode(value, nil, 0);
     if (sel result.err) { ret false; }
     val len: usize = result.ok;
     if (len > maximum) { ret false; }
@@ -410,7 +412,7 @@ fun decoded_len(value: *J.Value, maximum: usize, output: *usize) bool {
 
 # a value that decodes cleanly but does not fit is a capacity failure, not a
 # malformed document. the distinction is recorded so callers map it exactly.
-fun copy_string(cursor: *Cursor, value: *J.Value, maximum: usize,
+fun copy_string(cursor: *Cursor, value: *JV.Value, maximum: usize,
     output: *view.View) bool {
     if (value == nil) {
         @output = view.view(nil, 0);
@@ -422,8 +424,8 @@ fun copy_string(cursor: *Cursor, value: *J.Value, maximum: usize,
         cursor.short = true;
         ret false;
     }
-    val start:  usize                   = cursor.pos;
-    val result: res[usize, J.JsonError] = J.value_string_decode(value,
+    val start:  usize                    = cursor.pos;
+    val result: res[usize, JE.JsonError] = JD.value_string_decode(value,
         ?cursor.data[start], cursor.cap - start);
     if (sel result.err)   { ret false; }
     if (result.ok != len) { ret false; }
@@ -432,11 +434,11 @@ fun copy_string(cursor: *Cursor, value: *J.Value, maximum: usize,
     ret true;
 }
 
-fun value_equals(value: *J.Value, expected: *u8) bool {
+fun value_equals(value: *JV.Value, expected: *u8) bool {
     var decoded: [32]u8;
     var len:     usize = 0;
     if (!decoded_len(value, 31, ?len)) { ret false; }
-    val result: res[usize, J.JsonError] = J.value_string_decode(value,
+    val result: res[usize, JE.JsonError] = JD.value_string_decode(value,
         ?decoded[0], 32);
     if (sel result.err) { ret false; }
     var i: usize = 0;
@@ -447,7 +449,7 @@ fun value_equals(value: *J.Value, expected: *u8) bool {
     ret expected[len] == 0;
 }
 
-fun order_status(value: *J.Value) u8 {
+fun order_status(value: *JV.Value) u8 {
     if (value_equals(value, "pending"))    { ret PENDING; }
     if (value_equals(value, "ready"))      { ret READY; }
     if (value_equals(value, "processing")) { ret PROCESSING; }
@@ -456,7 +458,7 @@ fun order_status(value: *J.Value) u8 {
     ret 0;
 }
 
-fun authorization_status(value: *J.Value) u8 {
+fun authorization_status(value: *JV.Value) u8 {
     if (value_equals(value, "pending"))     { ret AUTH_PENDING; }
     if (value_equals(value, "valid"))       { ret AUTH_VALID; }
     if (value_equals(value, "invalid"))     { ret AUTH_INVALID; }
@@ -472,17 +474,17 @@ pub fun status_terminal(value: u8) bool {
 
 # an embedded rfc 7807 object carries why one identifier failed. it is bounded
 # and copied into caller storage so a partial failure survives the response.
-fun copy_problem(cursor: *Cursor, value: *J.Value, configured: Limits,
+fun copy_problem(cursor: *Cursor, value: *JV.Value, configured: Limits,
     output: *problem.Problem) bool {
     @output = problem.Problem{typ: view.view(nil, 0),
         title:    view.view(nil, 0), detail: view.view(nil, 0), status: 0,
         instance: view.view(nil, 0), subproblems: nil, subproblem_len: 0};
-    if (value == nil)           { ret true; }
-    if (value.kind != J.OBJECT) { ret false; }
-    val code: *J.Value = json.find(value, "status");
+    if (value == nil)            { ret true; }
+    if (value.kind != JV.OBJECT) { ret false; }
+    val code: *JV.Value = json.find(value, "status");
     if (code != nil) {
-        if (code.kind != J.NUMBER || J.value_is_float(code)) { ret false; }
-        val number: i64 = J.value_number(code);
+        if (code.kind != JV.NUMBER || JV.value_is_float(code)) { ret false; }
+        val number: i64 = JV.value_number(code);
         if (number < 0 || number > 599) { ret false; }
         output.status = number::u16;
     }
@@ -675,24 +677,24 @@ pub fun parse(response: client.Response, order_url: view.View,
         max_key_bytes:       configured.max_json_key_bytes,
         max_key_comparisons: configured.max_json_key_comparisons});
     if (!document.valid) { ret document.error; }
-    var root: J.Value = document.root;
-    if (root.kind != J.OBJECT) {
+    var root: JV.Value = document.root;
+    if (root.kind != JV.OBJECT) {
         ret parse_error(problem.MALFORMED_JSON, "order response is not an object");
     }
-    val state:          u8       = order_status(json.find(?root, "status"));
-    val identifiers:    *J.Value = json.find(?root, "identifiers");
-    val authorizations: *J.Value = json.find(?root, "authorizations");
-    val finalize:       *J.Value = json.find(?root, "finalize");
-    val certificate:    *J.Value = json.find(?root, "certificate");
-    val expires:        *J.Value = json.find(?root, "expires");
-    if (state == 0 || identifiers == nil || identifiers.kind != J.ARRAY ||
-        authorizations == nil || authorizations.kind != J.ARRAY ||
+    val state:          u8        = order_status(json.find(?root, "status"));
+    val identifiers:    *JV.Value = json.find(?root, "identifiers");
+    val authorizations: *JV.Value = json.find(?root, "authorizations");
+    val finalize:       *JV.Value = json.find(?root, "finalize");
+    val certificate:    *JV.Value = json.find(?root, "certificate");
+    val expires:        *JV.Value = json.find(?root, "expires");
+    if (state == 0 || identifiers == nil || identifiers.kind != JV.ARRAY ||
+        authorizations == nil || authorizations.kind != JV.ARRAY ||
         finalize == nil) {
         ret parse_error(problem.MALFORMED_JSON,
             "order response has invalid fields");
     }
-    val identifier_len:    usize = J.value_count(identifiers);
-    val authorization_len: usize = J.value_count(authorizations);
+    val identifier_len:    usize = JV.value_count(identifiers);
+    val authorization_len: usize = JV.value_count(authorizations);
     if (identifier_len == 0 || identifier_len > configured.max_identifiers ||
         identifier_len > storage.identifier_capacity ||
         authorization_len > storage.authorization_capacity ||
@@ -741,8 +743,8 @@ pub fun parse(response: client.Response, order_url: view.View,
     }
     var i: usize = 0;
     for (i < identifier_len) {
-        val item: *J.Value = element(identifiers, i);
-        if (item == nil || item.kind != J.OBJECT) {
+        val item: *JV.Value = element(identifiers, i);
+        if (item == nil || item.kind != JV.OBJECT) {
             ret parse_error(problem.MALFORMED_JSON,
                 "order identifier is not an object");
         }
@@ -816,23 +818,23 @@ pub fun parse_authorization(response: client.Response,
         max_key_bytes:       configured.max_json_key_bytes,
         max_key_comparisons: configured.max_json_key_comparisons});
     if (!document.valid) { ret document.error; }
-    var root: J.Value = document.root;
-    if (root.kind != J.OBJECT) {
+    var root: JV.Value = document.root;
+    if (root.kind != JV.OBJECT) {
         ret parse_error(problem.MALFORMED_JSON,
             "authorization response is not an object");
     }
-    val state:      u8       = authorization_status(json.find(?root, "status"));
-    val subject:    *J.Value = json.find(?root, "identifier");
-    val challenges: *J.Value = json.find(?root, "challenges");
-    val wildcard:   *J.Value = json.find(?root, "wildcard");
-    val expires:    *J.Value = json.find(?root, "expires");
-    if (state == 0 || subject == nil || subject.kind != J.OBJECT ||
-        challenges == nil || challenges.kind != J.ARRAY ||
-        (wildcard != nil && wildcard.kind != J.BOOL)) {
+    val state:      u8        = authorization_status(json.find(?root, "status"));
+    val subject:    *JV.Value = json.find(?root, "identifier");
+    val challenges: *JV.Value = json.find(?root, "challenges");
+    val wildcard:   *JV.Value = json.find(?root, "wildcard");
+    val expires:    *JV.Value = json.find(?root, "expires");
+    if (state == 0 || subject == nil || subject.kind != JV.OBJECT ||
+        challenges == nil || challenges.kind != JV.ARRAY ||
+        (wildcard != nil && wildcard.kind != JV.BOOL)) {
         ret parse_error(problem.MALFORMED_JSON,
             "authorization response has invalid fields");
     }
-    val challenge_len: usize = J.value_count(challenges);
+    val challenge_len: usize = JV.value_count(challenges);
     if (challenge_len == 0 || challenge_len > configured.max_challenges ||
         challenge_len > storage.challenge_capacity) {
         ret problem.local_code(problem.LIMIT, problem.OUTPUT_TOO_SMALL,
@@ -844,7 +846,7 @@ pub fun parse_authorization(response: client.Response,
     result.challenges    = storage.challenges;
     result.challenge_len = challenge_len;
     result.wildcard      = false;
-    if (wildcard != nil) { result.wildcard = J.value_bool(wildcard); }
+    if (wildcard != nil) { result.wildcard = JV.value_bool(wildcard); }
     var cursor: Cursor = Cursor{data: storage.data, cap: storage.capacity,
         pos: 0, short: false};
     var kind_text: view.View;
@@ -870,8 +872,8 @@ pub fun parse_authorization(response: client.Response,
     }
     var i: usize = 0;
     for (i < challenge_len) {
-        val item: *J.Value = element(challenges, i);
-        if (item == nil || item.kind != J.OBJECT) {
+        val item: *JV.Value = element(challenges, i);
+        if (item == nil || item.kind != JV.OBJECT) {
             ret parse_error(problem.MALFORMED_JSON,
                 "authorization challenge is not an object");
         }

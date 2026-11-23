@@ -7,3 +7,9 @@
 [submodule "dep/http"]
 	path = dep/http
 	url = https://github.com/briar-systems/mach-http
+[submodule "dep/json"]
+	path = dep/json
+	url = https://github.com/briar-systems/mach-json
+[submodule "dep/encoding"]
+	path = dep/encoding
+	url = https://github.com/briar-systems/mach-encoding

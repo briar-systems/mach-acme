@@ -2,9 +2,12 @@
 
 use acme.memory_range;
 use acme.problem;
-use A: std.allocator;
-use F: std.allocator.fixed;
-use J: std.data.json;
+use JD: json.decode;
+use JE: json.error;
+use JP: json.parse;
+use JV: json.value;
+use A:  std.allocator;
+use F:  std.allocator.fixed;
 use std.text.utf8;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -17,15 +20,15 @@ use std.types.string.str;
 use std.types.view;
 
 # an element by index, nil when absent, as std 1.x returned it
-fun element(value: *J.Value, index: usize) *J.Value {
-    val got: opt[*J.Value] = J.value_get(value, index);
+fun element(value: *JV.Value, index: usize) *JV.Value {
+    val got: opt[*JV.Value] = JV.value_get(value, index);
     if (sel got.some) { ret got.some; }
     ret nil;
 }
 
 # a key by index, nil when absent, as std 1.x returned it
-fun key_at(value: *J.Value, index: usize) str {
-    val got: opt[str] = J.value_key(value, index);
+fun key_at(value: *JV.Value, index: usize) str {
+    val got: opt[str] = JV.value_key(value, index);
     if (sel got.some) { ret got.some; }
     ret nil;
 }
@@ -39,7 +42,7 @@ pub rec Limits {
 }
 
 pub rec Document {
-    root:  J.Value;
+    root:  JV.Value;
     error: problem.Error;
     valid: bool;
 }
@@ -198,25 +201,25 @@ fun prescan(input: view.View, configured: Limits) problem.Error {
     ret problem.none();
 }
 
-fun decoded_string_valid(value: *J.Value, maximum: usize) bool {
-    val decoded: res[usize, J.JsonError] = J.value_string_decode(value, nil, 0);
+fun decoded_string_valid(value: *JV.Value, maximum: usize) bool {
+    val decoded: res[usize, JE.JsonError] = JD.value_string_decode(value, nil, 0);
     ret (sel decoded.ok) && decoded.ok <= maximum;
 }
 
-fun key_value(object: *J.Value, index: usize) J.Value {
-    var value: J.Value;
-    value.kind    = J.STRING;
+fun key_value(object: *JV.Value, index: usize) JV.Value {
+    var value: JV.Value;
+    value.kind    = JV.STRING;
     value.str_val = key_at(object, index);
-    value.str_len = J.value_key_len(object, index);
+    value.str_len = JV.value_key_len(object, index);
     ret value;
 }
 
-fun decoded_key_equal(first: *J.Value, second: *J.Value) bool {
+fun decoded_key_equal(first: *JV.Value, second: *JV.Value) bool {
     var first_bytes:  [128]u8;
     var second_bytes: [128]u8;
-    val first_result: res[usize, J.JsonError] = J.value_string_decode(first,
+    val first_result: res[usize, JE.JsonError] = JD.value_string_decode(first,
         ?first_bytes[0], 128);
-    val second_result: res[usize, J.JsonError] = J.value_string_decode(second,
+    val second_result: res[usize, JE.JsonError] = JD.value_string_decode(second,
         ?second_bytes[0], 128);
     if (sel first_result.err)  { ret false; }
     if (sel second_result.err) { ret false; }
@@ -230,29 +233,29 @@ fun decoded_key_equal(first: *J.Value, second: *J.Value) bool {
     ret true;
 }
 
-fun validate_tree(value: *J.Value, depth: usize, configured: Limits,
+fun validate_tree(value: *JV.Value, depth: usize, configured: Limits,
     count: *usize, comparisons: *usize, comparison_limit: *bool) bool {
     if (value == nil || depth > configured.max_depth || @count >= configured.max_values) {
         ret false;
     }
     @count = @count + 1;
-    if (value.kind == J.STRING) {
+    if (value.kind == JV.STRING) {
         ret decoded_string_valid(value, configured.max_bytes);
     }
-    if (value.kind != J.ARRAY && value.kind != J.OBJECT) { ret true; }
+    if (value.kind != JV.ARRAY && value.kind != JV.OBJECT) { ret true; }
     var i: usize = 0;
-    if (value.kind == J.OBJECT) {
-        for (i < J.value_count(value)) {
-            var first: J.Value = key_value(value, i);
+    if (value.kind == JV.OBJECT) {
+        for (i < JV.value_count(value)) {
+            var first: JV.Value = key_value(value, i);
             if (!decoded_string_valid(?first, configured.max_key_bytes)) { ret false; }
             var j: usize = i + 1;
-            for (j < J.value_count(value)) {
+            for (j < JV.value_count(value)) {
                 if (@comparisons >= configured.max_key_comparisons) {
                     @comparison_limit = true;
                     ret false;
                 }
                 @comparisons = @comparisons + 1;
-                var second: J.Value = key_value(value, j);
+                var second: JV.Value = key_value(value, j);
                 if (!decoded_string_valid(?second, configured.max_key_bytes) ||
                     decoded_key_equal(?first, ?second)) { ret false; }
                 j = j + 1;
@@ -261,7 +264,7 @@ fun validate_tree(value: *J.Value, depth: usize, configured: Limits,
         }
     }
     i = 0;
-    for (i < J.value_count(value)) {
+    for (i < JV.value_count(value)) {
         if (!validate_tree(element(value, i), depth + 1, configured, count,
             comparisons, comparison_limit)) {
             ret false;
@@ -290,7 +293,7 @@ pub fun parse(input: view.View, scratch: *u8, scratch_capacity: usize,
     if (sel made.err) {
         ret invalid(problem.INVALID_INPUT, "json scratch allocator is invalid");
     }
-    val parsed: res[J.Value, J.JsonError] = J.parse(input.data, input.len, ?allocator);
+    val parsed: res[JV.Value, JE.JsonError] = JP.parse(input.data, input.len, ?allocator);
     if (sel parsed.err) {
         if (sel parsed.err.alloc) {
             ret invalid(problem.OUTPUT_TOO_SMALL, "json scratch is too small");
@@ -300,10 +303,10 @@ pub fun parse(input: view.View, scratch: *u8, scratch_capacity: usize,
         }
         ret invalid(problem.MALFORMED_JSON, "json syntax error");
     }
-    var root:             J.Value = parsed.ok;
-    var count:            usize   = 0;
-    var comparisons:      usize   = 0;
-    var comparison_limit: bool    = false;
+    var root:             JV.Value = parsed.ok;
+    var count:            usize    = 0;
+    var comparisons:      usize    = 0;
+    var comparison_limit: bool     = false;
     if (!validate_tree(?root, 1, configured, ?count, ?comparisons,
         ?comparison_limit)) {
         if (comparison_limit) {
@@ -318,14 +321,14 @@ pub fun parse(input: view.View, scratch: *u8, scratch_capacity: usize,
     ret Document{root: root, error: problem.none(), valid: true};
 }
 
-fun key_equals(object: *J.Value, index: usize, expected: str) bool {
+fun key_equals(object: *JV.Value, index: usize, expected: str) bool {
     if (object == nil ||
-        !memory_range.valid(object::*u8, $size_of(J.Value)) ||
-        object.kind != J.OBJECT ||
-        index >= J.value_count(object) || expected == nil) { ret false; }
-    var key:     J.Value                 = key_value(object, index);
+        !memory_range.valid(object::*u8, $size_of(JV.Value)) ||
+        object.kind != JV.OBJECT ||
+        index >= JV.value_count(object) || expected == nil) { ret false; }
+    var key:     JV.Value                 = key_value(object, index);
     var bytes:   [128]u8;
-    val decoded: res[usize, J.JsonError] = J.value_string_decode(?key, ?bytes[0], 128);
+    val decoded: res[usize, JE.JsonError] = JD.value_string_decode(?key, ?bytes[0], 128);
     if (sel decoded.err) { ret false; }
     val len: usize = decoded.ok;
     var i:   usize = 0;
@@ -336,12 +339,12 @@ fun key_equals(object: *J.Value, index: usize, expected: str) bool {
     ret expected[len] == 0;
 }
 
-pub fun find(object: *J.Value, expected: str) *J.Value {
+pub fun find(object: *JV.Value, expected: str) *JV.Value {
     if (object == nil ||
-        !memory_range.valid(object::*u8, $size_of(J.Value)) ||
-        object.kind != J.OBJECT || expected == nil) { ret nil; }
+        !memory_range.valid(object::*u8, $size_of(JV.Value)) ||
+        object.kind != JV.OBJECT || expected == nil) { ret nil; }
     var i: usize = 0;
-    for (i < J.value_count(object)) {
+    for (i < JV.value_count(object)) {
         if (key_equals(object, i, expected)) { ret element(object, i); }
         i = i + 1;
     }
