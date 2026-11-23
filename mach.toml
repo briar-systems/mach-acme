@@ -1,7 +1,7 @@
 [project]
 id = "acme"
 mach = "^7"
-version = "0.14.1"
+version = "0.15.0"
 src = "src"
 work = "out/{target.name}/{profile.name}"
 
@@ -68,20 +68,20 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/dev"
+version = "^10.0.0"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "branch/dev"
+version = "^0.30.0"
 
 [dep.json]
 git = "https://github.com/briar-systems/mach-json"
-ref = "branch/dev"
+version = "^0.1.0"
 
 [dep.http]
 git = "https://github.com/briar-systems/mach-http"
-ref = "branch/dev"
+version = "^0.26.0"
 
 [dep.encoding]
 git = "https://github.com/briar-systems/mach-encoding"
-ref = "branch/dev"
+version = "^0.1.0"
